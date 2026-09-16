@@ -231,69 +231,64 @@ public enum InitRunner {
     /// depend on the `Benchmark` product — is not frozen (freeze detection keys on
     /// that product dependency), so it would be writable by the agent under a
     /// blanket scope, or even under a scope built from a naive "not a test, not a
-    /// benchmark" target filter. Two independent signals close this, applied together
-    /// ("belt and braces" — each catches a layout the other misses):
+    /// benchmark" target filter.
     ///
-    /// 1. **Path adjacency.** In practice a benchmark's helper targets live alongside
-    ///    it — nested under the same parent directory a benchmark target's own path
-    ///    sits in (e.g. a `Fixtures` target at `Benchmarks/Fixtures`, sibling to a
-    ///    benchmark target at `Benchmarks/Bench`). This excludes every non-test,
-    ///    non-benchmark target whose path falls under any benchmark target's PARENT
-    ///    directory, not merely a benchmark target's own exact path.
-    /// 2. **The target-dependency graph** (`benchmarkHelperPaths`, resolved by the
-    ///    caller from a local decode of `target_dependencies` — see
-    ///    `benchmarkHelperPaths(of:repo:)` below). This catches a helper that is a
-    ///    *declared dependency* of the benchmark target but lives nowhere near it,
-    ///    e.g. `Sources/BenchFixtures` alongside a real library at `Sources/Lib` and a
-    ///    benchmark at `Benchmarks/Bench` — path adjacency alone misses this entirely,
-    ///    since `Sources/BenchFixtures` doesn't nest under `Benchmarks`.
+    /// **Path adjacency** is the ONLY automatic exclusion this applies. In practice a
+    /// benchmark's helper targets live alongside it — nested under the same parent
+    /// directory a benchmark target's own path sits in (e.g. a `Fixtures` target at
+    /// `Benchmarks/Fixtures`, sibling to a benchmark target at `Benchmarks/Bench`).
+    /// This excludes every non-test, non-benchmark target whose path falls under any
+    /// benchmark target's PARENT directory, not merely a benchmark target's own exact
+    /// path. It can be overly conservative — a genuine library target that shares a
+    /// benchmark's parent directory would also land out of scope — but that is a
+    /// loud, recoverable `out_of_scope` rejection at scope-gate time, preferable to a
+    /// benchmark-shrinking edit sailing through silently.
     ///
-    /// Both signals can be overly conservative — a genuine library target that shares
-    /// a benchmark's parent directory could land out of scope under signal 1. That is
-    /// a loud, recoverable `out_of_scope` rejection at scope-gate time, preferable to
-    /// a benchmark-shrinking edit sailing through silently, so signal 1 always
-    /// applies unconditionally.
+    /// ## Why the target-dependency graph is NOT used here (round 2 of this task's
+    /// review)
     ///
-    /// Signal 2 needs more care: `benchmarkHelperPaths` is every DIRECT target
-    /// dependency of the chosen benchmark, and in a real package that set almost
-    /// always includes the actual library under test alongside any genuine fixture
-    /// helpers — SwiftPM's manifest has no field distinguishing "the algorithm I'm
-    /// benchmarking" from "fixture data I feed it," so both show up identically in
-    /// `target_dependencies`. Excluding the whole set unconditionally was tried and
-    /// rejected during this fix's round 1: verified live against a real, working
-    /// single-library-single-benchmark package, it drove `scope` to empty — turning
-    /// `init` into a hard refusal for the single most common package shape this tool
-    /// exists to support, and (worse) against the THREE-target layout this signal was
-    /// added for (real library + fixture helper, both direct dependencies of the
-    /// benchmark) it excluded BOTH, re-emptying scope and backing out of the
-    /// exclusion entirely — silently reopening the exact hole this signal exists to
-    /// close.
+    /// An earlier version of this function also excluded the chosen benchmark
+    /// target's declared `target_dependencies` (see `benchmarkHelperPaths(of:repo:)`
+    /// below), on the theory that a dependency the benchmark pulls in but that lives
+    /// nowhere near it is probably fixture data. That theory doesn't hold: SwiftPM's
+    /// manifest has no field distinguishing "the algorithm I'm benchmarking" from
+    /// "fixture data I feed it" — both show up identically in `target_dependencies`.
+    /// Every automatic decision built on that signal is a guess, and both ways of
+    /// making the guess were verified live to fail in a genuinely bad direction:
     ///
-    /// So exclusion here is greedy with a floor of one: helper paths are tried in a
-    /// fixed (sorted) order, each excluded only if at least one non-test,
-    /// non-benchmark target would still remain afterward. For the common shape (one
-    /// real library, zero or more genuine fixture helpers) this excludes every
-    /// fixture and leaves the library — verified live against exactly that layout.
-    /// The known remaining gap: if a benchmark genuinely depends on MORE than one
-    /// real, independently-optimizable library target (not just one library plus
-    /// fixtures), this floor stops at whichever one target happens to sort last and
-    /// excludes the rest — safe-direction-wrong (an `out_of_scope` rejection the
-    /// human can fix by widening `scope` by hand), not silent-direction-wrong, but a
-    /// real limitation worth flagging for whoever next revisits this.
-    static func deriveScope(from description: PackageDescription, benchmarkHelperPaths: Set<String> = []) -> [String] {
+    /// - Excluding ALL declared dependencies unconditionally drove `scope` to empty
+    ///   for an ordinary single-library-single-benchmark package (the common case),
+    ///   and for a real library-plus-fixture pair it excluded BOTH, silently
+    ///   reopening the exact hole the signal was meant to close.
+    /// - A "greedy, floor of one" refinement (exclude declared dependencies one at a
+    ///   time, in sorted-path order, never past the last remaining candidate) fixed
+    ///   that specific case by accident of alphabetical ordering — `Sources/Bench
+    ///   Fixtures` sorts before `Sources/Lib`, so the fixture happened to be tried
+    ///   (and excluded) first. Renaming the same two targets `Sources/Alpha` (the
+    ///   real library) and `Sources/ZHelper` (the fixture) flips the sort order:
+    ///   `Alpha` is excluded first because the floor-of-one guard doesn't stop it
+    ///   (two candidates remain), leaving `ZHelper` as the lone survivor — the real
+    ///   library silently dropped from scope AND the fixture silently left in it.
+    ///   Ordinary fixture names that sort late (`Helpers`, `Mocks`, `Stubs`,
+    ///   `Support`, `TestData`) hit exactly this failure.
+    ///
+    /// Both attempts guess, and a wrong guess here is silent — indistinguishable from
+    /// a correct scope, which is the one outcome this project never accepts (see
+    /// `ConfigError.emptyScope`'s own reasoning and the ruling recorded for this
+    /// task). So `deriveScope` does not use the dependency graph at all any more.
+    /// `target_dependencies` is still read (via `benchmarkHelperPaths(of:repo:)`),
+    /// but only to power `scopedBenchmarkDependencyPaths`/`dependencyScopeWarning`
+    /// below — a WARNING surfaced to the human after `init` succeeds, not a decision
+    /// made on their behalf.
+    static func deriveScope(from description: PackageDescription) -> [String] {
         let benchmarkTargets = description.benchmarkTargets
         let benchmarkNames = Set(benchmarkTargets.map(\.name))
         let pathAdjacencyRoots = Set(benchmarkTargets.map { parentDirectory(of: $0.path) })
 
-        var candidates = description.targets.filter {
+        let candidates = description.targets.filter {
             $0.type != "test"
                 && !benchmarkNames.contains($0.name)
                 && !isBenchmarkAdjacent($0.path, roots: pathAdjacencyRoots)
-        }
-
-        for helperPath in benchmarkHelperPaths.sorted() {
-            guard candidates.count > 1 else { break }
-            candidates.removeAll { $0.path == helperPath }
         }
 
         let globs = Set(candidates.map { "\($0.path)/**" })
@@ -350,19 +345,18 @@ public enum InitRunner {
         return Set(depNames.compactMap { pathsByName[$0] })
     }
 
-    /// Runs `swift package describe --type json` a second time (the first, via
-    /// `PackageDescribe.describe`, already ran to build `description` in `run`) purely
-    /// to recover `target_dependencies` for `targetName` — a field `PackageDescription`
-    /// does not expose. Acceptable: `init` runs once per repository and is not on the
-    /// measurement path.
+    /// Runs `swift package describe --type json` purely to recover
+    /// `target_dependencies` for `targetName` — a field `PackageDescription` does not
+    /// expose. Called from `run` (via `deriveScope`) in round 1 of this task's
+    /// review; as of round 2, `deriveScope` no longer uses this at all (see its doc
+    /// comment) — this is now called ONLY by `scopedBenchmarkDependencies` below, to
+    /// power a warning, after `run` has already succeeded. `init` runs once per
+    /// repository and is not on the measurement path, so a separate invocation for
+    /// this is an acceptable cost.
     ///
-    /// Throws rather than silently returning no exclusions on failure. This data feeds
-    /// a safety-narrowing decision (`deriveScope`'s belt-and-braces exclusion set);
-    /// silently treating a failure here as "no additional helpers found" would make a
-    /// transient or environmental failure indistinguishable from a genuinely helper-
-    /// free benchmark target, which is exactly the kind of silent guess this project's
-    /// own ethos rejects everywhere else. The first `describe` call already proved the
-    /// manifest parses and the toolchain works, so a failure here should be rare.
+    /// Throws rather than silently returning no dependencies on failure, matching
+    /// this project's ethos of failing loud rather than silently treating "the check
+    /// couldn't run" the same as "the check ran and found nothing."
     static func benchmarkHelperPaths(of targetName: String, repo: URL, timeout: TimeInterval = 300) throws -> Set<String> {
         let swift = URL(fileURLWithPath: "/usr/bin/swift")
         let r = try Subprocess.run(swift, ["package", "describe", "--type", "json"],
@@ -375,6 +369,54 @@ public enum InitRunner {
             throw PackageDescribeError.failed("no JSON in output")
         }
         return try parseTargetDependencyPaths(Data(r.stdout[start...].utf8), of: targetName)
+    }
+
+    /// Which of the benchmark's declared dependency paths (`benchmarkHelperPaths`)
+    /// ended up inside the generated `scope`, i.e. which ones the agent can actually
+    /// edit. A path-adjacent helper (excluded automatically by `deriveScope`) never
+    /// appears here, because it was never in scope to begin with — there is nothing
+    /// to warn about for a target the agent already cannot touch. Pure and
+    /// hermetically testable, separate from the I/O in `benchmarkHelperPaths(of:repo:)`.
+    static func scopedBenchmarkDependencyPaths(scope: [String], benchmarkHelperPaths: Set<String>) -> [String] {
+        benchmarkHelperPaths.filter { scope.contains("\($0)/**") }.sorted()
+    }
+
+    /// Renders the human-facing warning for a non-empty `scopedBenchmarkDependencyPaths`
+    /// result, or `nil` when there is nothing to warn about. `init` cannot tell which
+    /// of these targets hold code genuinely under test and which hold fixture or
+    /// synthetic input data — see `deriveScope`'s doc comment for why it no longer
+    /// guesses — so every path here is named, including ones that are almost
+    /// certainly the real library under test: pretending to know which is which is
+    /// exactly the mistake round 1 of this fix made.
+    public static func dependencyScopeWarning(paths: [String]) -> String? {
+        guard !paths.isEmpty else { return nil }
+        return """
+        The following targets are direct dependencies of the benchmark target, and are \
+        currently editable by the agent because they fell inside the generated scope:
+
+        \(paths.sorted().map { "  - \($0)" }.joined(separator: "\n"))
+
+        autor3search-swift cannot tell which of these hold code genuinely under test and \
+        which hold fixture data or synthetic inputs the benchmark merely consumes -- \
+        SwiftPM's manifest carries no such distinction, so none of them were excluded \
+        automatically. If any of them are fixture/input data rather than code under test, \
+        remove them from scope in .autor3search/config.yaml now: an agent that can shrink \
+        a benchmark's input can win without making anything faster.
+
+        Do this before running `autor3search-swift baseline` -- baseline freezes \
+        config.yaml's hash, so this is the last moment such a change is straightforward.
+        """
+    }
+
+    /// Convenience wrapper for `InitCommand`: recomputes the dependency graph (a
+    /// fresh `swift package describe`, since `run(repo:force:)`'s signature is frozen
+    /// and does not return this) and resolves it against `config.scope`. Called AFTER
+    /// `run` has already succeeded and written the config — a failure here should not
+    /// be treated as `init` itself having failed, since the actual work is already
+    /// done; see `InitCommand` for how it handles that.
+    public static func scopedBenchmarkDependencies(config: Config, repo: URL) throws -> [String] {
+        let helperPaths = try benchmarkHelperPaths(of: config.benchmarkTarget, repo: repo)
+        return scopedBenchmarkDependencyPaths(scope: config.scope, benchmarkHelperPaths: helperPaths)
     }
 
     /// Picks the one target to measure, or refuses. Split out from `run` so the
@@ -414,10 +456,10 @@ public enum InitRunner {
     /// cannot be measured.
     ///
     /// Ordering matters for partial-write safety: every check that can refuse — the
-    /// existing-config check, both `swift package describe` invocations (target
-    /// selection and the target-dependency graph), benchmark discovery,
-    /// `Config.validate()`, and rendering both files to strings — happens BEFORE any
-    /// file is touched. A refusal therefore never leaves a half-written
+    /// existing-config check, `swift package describe` (target selection and scope),
+    /// benchmark discovery, `Config.validate()`, and rendering both files to strings
+    /// — happens BEFORE any file is touched. A refusal therefore never leaves a
+    /// half-written
     /// `.autor3search/` directory or a `program.md` with no matching config: either
     /// every write happens, or none does. The one thing this ordering cannot protect
     /// against is the filesystem itself failing partway through the write phase
@@ -438,8 +480,7 @@ public enum InitRunner {
         let names = try discoverBenchmarks(repo: repo, target: chosenTarget)
         try validateDiscovered(names)
 
-        let helperPaths = try benchmarkHelperPaths(of: chosenTarget.name, repo: repo)
-        let scope = deriveScope(from: description, benchmarkHelperPaths: helperPaths)
+        let scope = deriveScope(from: description)
 
         let config = Config(
             version: 1,

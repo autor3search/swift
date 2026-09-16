@@ -27,5 +27,22 @@ struct InitCommand: ParsableCommand {
         if let warning = config.keepReachabilityWarning() {
             print("warning: \(warning)")
         }
+
+        // Best-effort: this is an advisory check, not part of what makes `init`
+        // succeed or fail. init already wrote a usable config by this point, so a
+        // failure here (e.g. a transient `swift package describe` hiccup) is
+        // reported but does not change init's own exit status -- the human just
+        // doesn't get this particular heads-up on this run and is told so plainly
+        // rather than left to think everything was checked.
+        do {
+            let paths = try InitRunner.scopedBenchmarkDependencies(config: config, repo: repoOption.repoURL)
+            if let warning = InitRunner.dependencyScopeWarning(paths: paths) {
+                print("")
+                print(warning)
+            }
+        } catch {
+            print("")
+            print("note: could not check the benchmark's declared dependencies against scope: \(error)")
+        }
     }
 }

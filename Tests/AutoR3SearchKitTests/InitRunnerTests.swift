@@ -153,16 +153,9 @@ private func target(_ name: String, type: String = "library", path: String, prod
     #expect(scope != ["**"])
 }
 
-// MARK: - Fix round 1: target-dependency graph as a second scope-exclusion signal
-//
-// Path adjacency alone misses a benchmark helper that is a DECLARED target
-// dependency of the benchmark but lives nowhere near it, e.g. `Sources/BenchFixtures`
-// alongside a real library at `Sources/Lib` and a benchmark at `Benchmarks/Bench` —
-// `Sources/BenchFixtures` never nests under `Benchmarks`, so the path rule alone
-// cannot catch it. `swift package describe --type json` reports this as
-// `"target_dependencies": ["BenchFixtures"]` on the benchmark target's own JSON
-// object; `parseTargetDependencyPaths` decodes exactly that field, independent of
-// Task 8's frozen `PackageDescribe`/`SwiftTarget`.
+// MARK: - Fix round 1: parsing the target-dependency graph out of `swift package
+// describe --type json`'s output (still used in round 2 — see below — just no
+// longer to make an automatic scope decision).
 
 private func describeJSON(targets: [(name: String, path: String, type: String, productDependencies: [String], targetDependencies: [String])]) -> Data {
     let targetsJSON = targets.map {
@@ -192,42 +185,96 @@ private func describeJSON(targets: [(name: String, path: String, type: String, p
     #expect(paths == ["Sources/Lib", "Sources/BenchFixtures"])
 }
 
-/// The exact layout the round-1 review specified: benchmarks in a separate
-/// top-level directory (`Benchmarks/Bench`), a helper under `Sources/`
-/// (`Sources/BenchFixtures`) declared as a target dependency of the benchmark, and a
-/// REAL library also present (`Sources/Lib`). The helper must be excluded from
-/// scope; the real library must not be — this is the case
-/// `deriveScopeExcludesTestsAndBenchmarksButKeepsLibraryTargets` does not cover
-/// (that test's helper is path-adjacent; this one only shows up in the dependency
-/// graph).
-@Test func deriveScopeExcludesAGraphOnlyHelperUnderSourcesButKeepsTheRealLibrary() {
+// MARK: - Fix round 2: deriveScope no longer guesses which dependency is a fixture
+//
+// Round 1's "greedy, floor of one" exclusion was alphabetical luck, not a signal.
+// `Sources/BenchFixtures` sorts before `Sources/Lib`, so the fixture happened to be
+// excluded and the real library happened to survive. Rename the exact same two roles
+// `Sources/Alpha` (real library) and `Sources/ZHelper` (fixture) and the sort order
+// flips: the real library would have been excluded and the fixture left in scope —
+// silently, which is the one outcome this project never accepts. `deriveScope` no
+// longer reads the dependency graph at all; it only ever applies path adjacency.
+// `target_dependencies` is still read (via `parseTargetDependencyPaths` /
+// `benchmarkHelperPaths(of:repo:)`, unchanged from round 1) but now purely to power
+// `scopedBenchmarkDependencyPaths` / `dependencyScopeWarning`, a WARNING surfaced
+// after `init` succeeds rather than a decision made silently on the human's behalf.
+
+/// The counterexample from the round-2 review: `Sources/Alpha` (the real library)
+/// and `Sources/ZHelper` (the fixture) are both direct dependencies of the benchmark.
+/// Under the deleted greedy logic this excluded Alpha and kept ZHelper — the worst
+/// possible outcome. Now neither is guessed at: both stay in scope, and the warning
+/// names BOTH of them, because `init` genuinely cannot tell them apart.
+@Test func doesNotGuessWhichDependencyIsAFixtureAndWarnsAboutBothCandidates() {
     let description = PackageDescription(targets: [
-        target("Lib", path: "Sources/Lib"),
-        target("BenchFixtures", path: "Sources/BenchFixtures"),
+        target("Alpha", path: "Sources/Alpha"),
+        target("ZHelper", path: "Sources/ZHelper"),
         target("Bench", type: "executable", path: "Benchmarks/Bench", productDependencies: ["Benchmark"]),
     ])
-    let scope = InitRunner.deriveScope(from: description, benchmarkHelperPaths: ["Sources/BenchFixtures"])
-    #expect(scope.contains("Sources/Lib/**"), "the real library must stay in scope")
-    #expect(!scope.contains("Sources/BenchFixtures/**"), "the graph-declared helper must be excluded")
-    #expect(!scope.contains(where: { $0.hasPrefix("Benchmarks/") }))
+    let scope = InitRunner.deriveScope(from: description)
+    #expect(scope.contains("Sources/Alpha/**"), "no signal distinguishes it from a fixture; must not be silently excluded")
+    #expect(scope.contains("Sources/ZHelper/**"), "no signal distinguishes it from the real library; must not be silently kept without warning")
+
+    let helperPaths: Set<String> = ["Sources/Alpha", "Sources/ZHelper"]
+    let warnedPaths = InitRunner.scopedBenchmarkDependencyPaths(scope: scope, benchmarkHelperPaths: helperPaths)
+    #expect(Set(warnedPaths) == ["Sources/Alpha", "Sources/ZHelper"])
+
+    let warning = InitRunner.dependencyScopeWarning(paths: warnedPaths)
+    #expect(warning != nil)
+    #expect(warning!.contains("Sources/Alpha"), "must name the real library too: init cannot tell it apart from a fixture")
+    #expect(warning!.contains("Sources/ZHelper"))
+    #expect(warning!.contains("baseline"), "must mention that baseline freezes the config hash, or the warning gives no deadline")
 }
 
-/// Regression test for the exact failure mode caught during this fix: a benchmark's
-/// SOLE non-test, non-benchmark dependency is very often the actual library under
-/// test (verified against a real, working single-library-single-benchmark package —
-/// see the report). Unconditionally excluding every graph-declared dependency would
-/// drive `scope` to empty for this — the single most common package shape — turning
-/// `init` into a hard refusal rather than a per-edit `out_of_scope` rejection.
-/// `deriveScope` must back the graph signal out when applying it would empty scope.
-@Test func deriveScopeDoesNotEmptyItselfWhenTheOnlyDependencyIsTheRealLibrary() {
+/// The SAME shape as the counterexample above, but with the favourable naming from
+/// round 1's test (`BenchFixtures` sorts before `Lib`) — the ordering under which the
+/// deleted greedy logic happened to produce the "right" answer by luck. Both orderings
+/// must now produce the identical, non-guessing result: nothing excluded by the graph
+/// signal, both targets present, in both cases. Asserting the two scopes have the same
+/// SHAPE (both candidates kept, neither excluded) is the order-independence property;
+/// the literal path strings necessarily differ since the targets are named differently.
+@Test func favourableAndUnfavourableNamingOrdersNowProduceTheSameNonGuessingResult() {
+    func scopeKeepsBothDependencies(libraryPath: String, fixturePath: String) -> Bool {
+        let description = PackageDescription(targets: [
+            target("Library", path: libraryPath),
+            target("Fixture", path: fixturePath),
+            target("Bench", type: "executable", path: "Benchmarks/Bench", productDependencies: ["Benchmark"]),
+        ])
+        let scope = InitRunner.deriveScope(from: description)
+        return scope.contains("\(libraryPath)/**") && scope.contains("\(fixturePath)/**") && scope.count == 2
+    }
+
+    // Favourable order: fixture path sorts BEFORE the library path.
+    let favourable = scopeKeepsBothDependencies(libraryPath: "Sources/Lib", fixturePath: "Sources/BenchFixtures")
+    // Unfavourable order: fixture path sorts AFTER the library path (the round-2
+    // counterexample's ordering).
+    let unfavourable = scopeKeepsBothDependencies(libraryPath: "Sources/Alpha", fixturePath: "Sources/ZHelper")
+
+    #expect(favourable, "favourable ordering must keep both dependencies in scope")
+    #expect(unfavourable, "unfavourable ordering must ALSO keep both dependencies in scope")
+    #expect(favourable == unfavourable, "both orderings must produce the identical (non-guessing) outcome")
+}
+
+/// A helper that IS path-adjacent to the benchmark (e.g. `Benchmarks/Fixtures`,
+/// sibling to `Benchmarks/Bench`) is still excluded automatically — path adjacency is
+/// a real signal and still applies. And because it was never in scope to begin with,
+/// it must not appear in the dependency warning either: the warning is about targets
+/// the agent can actually edit, and this one it cannot.
+@Test func pathAdjacentHelperStaysExcludedAndNeverAppearsInTheWarning() {
     let description = PackageDescription(targets: [
         target("Lib", path: "Sources/Lib"),
+        target("Fixtures", path: "Benchmarks/Fixtures"),
         target("Bench", type: "executable", path: "Benchmarks/Bench", productDependencies: ["Benchmark"]),
     ])
-    // As if `parseTargetDependencyPaths` reported Bench's only dependency, "Lib", as
-    // a helper — the worst case for the graph signal.
-    let scope = InitRunner.deriveScope(from: description, benchmarkHelperPaths: ["Sources/Lib"])
-    #expect(scope == ["Sources/Lib/**"], "must fall back rather than leave scope empty")
+    let scope = InitRunner.deriveScope(from: description)
+    #expect(scope.contains("Sources/Lib/**"))
+    #expect(!scope.contains(where: { $0.hasPrefix("Benchmarks/") }), "path-adjacent helper must still be excluded automatically")
+
+    // Even though it is (hypothetically) ALSO a declared target dependency of the
+    // benchmark, it must not appear in the warning, because it is not in scope.
+    let helperPaths: Set<String> = ["Sources/Lib", "Benchmarks/Fixtures"]
+    let warnedPaths = InitRunner.scopedBenchmarkDependencyPaths(scope: scope, benchmarkHelperPaths: helperPaths)
+    #expect(!warnedPaths.contains("Benchmarks/Fixtures"), "a target that is not in scope has nothing to warn about")
+    #expect(warnedPaths.contains("Sources/Lib"))
 }
 
 @Test func selectBenchmarkTargetRefusesToPickAmongSeveral() {
