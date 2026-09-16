@@ -7,7 +7,7 @@ struct AutoR3Search: AsyncParsableCommand {
         abstract: "Autonomous AI-driven performance optimization for any Swift repository.",
         subcommands: [
             VersionCommand.self, InitCommand.self, BaselineCommand.self, EvalCommand.self,
-            StatusCommand.self, StopCommand.self, ReportCommand.self,
+            StatusCommand.self, StopCommand.self, ReportCommand.self, DoctorCommand.self,
         ]
     )
 }
