@@ -377,6 +377,46 @@ import Foundation
     #expect(f.detail.contains("baseline"), "the operator must be told to re-run baseline")
 }
 
+/// ROUND 2, MEDIUM 3. `doctor` creates the lockfile it complains about:
+/// `measurementBuild` runs `swift build -c release`, which writes
+/// `Package.resolved` into the package root. Observed live -- a second `doctor`
+/// run on the same repository flipped this finding from "has no
+/// Package.resolved" to "exists but is untracked", because doctor itself had
+/// created it.
+///
+/// The finding is therefore keyed on TRACKEDNESS, which doctor's own build
+/// cannot change. These are the two states doctor's build moves between, and
+/// they must be indistinguishable in the report. This also covers the
+/// `--skip-build` path, which writes nothing and so stays in the first state
+/// forever: the two must not disagree about reality.
+@Test func dependencyPinReportsTheSameThingBeforeAndAfterDoctorsOwnBuild() {
+    let beforeBuild = DoctorChecks.dependencyPin(
+        externalDependencies: ["benchmark"], lockfileExists: false,
+        lockfileTracked: false, lockfileGitIgnored: false, recordedPins: [:])
+    let afterBuild = DoctorChecks.dependencyPin(
+        externalDependencies: ["benchmark"], lockfileExists: true,
+        lockfileTracked: false, lockfileGitIgnored: false, recordedPins: [:])
+    #expect(beforeBuild.level == .warn)
+    #expect(beforeBuild == afterBuild, """
+        doctor's own build must not change what doctor reports:
+        before: \(beforeBuild.detail)
+        after:  \(afterBuild.detail)
+        """)
+}
+
+/// The transitive case, which the manifest signal cannot see: a package whose
+/// only DIRECT dependency is a path dependency still gets a root
+/// `Package.resolved` when that dependency's own manifest pulls a
+/// source-control one (verified live). An empty `externalDependencies` list
+/// with a lockfile on disk is that package, and it is still unpinned.
+@Test func dependencyPinTreatsAnUntrackedLockfileAsEvidenceOfDependencies() {
+    let f = DoctorChecks.dependencyPin(
+        externalDependencies: [], lockfileExists: true,
+        lockfileTracked: false, lockfileGitIgnored: false, recordedPins: [:])
+    #expect(f.level == .warn)
+    #expect(f.detail.contains("git add"))
+}
+
 /// Everything in order: dependencies, a tracked lockfile, and a real pin.
 @Test func dependencyPinIsQuietWhenEverythingIsPinnedProperly() {
     let f = DoctorChecks.dependencyPin(

@@ -493,6 +493,103 @@ private func describeJSON(targets: [(name: String, path: String, type: String, p
     }
 }
 
+/// ROUND 2, HIGH 2. `init` writes to someone else's git history, so it has to
+/// SAY SO. The commit it made must come back with its SHA and the exact paths,
+/// and the SHA must be real -- resolvable to a commit that touches those paths
+/// and nothing else.
+@Test func initReportsTheCommitItMadeSoItCanBeAnnounced() throws {
+    let (root, repo) = try makeDependentGitFixture()
+    try withTempDirectories(root) {
+        let commit = try InitRunner.ensureLockfileTracked(repo: repo)
+        guard let commit else {
+            Issue.record("init committed the lockfile but reported no commit to announce")
+            return
+        }
+        let git = Git(repo: repo)
+        #expect(commit.sha == (try git.head()), "the announced SHA must be the commit it made")
+        #expect(commit.paths == ["Package.resolved"], """
+            the fixture's .gitignore is already tracked and unchanged, so the commit is exactly \
+            the lockfile; got \(commit.paths)
+            """)
+        let touched = try git.run(["show", "--name-only", "--format=", commit.sha])
+            .split(separator: "\n").map(String.init)
+        #expect(touched == ["Package.resolved"],
+                "the announced paths must be the whole of what was committed; got \(touched)")
+    }
+}
+
+/// Nothing to commit must be reported as nothing, not as a commit that did not
+/// happen -- `init --force` on an already-prepared repository is the common case.
+@Test func initReportsNoCommitWhenNothingNeededOne() throws {
+    let (root, repo) = try makeDependentGitFixture()
+    try withTempDirectories(root) {
+        _ = try InitRunner.ensureLockfileTracked(repo: repo)
+        #expect(try InitRunner.ensureLockfileTracked(repo: repo) == nil,
+                "a second run has nothing to commit and must say so")
+    }
+}
+
+/// ROUND 2, MEDIUM 4. Both lockfile refusals say "refusing to configure this
+/// repository". In round 1 they ran as the LAST statement of `run`, after
+/// config.yaml, program.md and .gitignore were already on disk -- telling the
+/// operator it was refusing to do something it had just finished doing. The
+/// probe and its refusals are now their own step, `resolveLockfile`, which
+/// `run` calls BEFORE the first write and which commits nothing.
+@Test func lockfileRefusalHappensBeforeAnythingIsWrittenOrCommitted() throws {
+    let (root, repo) = try makeDependentGitFixture()
+    try withTempDirectories(root) {
+        let gitignore = repo.appendingPathComponent(".gitignore")
+        try (try String(contentsOf: gitignore, encoding: .utf8) + "Package.resolved\n")
+            .write(to: gitignore, atomically: true, encoding: .utf8)
+        let sh = URL(fileURLWithPath: "/bin/sh")
+        _ = try Subprocess.run(sh, ["-c", "git add -A && git commit -q -m ignore"],
+                               cwd: repo, env: nil, timeout: 60)
+        let git = Git(repo: repo)
+        let headBefore = try git.head()
+        // The fixture ships its own config.yaml, so "the file does not exist"
+        // proves nothing here -- its CONTENT staying byte-identical does, and
+        // program.md (which the fixture does not have) must not appear at all.
+        let configURL = repo.appendingPathComponent(".autor3search/config.yaml")
+        let configBefore = try String(contentsOf: configURL, encoding: .utf8)
+
+        #expect(throws: InitError.self) { _ = try InitRunner.resolveLockfile(repo: repo) }
+
+        #expect(try git.head() == headBefore, "a refusal must not have committed anything")
+        #expect(try String(contentsOf: configURL, encoding: .utf8) == configBefore,
+                "resolveLockfile must not write the config it refuses over")
+        #expect(!FileManager.default.fileExists(
+            atPath: repo.appendingPathComponent("program.md").path),
+                "resolveLockfile must run before program.md is written, not after")
+    }
+}
+
+/// A dependency-free package still has `.gitignore` to track, and that is the
+/// whole of its commit.
+@Test func initCommitsOnlyGitignoreForADependencyFreePackage() throws {
+    let dir = tempDir()
+    try withTempDirectories(dir) {
+        try FileManager.default.createDirectory(at: dir.appendingPathComponent("Sources/Lib"),
+                                                withIntermediateDirectories: true)
+        try write("// swift-tools-version: 6.0\nimport PackageDescription\n" +
+                  "let package = Package(name: \"f\", targets: [.target(name: \"Lib\")])\n",
+                  to: dir.appendingPathComponent("Package.swift"))
+        try write("public func f() -> Int { 1 }\n", to: dir.appendingPathComponent("Sources/Lib/Lib.swift"))
+        let sh = URL(fileURLWithPath: "/bin/sh")
+        let setup = try Subprocess.run(sh, ["-c", """
+            git init -q -b main . && git config user.name Test && git config user.email t@e.com \
+            && git add -A && git commit -q -m one
+            """], cwd: dir, env: nil, timeout: 120)
+        #expect(setup.exitCode == 0, "\(setup.stderr)")
+
+        #expect(try InitRunner.resolveLockfile(repo: dir) == .notProduced)
+        try InitRunner.ensureGitignoreCoversBuildOutput(repo: dir)
+        let commit = try InitRunner.ensureLockfileTracked(repo: dir)
+        #expect(commit?.paths == [".gitignore"], "got \(commit?.paths.description ?? "nil")")
+        #expect(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("Package.resolved").path),
+                "SwiftPM must not have invented a lockfile for a package with no dependencies")
+    }
+}
+
 /// THE SECOND-ORDER HOLE, CLOSED AT THE SOURCE. `doctor` used to advise
 /// "commit or .gitignore it". A repository that took the .gitignore branch has
 /// `packageResolvedSHA256` pinning the hash of zero bytes forever -- every

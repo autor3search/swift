@@ -543,8 +543,46 @@ public enum InitRunner {
     /// multi-file writer without a journal, and orthogonal to the "refuses to
     /// configure what it cannot measure" behaviour this function exists to
     /// guarantee.
+    /// ROUND 2: the lockfile probe and its two refusals (`lockfileGitIgnored`,
+    /// `lockfileOutOfDate`) moved AHEAD of the writes, so their wording --
+    /// "refusing to configure this repository" -- is now literally true. In
+    /// round 1 they ran as the last statement of `run`, after `config.yaml`,
+    /// `program.md` and `.gitignore` were already on disk, and told the
+    /// operator it was refusing to do something it had just done. Only the
+    /// COMMIT stays at the end, where it belongs: there is nothing to commit
+    /// until `.gitignore` has been written.
     @discardableResult
     public static func run(repo: URL, force: Bool) throws -> Config {
+        try runReportingCommit(repo: repo, force: force).config
+    }
+
+    /// The single commit `init` makes, so `InitCommand` can announce it.
+    ///
+    /// An unannounced commit in someone else's repository is not acceptable
+    /// even when it is the correct thing to do, so this carries exactly what a
+    /// human needs to audit or undo it: the SHA and the paths.
+    public struct HarnessCommit: Equatable, Sendable {
+        public let sha: String
+        public let paths: [String]
+        public init(sha: String, paths: [String]) {
+            self.sha = sha
+            self.paths = paths
+        }
+    }
+
+    /// What `init` did, including the commit it made (`nil` when nothing needed
+    /// committing -- both files already tracked and unchanged).
+    ///
+    /// Separate from `run(repo:force:)` rather than a change to its return
+    /// type: that signature is called from the integration tests and from
+    /// `BaselineCommand`'s neighbourhood, and widening it would churn callers
+    /// that do not care.
+    public struct Outcome: Sendable {
+        public let config: Config
+        public let harnessCommit: HarnessCommit?
+    }
+
+    public static func runReportingCommit(repo: URL, force: Bool) throws -> Outcome {
         let configURL = repo.appendingPathComponent(".autor3search/config.yaml")
         if !force, FileManager.default.fileExists(atPath: configURL.path) {
             throw InitError.configExists
@@ -579,15 +617,21 @@ public enum InitRunner {
         let tag = todayTag()
         let programMDText = ProgramMD.render(config: config, tag: tag)
 
+        // LAST refusal, and still ahead of the first write: resolve the
+        // dependency graph and refuse an ignored or out-of-date lockfile now,
+        // while "refusing to configure this repository" is a true statement.
+        let requirement = try resolveLockfile(repo: repo)
+
         try FileManager.default.createDirectory(
             at: configURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try configText.write(to: configURL, atomically: true, encoding: .utf8)
         try programMDText.write(
             to: repo.appendingPathComponent("program.md"), atomically: true, encoding: .utf8)
         try ensureGitignoreCoversBuildOutput(repo: repo)
-        try ensureLockfileTracked(repo: repo)
+        let harnessCommit = try commitHarnessPrerequisites(
+            repo: repo, paths: requirement.pathsToTrack)
 
-        return config
+        return Outcome(config: config, harnessCommit: harnessCommit)
     }
 
     // =====================================================================
@@ -625,16 +669,49 @@ public enum InitRunner {
     /// `ensureGitignoreCoversBuildOutput` is, so the git behaviour can be
     /// bound without a full `run()` (which needs a real benchmark package and
     /// therefore the network).
-    static func ensureLockfileTracked(repo: URL) throws {
+    @discardableResult
+    static func ensureLockfileTracked(repo: URL) throws -> HarnessCommit? {
+        let requirement = try resolveLockfile(repo: repo)
+        return try commitHarnessPrerequisites(repo: repo, paths: requirement.pathsToTrack)
+    }
+
+    /// Whether this package needs a lockfile tracked, and therefore which paths
+    /// `init`'s one commit has to cover.
+    enum LockfileRequirement: Equatable, Sendable {
+        case required
+        case notProduced
+
+        /// `.gitignore` is in both cases because `init` writes it either way
+        /// and it has to be tracked before `baseline` freezes: `.build/` must
+        /// be ignored AT `frozenCommit`, or the pinned worktree's `clean -fd`
+        /// deletes the warm build cache on every eval.
+        var pathsToTrack: [String] {
+            self == .required ? [Lockfile.name, ".gitignore"] : [".gitignore"]
+        }
+    }
+
+    /// The probe and every refusal that depends on it -- and NOTHING that
+    /// writes into the repository's tracked files or git history.
+    ///
+    /// Split out from the commit half in round 2 so `run` can call it BEFORE
+    /// `config.yaml`, `program.md` and `.gitignore` exist. Both refusals it
+    /// raises say "refusing to configure this repository", which was false
+    /// when this ran last: the repository had already been configured on disk.
+    /// Now nothing has been written when either fires.
+    ///
+    /// `Lockfile.probe` does write -- `Package.resolved` and `.build/` -- but
+    /// those are SwiftPM's own artefacts, idempotent, and `.build/` was already
+    /// created by the `swift package describe` that runs before this. Neither
+    /// is part of the "either every file this tool writes appears, or none
+    /// does" guarantee the ordering exists to protect.
+    static func resolveLockfile(repo: URL) throws -> LockfileRequirement {
         switch Lockfile.probe(in: repo) {
         case .undetermined(let why):
             throw InitError.dependencyResolveFailed(why)
         case .notProduced:
             // No external dependencies anywhere in the graph. SwiftPM has said
             // so itself; there is no lockfile to track and never will be.
-            // `.gitignore` may still need its first commit.
-            try commitHarnessPrerequisites(repo: repo, paths: [".gitignore"])
-            return
+            return .notProduced
         case .required:
             break
         }
@@ -652,14 +729,14 @@ public enum InitRunner {
         // requires git and refuses an unpinned dependency set on its own, so
         // the guarantee is not lost, only deferred to the command that can
         // actually enforce it.
-        guard let tracked = Lockfile.isTracked(repo: repo) else { return }
-        if tracked, try isModified(repo: repo, path: Lockfile.name) {
+        if Lockfile.isTracked(repo: repo) == true,
+           try isModified(repo: repo, path: Lockfile.name) {
             // resolve rewrote a lockfile that was already committed: the
             // manifest and the pins disagree. That is a dependency change, and
             // init does not make one silently.
             throw InitError.lockfileOutOfDate
         }
-        try commitHarnessPrerequisites(repo: repo, paths: [Lockfile.name, ".gitignore"])
+        return .required
     }
 
     /// Commits whichever of `paths` git currently reports as untracked or
@@ -673,9 +750,12 @@ public enum InitRunner {
     /// A no-op when nothing needs committing -- which also keeps `git commit`
     /// from failing with "nothing to commit" and turning a clean re-run of
     /// `init --force` into an error.
-    private static func commitHarnessPrerequisites(repo: URL, paths: [String]) throws {
+    /// Returns what it committed, so `InitCommand` can ANNOUNCE it. `nil` means
+    /// nothing needed committing.
+    @discardableResult
+    private static func commitHarnessPrerequisites(repo: URL, paths: [String]) throws -> HarnessCommit? {
         let git = Git(repo: repo)
-        guard (try? git.run(["rev-parse", "--git-dir"])) != nil else { return }
+        guard (try? git.run(["rev-parse", "--git-dir"])) != nil else { return nil }
 
         var pending: [String] = []
         for path in paths {
@@ -683,13 +763,14 @@ public enum InitRunner {
                 atPath: repo.appendingPathComponent(path).path) else { continue }
             if (try? isModified(repo: repo, path: path)) == true { pending.append(path) }
         }
-        guard !pending.isEmpty else { return }
+        guard !pending.isEmpty else { return nil }
 
         do {
             try git.run(["add", "--"] + pending)
             try git.run(["commit", "-q", "-m",
                          "chore: track \(pending.joined(separator: " and ")) for autor3search-swift",
                          "--"] + pending)
+            return HarnessCommit(sha: try git.head(), paths: pending)
         } catch {
             throw InitError.prerequisiteCommitFailed("\(error)")
         }

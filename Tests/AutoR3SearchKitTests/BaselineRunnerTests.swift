@@ -281,6 +281,62 @@ func makeDependentGitFixture() throws -> (root: URL, repo: URL) {
     }
 }
 
+/// ROUND 2, LOW 6. `sha256File` throwing now reaches beyond the lockfile: a
+/// repository with no `.autor3search/config.yaml` -- `baseline` run before
+/// `init`, the ordinary mistake -- used to be pinned with the hash of zero
+/// bytes and is now refused. Right, but in round 1 the refusal happened at the
+/// BOTTOM of `run`, after the run branch, the frozen snapshot and the pinned
+/// worktree had all been created, leaving every one of them behind for an error
+/// knowable before the first side effect. The hashes are now read up front.
+@Test func baselineRefusesAMissingConfigBeforeTakingAnySideEffect() throws {
+    let (repo, git) = try makeGitFixture()
+    let env = isolatedStateEnv()
+    try withTempDirectories(repo, URL(fileURLWithPath: env[StateHome.envKey] ?? "/dev/null")) {
+        let sh = URL(fileURLWithPath: "/bin/sh")
+        let rm = try Subprocess.run(
+            sh, ["-c", "git rm -q -r --cached .autor3search && rm -rf .autor3search && " +
+                       "git commit -q -m 'drop config'"],
+            cwd: repo, env: nil, timeout: 60)
+        #expect(rm.exitCode == 0, "\(rm.stderr)")
+        let headBefore = try git.head()
+
+        #expect(throws: BaselineError.self) {
+            try BaselineRunner.run(repo: repo, tag: "noconfig", env: env)
+        }
+
+        // Nothing left behind: no run branch, HEAD not moved, no state written.
+        #expect(!git.branchExists("autor3search-swift/noconfig"),
+                "a refusal knowable before any side effect must not create the run branch")
+        #expect(try git.head() == headBefore)
+        let home = try StateHome(repo: repo, env: env)
+        #expect(!FileManager.default.fileExists(atPath: try home.runDir(tag: "noconfig").path),
+                "no run directory may be created for a baseline that refuses this early")
+    }
+}
+
+/// ROUND 2, LOW 5. `Lockfile.probe`'s `.undetermined` branch is the fail-closed
+/// one: callers must never read "the check could not run" as "there is nothing
+/// to pin". It is hard to reach through `init` (a `swift package describe` that
+/// cannot resolve fails first) but trivially reachable through `baseline`,
+/// which probes the PINNED WORKTREE -- a different directory, with its own
+/// `.build`, resolved at a different moment. This binds the mechanism directly
+/// rather than leaving the branch untested because it is inconvenient to reach.
+@Test func lockfileProbeReportsUndeterminedRatherThanNotProduced() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    try withTempDirectories(dir) {
+        // Not a Swift package at all: `swift package resolve` exits non-zero.
+        guard case .undetermined(let why) = Lockfile.probe(in: dir) else {
+            Issue.record("""
+                a directory that is not a package must not answer .notProduced -- that is \
+                "the check could not run" read as "there is nothing to pin"
+                """)
+            return
+        }
+        #expect(!why.isEmpty, "the reason must carry why, for the operator to act on")
+    }
+}
+
 /// A repository that DOES track its lockfile is pinned to that file's real
 /// bytes -- the thing the whole fix exists to make true.
 @Test func baselinePinsTheRealLockfileWhenOneIsTracked() throws {

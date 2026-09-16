@@ -343,3 +343,125 @@ private final class CountingSource: MetricSource, @unchecked Sendable {
     try Data().write(to: url)
     #expect(EvalRunner.nextExperimentNumber(at: url) == 1)
 }
+
+// =========================================================================
+// MARK: - Gate 2a: manifest integrity by hash, not by path
+// =========================================================================
+//
+// Gate 1 asks git which PATHS changed; gate 2b asks git whether the tree is
+// clean. Both read the index, and an agent with a shell owns the index. These
+// tests perform the REAL attack -- `git update-index --assume-unchanged` -- not
+// a simulation of it, and assert that the harness now rejects it.
+
+/// THE BYPASS. `--assume-unchanged` tells git to stop looking at the file's
+/// working-tree state; the manifest can then be rewritten with `-Ounchecked`
+/// while `git status --porcelain` stays EMPTY and `git diff frozenCommit HEAD`
+/// names only the in-scope source file. `swift build` reads the file on disk,
+/// so the candidate is compiled with bounds checking OFF -- winning the
+/// measurement without anyone writing faster code, which is precisely what this
+/// tool exists to prevent.
+///
+/// The test asserts the git-level premise first. Without those two assertions
+/// it would be impossible to tell a working gate from a bypass that silently
+/// stopped working (e.g. if a future git refused `--assume-unchanged`), and a
+/// test that passes for the wrong reason is worse than no test.
+@Test func assumeUnchangedManifestBypassIsRejectedByHash() throws {
+    let (repo, _) = try makeGitFixture()
+    let env = isolatedStateEnv()
+    defer { cleanUpFixture(repo: repo, env: env) }
+    let record = try BaselineRunner.run(repo: repo, tag: "t", env: env)
+    let sh = URL(fileURLWithPath: "/bin/sh")
+
+    // Hide Package.swift from git, then rewrite it with an unsafe compiler flag.
+    let hide = try Subprocess.run(
+        sh, ["-c", "git update-index --assume-unchanged Package.swift"],
+        cwd: repo, env: nil, timeout: 60)
+    #expect(hide.exitCode == 0, "\(hide.stderr)")
+
+    let manifest = repo.appendingPathComponent("Package.swift")
+    let original = try String(contentsOf: manifest, encoding: .utf8)
+    let tampered = original.replacingOccurrences(
+        of: ".target(name: \"Lib\")",
+        with: ".target(name: \"Lib\", swiftSettings: [.unsafeFlags([\"-Ounchecked\"])])")
+    #expect(tampered != original, "the fixture manifest changed shape; the rewrite matched nothing")
+    try tampered.write(to: manifest, atomically: true, encoding: .utf8)
+
+    // A perfectly ordinary, in-scope, committed source change rides along.
+    try makeInScopeCommit(repo, "innocent looking")
+
+    // THE PREMISE, asserted rather than assumed: both path-based gates are blind.
+    let status = try Subprocess.run(sh, ["-c", "git status --porcelain"],
+                                    cwd: repo, env: nil, timeout: 60)
+    #expect(status.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            "the bypass did not work -- gate 2b would have caught this anyway: \(status.stdout)")
+    let changed = try Git(repo: repo).changedPaths(since: record.frozenCommit)
+    #expect(!changed.contains("Package.swift"),
+            "the bypass did not work -- gate 1 would have caught this anyway: \(changed)")
+    #expect(try String(contentsOf: manifest, encoding: .utf8).contains("-Ounchecked"),
+            "the tampered manifest must actually be the one on disk")
+
+    // And yet the hash gate sees it.
+    let v = try EvalRunner.run(repo: repo, env: env, source: NeverCalledSource(), now: Date.init)
+    #expect(v.kind == .fail)
+    #expect(v.reason == "manifest_change_rejected", "got \(v.reason ?? "nil")")
+}
+
+/// The same door, for the lockfile, in the `absentPin` case. `baseline`
+/// recorded that this package produces no `Package.resolved`; one APPEARING
+/// changes the dependency set the candidate builds against. A lockfile named in
+/// `.gitignore` is invisible to `git status`, so gate 2b sees a clean tree --
+/// which is exactly the state `doctor` used to recommend creating.
+@Test func aLockfileAppearingWhereBaselineRecordedNoneIsRejected() throws {
+    let (repo, _) = try makeGitFixture()
+    let env = isolatedStateEnv()
+    defer { cleanUpFixture(repo: repo, env: env) }
+    let sh = URL(fileURLWithPath: "/bin/sh")
+
+    // The ignore rule has to predate the freeze. Committing it AFTER baseline
+    // would put `.gitignore` in the frozenCommit..HEAD diff, and `.gitignore`
+    // is not in `scope` -- gate 1 would answer `out_of_scope` and this test
+    // would pass without ever reaching the gate it exists to bind. (Observed:
+    // it did exactly that on the first attempt.)
+    let gitignore = repo.appendingPathComponent(".gitignore")
+    try (try String(contentsOf: gitignore, encoding: .utf8) + "Package.resolved\n")
+        .write(to: gitignore, atomically: true, encoding: .utf8)
+    let commit = try Subprocess.run(sh, ["-c", "git add -- .gitignore && git commit -q -m ignore"],
+                                    cwd: repo, env: nil, timeout: 60)
+    #expect(commit.exitCode == 0, "\(commit.stderr)")
+
+    let record = try BaselineRunner.run(repo: repo, tag: "t", env: env)
+    #expect(record.packageResolvedSHA256 == Lockfile.absentPin,
+            "the dependency-free fixture must record absence, not a hash")
+
+    // Now the lockfile arrives, invisibly.
+    try "{ \"pins\": [], \"version\": 3 }\n".write(
+        to: Lockfile.url(in: repo), atomically: true, encoding: .utf8)
+    try makeInScopeCommit(repo, "innocent looking")
+
+    let status = try Subprocess.run(sh, ["-c", "git status --porcelain"],
+                                    cwd: repo, env: nil, timeout: 60)
+    #expect(status.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            "the ignored lockfile must be invisible to gate 2b: \(status.stdout)")
+
+    let v = try EvalRunner.run(repo: repo, env: env, source: NeverCalledSource(), now: Date.init)
+    #expect(v.kind == .fail)
+    #expect(v.reason == "manifest_change_rejected", "got \(v.reason ?? "nil")")
+}
+
+/// The other direction, and the reason the gate is safe to add: an untouched
+/// manifest must pass it. Called directly rather than through a whole `eval` so
+/// this stays a pure assertion about the gate itself.
+@Test func manifestIntegrityPassesAnUntouchedRepository() throws {
+    let (repo, _) = try makeGitFixture()
+    let env = isolatedStateEnv()
+    defer { cleanUpFixture(repo: repo, env: env) }
+    let record = try BaselineRunner.run(repo: repo, tag: "t", env: env)
+    #expect(EvalRunner.manifestIntegrityFailure(repo: repo, record: record) == nil)
+
+    // A deleted manifest is a MISMATCH, not a thrown harness error: the
+    // experiment is rejected with a scored verdict and a results.tsv row.
+    try FileManager.default.removeItem(at: repo.appendingPathComponent("Package.swift"))
+    let failure = EvalRunner.manifestIntegrityFailure(repo: repo, record: record)
+    #expect(failure?.reason == "manifest_change_rejected")
+    #expect(failure?.detail.contains("missing") == true)
+}

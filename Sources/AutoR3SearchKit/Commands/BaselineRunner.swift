@@ -372,6 +372,27 @@ public enum BaselineRunner {
             throw BaselineError.tagInUse(tag)
         }
 
+        // Hashed HERE, before the first side effect, not at the bottom next to
+        // the lockfile pin.
+        //
+        // ROUND 2, raised as LOW 6. `sha256File` now THROWS on a missing file
+        // (which is the whole point -- it used to answer "the hash of zero
+        // bytes" and that is how the dependency pin came to pin nothing). But
+        // in round 1 these two calls still sat at the bottom of `run`, so a
+        // repository with no `.autor3search/config.yaml` -- `baseline` run
+        // before `init`, the ordinary mistake -- now failed AFTER the run
+        // branch had been created, the frozen snapshot written and the
+        // worktree pinned, leaving all of it behind for an error that was
+        // knowable from the start. Reading them up here restores the ordering
+        // guarantee this function's own doc comment claims: every refusal that
+        // can happen leaves nothing to clean up.
+        //
+        // It also closes a TOCTOU window. Recording a hash taken at the end
+        // would pin whatever the file became during the warm build; these are
+        // the bytes as they were when the tree was verified clean.
+        let configSHA256 = try sha256File(repo.appendingPathComponent(".autor3search/config.yaml"))
+        let packageSwiftSHA256 = try sha256File(repo.appendingPathComponent("Package.swift"))
+
         // Captured BEFORE touching the branch: creating or checking out the
         // run branch must never change which commit gets frozen.
         let commit = try git.head()
@@ -485,8 +506,8 @@ public enum BaselineRunner {
             tag: tag,
             frozenCommit: commit,
             measurementCommit: commit,
-            configSHA256: try sha256File(repo.appendingPathComponent(".autor3search/config.yaml")),
-            packageSwiftSHA256: try sha256File(repo.appendingPathComponent("Package.swift")),
+            configSHA256: configSHA256,
+            packageSwiftSHA256: packageSwiftSHA256,
             packageResolvedSHA256: packageResolvedPin,
             toolVersion: BuildInfo.version)
         try record.save(to: recordURL)

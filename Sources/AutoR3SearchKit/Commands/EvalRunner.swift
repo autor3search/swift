@@ -88,6 +88,84 @@ extension Verdict {
 public enum EvalRunner {
     public static let runBranchPrefix = "autor3search-swift/"
 
+    /// Gate 2a. Compares `Package.swift` and `Package.resolved` AS THEY ARE ON
+    /// DISK against the hashes `baseline` recorded, and returns the failure to
+    /// answer with, or `nil` when both match.
+    ///
+    /// See the call site for the bypass this closes. Three deliberate details:
+    ///
+    /// - **A missing file is a MISMATCH, never a throw.** `sha256File` now
+    ///   refuses to hash a file that is not there, which is right for
+    ///   `baseline` (recording a pin) and wrong here: a manifest deleted
+    ///   mid-run is an experiment to REJECT with a scored verdict, not a
+    ///   harness crash that produces no `results.tsv` row at all. `try?`
+    ///   converts the throw into `nil`, and `nil` never equals a recorded
+    ///   64-hex hash, so deletion lands in the same branch as rewriting.
+    ///
+    /// - **`Lockfile.absentPin` is checked by EXISTENCE, not by hash.** When
+    ///   `baseline` recorded that this package produces no lockfile, the
+    ///   assertion to enforce is "there is still no lockfile" -- a
+    ///   `Package.resolved` APPEARING is the change. That is not a hypothetical
+    ///   either: an ignored lockfile (the state `doctor` used to recommend and
+    ///   `init` now refuses) is invisible to `git status`, so gate 2b would see
+    ///   a clean tree while `swift build` uses the file.
+    ///
+    /// - **Pure read.** No file is written and no subprocess is run, so this
+    ///   keeps gate 1-4's "reject before anything is built or measured"
+    ///   property (spec.md section 5) intact.
+    static func manifestIntegrityFailure(repo: URL, record: BaselineRecord) -> GateFailure? {
+        let bypassNote = """
+            This is checked by HASH against the bytes on disk, not by which paths git reports as \
+            changed: `git update-index --assume-unchanged` (or `--skip-worktree`) hides an edit \
+            from both the scope gate and the dirty-tree gate, while `swift build` still reads the \
+            edited file. Restore the file to what baseline recorded, or start a new run with a \
+            new baseline if the change is intended.
+            """
+
+        let livePackageSwift = try? BaselineRunner.sha256File(
+            repo.appendingPathComponent("Package.swift"))
+        if livePackageSwift != record.packageSwiftSHA256 {
+            return GateFailure(reason: "manifest_change_rejected", detail: """
+                Package.swift on disk does not match what baseline recorded \
+                (\(livePackageSwift.map { "sha256 \($0)" } ?? "the file is missing") vs \
+                \(record.packageSwiftSHA256)). The manifest decides how the candidate is \
+                COMPILED -- `-Ounchecked` alone turns off bounds checking, which wins a \
+                measurement without anyone writing faster code -- so any change to it is \
+                rejected outright.
+
+                \(bypassNote)
+                """)
+        }
+
+        if record.packageResolvedSHA256 == Lockfile.absentPin {
+            guard !Lockfile.exists(in: repo) else {
+                return GateFailure(reason: "manifest_change_rejected", detail: """
+                    a \(Lockfile.name) exists on disk, but baseline recorded that this package \
+                    produces none (it resolved no external dependencies). A lockfile appearing \
+                    mid-run means the dependency set the candidate is built against is no longer \
+                    the one that was pinned.
+
+                    \(bypassNote)
+                    """)
+            }
+            return nil
+        }
+
+        let liveLockfile = try? BaselineRunner.sha256File(Lockfile.url(in: repo))
+        if liveLockfile != record.packageResolvedSHA256 {
+            return GateFailure(reason: "manifest_change_rejected", detail: """
+                \(Lockfile.name) on disk does not match what baseline recorded \
+                (\(liveLockfile.map { "sha256 \($0)" } ?? "the file is missing") vs \
+                \(record.packageResolvedSHA256)). That file pins every dependency version the \
+                candidate is built against; gate 2 exists so the agent cannot win by changing a \
+                dependency instead of the code.
+
+                \(bypassNote)
+                """)
+        }
+        return nil
+    }
+
     /// Runs one experiment end to end and returns its verdict.
     ///
     /// Throws only on a genuine harness failure (the executable turns that
@@ -271,6 +349,44 @@ public enum EvalRunner {
                 and an agent that can edit them can win without making anything faster.
                 """))
         }
+        // ---- Gate 2a: manifest integrity, by HASH, not by path ----
+        //
+        // THE PATH GATES ARE NOT ENOUGH, and this is a live bypass, not a
+        // theoretical one. Gate 1 asks git which PATHS changed between
+        // `frozenCommit` and `HEAD`; gate 2b asks git whether the tree is
+        // clean. Both answers come from git's index -- and an agent with a
+        // shell owns the index:
+        //
+        //     git update-index --assume-unchanged Package.swift
+        //     <rewrite Package.swift>            # e.g. add -Ounchecked
+        //     <edit and commit an in-scope source file>
+        //
+        // `git status --porcelain` is then EMPTY (gate 2b sees a clean tree)
+        // and `git diff --name-only frozenCommit HEAD` names only the source
+        // file (gate 1 sees no manifest path) -- while `swift build`, which
+        // reads the file ON DISK and not out of git, compiles the rewritten
+        // manifest. `--skip-worktree` does the same thing. The prize is
+        // exactly what this tool exists to prevent: `-Ounchecked` turns off
+        // bounds checking, which wins the measurement without anyone writing
+        // faster code. The same trick on `Package.resolved` swaps the
+        // dependency set the benchmark is built against.
+        //
+        // So `packageSwiftSHA256` and `packageResolvedSHA256` -- recorded by
+        // `baseline` since the beginning and, until now, READ BY NOTHING --
+        // are compared here, against the bytes on disk. Hashes cannot be
+        // talked out of noticing by the index.
+        //
+        // Placement: immediately after the config-integrity guard, so it is
+        // still a pure read that runs before the restore (gate 3) writes a
+        // byte, before gate 5 builds and long before gate 8 measures. The
+        // reason string is the existing `manifest_change_rejected` vocabulary
+        // -- spec.md's gate 1 already says any change to either manifest is
+        // "rejected outright", and this is that same rule enforced through
+        // the door the path check cannot see.
+        if let failure = manifestIntegrityFailure(repo: repo, record: record) {
+            return fail(failure)
+        }
+
         do { try config.validate() }
         catch {
             return fail(GateFailure(reason: "invalid_config", detail: """

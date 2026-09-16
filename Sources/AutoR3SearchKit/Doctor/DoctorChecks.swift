@@ -435,24 +435,35 @@ public enum DoctorChecks {
                 """)
         }
 
-        if !lockfileExists, !externalDependencies.isEmpty {
+        // ONE condition, keyed on TRACKEDNESS, covering what used to be two
+        // that flipped between runs (see `all`'s comment): "declares
+        // dependencies but has no Package.resolved" and "Package.resolved
+        // exists but is untracked" are the SAME problem -- there is no tracked
+        // lockfile -- and doctor's own `swift build` turns the first into the
+        // second by creating the file. Reporting them as one stable finding is
+        // what makes repeated `doctor` runs, and `--skip-build` versus a real
+        // build, agree with each other.
+        //
+        // `lockfileExists` still counts as evidence of an external dependency
+        // set, not just `externalDependencies`: the manifest list reads DIRECT
+        // dependencies only, so a package whose path dependency pulls a
+        // source-control one has an empty list and a real lockfile.
+        let hasExternalDependencies = !externalDependencies.isEmpty || lockfileExists
+        if hasExternalDependencies, lockfileTracked != true {
+            let declared = externalDependencies.isEmpty
+                ? "resolves external dependencies"
+                : "declares external dependencies (\(externalDependencies.joined(separator: ", ")))"
             problems.append("""
-                This package declares external dependencies \
-                (\(externalDependencies.joined(separator: ", "))) and has no Package.resolved. \
-                `swift package describe` never writes that file but `swift build` does, into the \
-                package root -- so the first eval creates it and every experiment after that \
-                fails permanently as manifest_change_rejected or dirty_working_tree. Fix: \
+                This package \(declared) and git is not tracking a Package.resolved, so no \
+                dependency version is pinned. `swift package describe` never writes that file but \
+                `swift build` does, into the package root -- so an untracked copy appears by \
+                itself, the first eval creates one if nothing else has, and every experiment \
+                after that fails permanently as manifest_change_rejected or dirty_working_tree. \
+                baseline refuses this state outright. Fix, and it is the same fix whether or not \
+                an untracked copy is sitting there right now: \
                 `swift package resolve && git add Package.resolved && git commit -m "pin \
-                dependencies"` (or re-run `autor3search-swift init`, which now does this). \
-                baseline refuses this state outright.
-                """)
-        }
-
-        if lockfileExists, lockfileTracked == false {
-            problems.append("""
-                Package.resolved exists but git is not tracking it, so it is not pinned by \
-                anything and leaves the working tree permanently dirty -- which eval refuses. \
-                Fix: `git add Package.resolved && git commit -m "pin dependencies"`.
+                dependencies"` -- or re-run `autor3search-swift init`, which now does exactly \
+                that and tells you the commit it made.
                 """)
         }
 
@@ -631,12 +642,26 @@ public enum DoctorChecks {
 
         // --- The dependency pin ---
         //
-        // Deliberately does NOT run `swift package resolve` the way `init` and
-        // `baseline` do: `doctor` is a read-only report on a repository the
-        // operator may be in the middle of working in, and resolve WRITES
-        // Package.resolved and .build/. So this reports from the manifest and
-        // from git, and says plainly (via `dependencyPin`'s own wording) that
-        // the manifest signal reads direct dependencies only.
+        // CORRECTED IN ROUND 2. This used to carry a comment claiming doctor
+        // does not probe because "doctor is read-only ... resolve WRITES".
+        // That was FALSE, and provably so: `probeMeasurementBuild` below runs
+        // `swift build -c release`, which writes `Package.resolved` into the
+        // package root. Observed live -- a second `doctor` run on the same
+        // repository FLIPPED this finding from "declares external dependencies
+        // and has no Package.resolved" to "exists but git is not tracking it",
+        // because doctor itself had created the file it was warning about.
+        //
+        // Two consequences, both handled in `dependencyPin` rather than here:
+        // the finding is keyed on TRACKEDNESS, which doctor's own build cannot
+        // change, so it is identical on every run; and because it never depends
+        // on whether an untracked copy happens to be on disk, `--skip-build`
+        // (which writes nothing at all) and the normal path cannot disagree
+        // about what they report.
+        //
+        // doctor still does not ADD a `swift package resolve` of its own. Not
+        // because it would be the only write -- it would not -- but because
+        // making the answer depend on a probe would reintroduce exactly the
+        // `--skip-build`/normal-path divergence just closed.
         findings.append(dependencyPin(
             externalDependencies: (try? Lockfile.externalDependencyIdentities(repo: repo)) ?? [],
             lockfileExists: Lockfile.exists(in: repo),
