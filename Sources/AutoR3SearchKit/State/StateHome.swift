@@ -15,6 +15,16 @@ public enum StateHomeError: Error, CustomStringConvertible {
     /// repository root would then address DIFFERENT state for the SAME run.
     case relativeOverride(String)
 
+    /// `tag` (typically typed by the operator via `--tag <name>`) is not a
+    /// safe single path component. In particular a tag containing `..` — as
+    /// a whole component, or via an embedded `/` — would, once the URL is
+    /// standardized on any real file I/O, escape `root` and could resolve
+    /// anywhere on the filesystem, including back inside the repository
+    /// under test. That defeats the reason state lives outside the repo at
+    /// all, so tags are validated once, here, before any accessor builds a
+    /// path from one.
+    case invalidTag(String)
+
     public var description: String {
         switch self {
         case .relativeOverride(let value):
@@ -23,6 +33,13 @@ public enum StateHomeError: Error, CustomStringConvertible {
             value resolves against whatever directory each command happens to run from, so \
             eval from a subdirectory and stop from the repository root would address \
             different state for the same run.
+            """
+        case .invalidTag(let value):
+            return """
+            "\(value)" is not a valid run tag. A tag must be a single path component: only \
+            ASCII letters, digits, "-", "_", and "." are allowed, it must not be empty, must \
+            not contain "/" or "\\\\", and must not be "." or "..". Examples of valid tags: \
+            "sep16", "2026-09-16", "sep16_v2".
             """
         }
     }
@@ -54,31 +71,54 @@ public struct StateHome {
         self.root = base.appendingPathComponent(String(key))
     }
 
-    public func runDir(tag: String) -> URL {
-        root.appendingPathComponent(tag)
+    /// Every other accessor funnels through this one. Validating the tag
+    /// here, once, means a malformed tag is rejected in exactly one place —
+    /// seven independent per-accessor checks would be seven chances to miss
+    /// one, the same class of mistake the "every accessor" test guards
+    /// against for the out-of-repo property itself.
+    public func runDir(tag: String) throws -> URL {
+        root.appendingPathComponent(try Self.validated(tag: tag))
     }
 
-    public func baselineRecordURL(tag: String) -> URL {
-        runDir(tag: tag).appendingPathComponent("baseline.json")
+    public func baselineRecordURL(tag: String) throws -> URL {
+        try runDir(tag: tag).appendingPathComponent("baseline.json")
     }
 
-    public func frozenDir(tag: String) -> URL {
-        runDir(tag: tag).appendingPathComponent("frozen")
+    public func frozenDir(tag: String) throws -> URL {
+        try runDir(tag: tag).appendingPathComponent("frozen")
     }
 
-    public func worktreeURL(tag: String) -> URL {
-        runDir(tag: tag).appendingPathComponent("baseline-worktree")
+    public func worktreeURL(tag: String) throws -> URL {
+        try runDir(tag: tag).appendingPathComponent("baseline-worktree")
     }
 
-    public func benchStorageURL(tag: String) -> URL {
-        runDir(tag: tag).appendingPathComponent("bench-storage")
+    public func benchStorageURL(tag: String) throws -> URL {
+        try runDir(tag: tag).appendingPathComponent("bench-storage")
     }
 
-    public func runClaimURL(tag: String) -> URL {
-        runDir(tag: tag).appendingPathComponent("run.claim")
+    public func runClaimURL(tag: String) throws -> URL {
+        try runDir(tag: tag).appendingPathComponent("run.claim")
     }
 
-    public func stopRequestURL(tag: String) -> URL {
-        runDir(tag: tag).appendingPathComponent("stop.request")
+    public func stopRequestURL(tag: String) throws -> URL {
+        try runDir(tag: tag).appendingPathComponent("stop.request")
+    }
+
+    /// ASCII letters, digits, `-`, `_`, `.` — the family of tags the brief
+    /// documents (`sep16`, `2026-09-16`, `sep16_v2`). `.` is included for
+    /// dates but a tag that is entirely `.` or `..` is still rejected below,
+    /// since as a whole path component either would resolve to `root` itself
+    /// or escape it to `root`'s parent.
+    private static let allowedTagCharacters = CharacterSet(
+        charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.")
+
+    private static func validated(tag: String) throws -> String {
+        guard !tag.isEmpty,
+              tag != ".", tag != "..",
+              tag.unicodeScalars.allSatisfy({ allowedTagCharacters.contains($0) })
+        else {
+            throw StateHomeError.invalidTag(tag)
+        }
+        return tag
     }
 }
