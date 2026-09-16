@@ -6,10 +6,19 @@ import Foundation
 public enum GitError: Error, CustomStringConvertible {
     case command(String, Int32, String)
 
+    /// Output was capped mid-stream (`ProcessDataResult.outputTruncated`)
+    /// for a command whose caller needs the complete, exact bytes —
+    /// `fileContents` and `changedPaths`. Returning the truncated prefix as
+    /// though it were complete would be silent data corruption, which this
+    /// project exists to avoid; this makes it a loud failure instead.
+    case truncated(String)
+
     public var description: String {
         switch self {
         case .command(let args, let rc, let stderr):
             return "git \(args) exited \(rc): \(stderr)"
+        case .truncated(let args):
+            return "git \(args) output was truncated (exceeded the capture cap) — refusing to return partial data"
         }
     }
 }
@@ -71,11 +80,31 @@ public struct Git: Sendable {
     /// — rename-detection defaults are git-version and config dependent, so
     /// leaving them on would also make this non-deterministic across
     /// machines.
+    ///
+    /// Goes through `Subprocess.runData`, NOT `Git.run` — `run` trims the
+    /// *whole* decoded String with `.trimmingCharacters(in:
+    /// .whitespacesAndNewlines)` before this function would ever get to
+    /// split it, which would silently eat a leading space from the first
+    /// path in the output. Splitting the raw bytes on the 0x00 terminator
+    /// and decoding each path from its own byte slice means no String-level
+    /// trimming ever touches path data, so a leading or trailing space
+    /// inside a real filename survives intact. Also checks
+    /// `outputTruncated`, for the same reason `fileContents` does below: a
+    /// silently truncated file list would silently drop paths from Task
+    /// 17's scope gate rather than fail loudly.
     public func changedPaths(since commit: String) throws -> [String] {
-        let output = try run(["diff", "-z", "--no-renames", "--name-only", commit, "HEAD"])
-        return output.isEmpty
-            ? []
-            : output.split(separator: "\u{0}", omittingEmptySubsequences: true).map(String.init).sorted()
+        let args = ["diff", "-z", "--no-renames", "--name-only", commit, "HEAD"]
+        let result = try Subprocess.runData(Git.gitBinary, args, cwd: repo, env: nil, timeout: 120)
+        guard result.exitCode == 0 else {
+            throw GitError.command(args.joined(separator: " "), result.exitCode, result.stderr)
+        }
+        guard !result.outputTruncated else {
+            throw GitError.truncated(args.joined(separator: " "))
+        }
+        return result.stdout
+            .split(separator: 0x00)
+            .map { String(decoding: $0, as: UTF8.self) }
+            .sorted()
     }
 
     /// Returns the exact bytes of `path` as it existed at `commit`. Uses
@@ -83,10 +112,28 @@ public struct Git: Sendable {
     /// a non-UTF-8 encoding round-trips exactly — `run`'s `String` decoding
     /// silently repairs invalid byte sequences to U+FFFD, which would
     /// corrupt the blob before this function ever saw it.
+    ///
+    /// Also refuses a truncated read: `runData`'s default `outputCapBytes`
+    /// (4 MiB) would otherwise let a larger blob come back silently
+    /// half-written, indistinguishable from a complete, small file — the
+    /// exact class of silent corruption this project exists to catch.
     public func fileContents(_ path: String, at commit: String) throws -> Data {
-        let result = try Subprocess.runData(Git.gitBinary, ["show", "\(commit):\(path)"], cwd: repo, env: nil, timeout: 60)
+        try fileContents(path, at: commit, outputCapBytes: 4 << 20)
+    }
+
+    /// Test-only entry point for binding the truncation guard above without
+    /// exposing a cap parameter on the public, fixed-interface
+    /// `fileContents(_:at:)` — an explicit small cap on a modest blob is the
+    /// cheap way to make `outputTruncated` actually trip in a test.
+    func fileContents(_ path: String, at commit: String, outputCapBytes: Int) throws -> Data {
+        let result = try Subprocess.runData(
+            Git.gitBinary, ["show", "\(commit):\(path)"], cwd: repo, env: nil, timeout: 60,
+            outputCapBytes: outputCapBytes)
         guard result.exitCode == 0 else {
             throw GitError.command("show \(commit):\(path)", result.exitCode, result.stderr)
+        }
+        guard !result.outputTruncated else {
+            throw GitError.truncated("show \(commit):\(path)")
         }
         return result.stdout
     }

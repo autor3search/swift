@@ -74,35 +74,27 @@ private func tempRepo() throws -> (URL, Git) {
 // fixed, for those four specifically. Every test below uses
 // `withTempDirectories` instead, so a thrown assertion can't leak a fixture.
 
-/// Neutralizes the operator's global (`~/.gitconfig`) and system
-/// (`/etc/gitconfig`) git config for every child process this test binary
-/// spawns from here on. `Subprocess.run(..., env: nil)` resolves to
-/// `ProcessInfo.processInfo.environment`, and `setenv` mutates exactly
-/// that — so this reaches every `git` invocation any test in this file
-/// makes, including the ones inside the four frozen tests' own `env: nil`
-/// calls, without touching a single character of those tests' bodies.
-///
-/// This is defense-in-depth, not a hard guarantee for the four frozen tests
-/// specifically: Swift does not run a non-`main.swift` file's top-level
-/// `let` eagerly, and swift-testing does not guarantee execution order
-/// across independent `@Test` functions, so in principle an unlucky
-/// scheduler could run a frozen test's `git commit` before anything below
-/// has referenced this value. In practice `withTempDirectories` references
-/// it from the very first fixture any test in this file creates, and once
-/// computed it stays set for the rest of the process. The fully
-/// deterministic alternative, if this is ever observed to matter in CI, is
-/// exporting `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL=/dev/null` in
-/// the CI job's own environment before invoking `swift test`.
-private let gitEnvironmentIsNeutralized: Bool = {
-    setenv("GIT_CONFIG_NOSYSTEM", "1", 1)
-    setenv("GIT_CONFIG_GLOBAL", "/dev/null", 1)
-    return true
-}()
+// HERMETICITY REQUIREMENT (not enforced in-process — see fix round 2):
+// these tests assume the operator's global (`~/.gitconfig`) and system
+// (`/etc/gitconfig`) git config does not do anything that would make a
+// `git commit` or `git checkout` fail or behave unexpectedly (e.g. a forced
+// `commit.gpgsign` with no usable key, or hooks that reject a commit). Fix
+// round 1 tried an in-process `setenv("GIT_CONFIG_NOSYSTEM", ...)`
+// mitigation and fix round 2 removed it: it ran too late to cover the one
+// command it was meant to protect (every test's `git commit` happens in
+// `tempRepo()`, before any test body — including this file's own new
+// tests — ever touched the priming value), and it raced with concurrent
+// `Subprocess.run(env: nil)` calls reading `environ` on other threads,
+// since swift-testing parallelizes by default and `setenv` can `realloc`
+// the array `ProcessInfo.processInfo.environment` iterates. If this is
+// ever observed to matter in CI, the deterministic fix — no ordering
+// dependency, no concurrency hazard — is exporting `GIT_CONFIG_NOSYSTEM=1`
+// and `GIT_CONFIG_GLOBAL=/dev/null` in the CI job's own environment before
+// invoking `swift test`.
 
 /// Removes `urls` when `body` returns OR throws, via `defer`. Shared by
-/// every test added or modified in this fix round.
+/// every test added or modified from fix round 1 onward.
 private func withTempDirectories<T>(_ urls: URL..., body: () throws -> T) rethrows -> T {
-    _ = gitEnvironmentIsNeutralized
     defer {
         for url in urls {
             try? FileManager.default.removeItem(at: url)
@@ -195,6 +187,32 @@ private func tempRepoWithGitignore() throws -> (URL, Git) {
     }
 }
 
+/// `changedPaths` must not round-trip through `Git.run`'s
+/// `.trimmingCharacters(in: .whitespacesAndNewlines)` — that trims the
+/// *whole* decoded string before any NUL-splitting happens, which would eat
+/// a leading space from the first path in the output. Splitting the raw
+/// `Data` on the 0x00 byte and decoding each path from its own slice means
+/// no String-level trimming ever touches path data, so both a leading and a
+/// trailing space inside a real filename survive.
+@Test func changedPathsPreservesLeadingAndTrailingSpacesInFilenames() throws {
+    let (dir, git) = try tempRepo()
+    try withTempDirectories(dir) {
+        let base = try git.head()
+        // " leading.txt" sorts first (space, 0x20, is less than any letter)
+        // so it would sit at the very start of the raw diff output — exactly
+        // where a whole-string trim would reach it.
+        let leading = " leading.txt"
+        let trailing = "trailing.txt "
+        try "l".write(to: dir.appendingPathComponent(leading), atomically: true, encoding: .utf8)
+        try "t".write(to: dir.appendingPathComponent(trailing), atomically: true, encoding: .utf8)
+        let sh = URL(fileURLWithPath: "/bin/sh")
+        let r = try Subprocess.run(sh, ["-c", "git add -A && git commit -q -m two"],
+                                   cwd: dir, env: nil, timeout: 60)
+        #expect(r.exitCode == 0, "fixture commit failed: \(r.stderr)")
+        #expect(try git.changedPaths(since: base) == [leading, trailing])
+    }
+}
+
 // MARK: - Finding 2: repoint's postcondition must satisfy the new verify
 
 /// `checkout --force` discards tracked modifications but leaves untracked
@@ -269,5 +287,35 @@ private func tempRepoWithGitignore() throws -> (URL, Git) {
         let commit = try git.head()
         let contents = try git.fileContents("binary.dat", at: commit)
         #expect(contents == rawBytes)
+    }
+}
+
+/// `runData`'s `outputCapBytes` defaults to 4 MiB; without checking
+/// `outputTruncated`, a blob larger than the cap would come back silently
+/// half-written and indistinguishable from a complete small file — the
+/// class of silent corruption this project exists to catch. Binds it via
+/// the test-only `fileContents(_:at:outputCapBytes:)` overload (`internal`,
+/// visible through `@testable import`) since the public, fixed-interface
+/// `fileContents(_:at:)` does not expose a cap parameter — a small explicit
+/// cap on a modest blob is the cheap way to make truncation actually trip.
+@Test func fileContentsThrowsRatherThanReturnTruncatedBytes() throws {
+    let (dir, git) = try tempRepo()
+    try withTempDirectories(dir) {
+        let big = String(repeating: "x", count: 4096)
+        try big.write(to: dir.appendingPathComponent("big.txt"), atomically: true, encoding: .utf8)
+        let sh = URL(fileURLWithPath: "/bin/sh")
+        let r = try Subprocess.run(sh, ["-c", "git add -A && git commit -q -m two"],
+                                   cwd: dir, env: nil, timeout: 60)
+        #expect(r.exitCode == 0, "fixture commit failed: \(r.stderr)")
+
+        let commit = try git.head()
+        #expect(throws: GitError.self) {
+            _ = try git.fileContents("big.txt", at: commit, outputCapBytes: 1024)
+        }
+
+        // Sanity: the same blob with a generous cap still round-trips, so
+        // the throw above is really about the cap, not something else.
+        let full = try git.fileContents("big.txt", at: commit, outputCapBytes: 1 << 20)
+        #expect(full == Data(big.utf8))
     }
 }
