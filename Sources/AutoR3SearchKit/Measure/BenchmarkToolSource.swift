@@ -83,6 +83,7 @@ public struct BenchmarkToolSource: MetricSource {
             "--path", "stdout",
             "--no-progress",
             "--metrics", "wallClock",
+            "--grouping", "benchmark",
             "--filter", anchoredFilter,
             "--benchmark-executable-paths", exe.path,
             "--baseline-storage-path", storage.path,

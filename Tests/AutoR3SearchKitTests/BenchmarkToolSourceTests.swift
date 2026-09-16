@@ -221,3 +221,42 @@ func sampleThrowsTimedOutRatherThanToolFailedOnAHang() throws {
                 "filter must be anchored and regex-escaped, got: \(captured)")
     }
 }
+
+/// `BenchmarkTool` REQUIRES `--grouping <grouping>`; omitting it fails before
+/// any benchmark runs at all (verified against `ordo-one/benchmark` 1.36.2:
+/// the exact argument list below it, minus this flag, exits 64 with
+/// "Missing expected argument '--grouping <grouping>'"). `benchmark` is the
+/// correct value here, not `metric`: each invocation is already filtered to
+/// one benchmark name and one metric (`wallClock`), and `benchmark` grouping
+/// is what produces the flat per-benchmark percentile table `parseP50`
+/// expects. This binds the literal argument vector — the only thing that
+/// would have caught this flag being dropped — so a future edit that removes
+/// or reorders it fails here instead of surfacing as an exit-64 the first
+/// time the real tool is invoked.
+@Test func sampleIncludesTheRequiredGroupingArgument() throws {
+    let script = """
+    #!/bin/sh
+    printf '%s\\n' "$@" > "$(dirname "$0")/captured-args.txt"
+    exit 0
+    """
+    let worktree = try makeFakeWorktree(target: "Bench", script: script)
+    try withTempDirectories(worktree) {
+        let storage = worktree.appendingPathComponent("bench-storage")
+        let source = BenchmarkToolSource(benchmarkTarget: "Bench", storage: storage)
+        // Exit 0 with no table still throws (noPercentileTable) — only the
+        // captured argv is being checked here.
+        _ = try? source.sample(benchmark: "A", in: worktree, config: cfg(timeoutSeconds: 30))
+
+        let captured = try String(
+            contentsOf: worktree.appendingPathComponent(".build/release/captured-args.txt"),
+            encoding: .utf8)
+        let argv = captured.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
+
+        guard let groupingIndex = argv.firstIndex(of: "--grouping") else {
+            Issue.record("argv does not contain --grouping at all: \(argv)")
+            return
+        }
+        #expect(groupingIndex + 1 < argv.count && argv[groupingIndex + 1] == "benchmark",
+                "expected --grouping to be immediately followed by \"benchmark\", got: \(argv)")
+    }
+}
