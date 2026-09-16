@@ -53,8 +53,11 @@ public struct Config: Codable, Equatable, Sendable {
     }
 
     /// Renders this config back to YAML, in the same key spelling `load`
-    /// reads (`benchmark_target`, `min_effect_pct`, etc).
-    public func serialized() -> String {
-        (try? YAMLEncoder().encode(self)) ?? ""
+    /// reads (`benchmark_target`, `min_effect_pct`, etc). Throws rather than
+    /// swallowing an encode failure into an empty string: Task 15 writes
+    /// this straight to `.autor3search/config.yaml`, and a silently empty
+    /// config file would corrupt state far from the point of failure.
+    public func serialized() throws -> String {
+        try YAMLEncoder().encode(self)
     }
 }
