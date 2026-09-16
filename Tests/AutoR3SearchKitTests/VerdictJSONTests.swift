@@ -91,20 +91,26 @@ private func tempDir() throws -> URL {
     return dir
 }
 
-@Test func jsonEncodesNaNScoreAsAStringNeverThrowsNeverZero() throws {
+@Test func jsonEncodesNaNScoreAsNullNeverThrowsNeverZero() throws {
     // The "no_measurements" verdict reports score as .nan (Scoring.decide's
     // documented behavior) - this is exactly the run where a throwing
     // encoder would silently break the agent's loop, and where substituting
     // 0.0 would be indistinguishable from a genuine zero-ratio measurement.
+    // FIX ROUND 1: a string sentinel ("NaN") was rejected too - it changes
+    // score's JSON TYPE, which is a landmine for any typed consumer
+    // declaring `score: Double` or doing `json["score"] as? Double`. The
+    // field must stay in a numeric field's type position: JSON null.
     let v = Verdict(kind: .discard, score: .nan, deltas: [], reason: "no_measurements",
                     warnings: [], unsafeHits: [], buildConfiguration: "release", stopRequested: false)
     let data = try v.jsonData()
     let o = try JSONSerialization.jsonObject(with: data) as! [String: Any]
-    #expect(o["score"] as? String == "NaN")
+    #expect(o.keys.contains("score"), "the key must be present (explicit null), not silently dropped")
+    #expect(o["score"] is NSNull, "a non-finite score must serialise as JSON null")
     #expect(o["score"] as? Double == nil, "must not silently coerce to a numeric 0")
+    #expect(o["score"] as? String == nil, "must not silently coerce to a string sentinel")
 }
 
-@Test func jsonEncodesInfiniteRatioAsAStringWithoutThrowing() throws {
+@Test func jsonEncodesInfiniteRatioAsNullWithoutThrowing() throws {
     // baselineMedian == 0 makes ratio = candidateMedian / 0 = +inf.
     let v = Verdict(kind: .discard, score: 1.0,
                     deltas: [BenchmarkDelta(benchmark: "A", baselineMedian: 0, candidateMedian: 5,
@@ -115,7 +121,32 @@ private func tempDir() throws -> URL {
     let data = try v.jsonData()
     let o = try JSONSerialization.jsonObject(with: data) as! [String: Any]
     let benchmarks = o["benchmarks"] as! [[String: Any]]
-    #expect(benchmarks[0]["ratio"] as? String == "Infinity")
+    #expect(benchmarks[0].keys.contains("ratio"), "the key must be present (explicit null), not silently dropped")
+    #expect(benchmarks[0]["ratio"] is NSNull, "a non-finite ratio must serialise as JSON null")
+    #expect(benchmarks[0]["ratio"] as? String == nil, "must not silently coerce to a string sentinel")
+    // baselineMedian == 0 is itself finite and must still round-trip as a
+    // plain number - only the +inf ratio it produces becomes null.
+    #expect(benchmarks[0]["baselineMedian"] as? Double == 0)
+}
+
+@Test func jsonDataProducesExactlyOneValidObjectForANaNScoreVerdict() throws {
+    // The constraint fix round 1 called out explicitly: jsonData() must
+    // still produce exactly one valid JSON object for a NaN-score verdict,
+    // and must still never throw - verified directly, not assumed to follow
+    // from the two tests above.
+    let v = Verdict(kind: .discard, score: .nan, deltas: [], reason: "no_measurements",
+                    warnings: [], unsafeHits: [], buildConfiguration: "release", stopRequested: false)
+    let data = try v.jsonData() // must not throw
+    let obj = try JSONSerialization.jsonObject(with: data) // must parse as exactly one JSON value
+    #expect(obj is [String: Any])
+    let text = String(decoding: data, as: UTF8.self)
+    #expect(!text.contains("\n\n"))
+    // No second top-level object concatenated after the first: a strict
+    // parse of the WHOLE buffer (JSONSerialization does not accept trailing
+    // garbage after a complete top-level value) already proves this, and a
+    // single-line, non-pretty-printed encode (asserted above) rules out a
+    // second object on a following line.
+    #expect(text.filter { $0 == "{" }.count == text.filter { $0 == "}" }.count)
 }
 
 @Test func jsonDataWithConfigEmitsCorrectedAlphaDerivedFromTheVerdictNotTheDeclaredCount() throws {
@@ -203,4 +234,27 @@ private func tempDir() throws -> URL {
         #expect(text.components(separatedBy: ResultsTSV.header).count - 1 == 1)
         #expect(try ResultsTSV.read(url).count == 1)
     }
+}
+
+@Test func resultsRowScoreIsLocaleIndependentEvenThoughStringFormatIsNot() throws {
+    // Binds the en_US_POSIX fix in ResultsRow.tsv without mutating process-
+    // global locale (which would be flaky under swift-testing's default
+    // parallel execution). Two halves:
+    //
+    // 1. Prove the failure mode is real on this platform: an unpinned
+    //    String(format:) genuinely does follow the given locale, producing
+    //    a comma decimal separator under German - not merely a
+    //    hypothetical concern.
+    // 2. Prove ResultsRow.tsv is immune regardless: it must contain the
+    //    dot-separated "0.7500" even though Locale.current (the process-
+    //    wide default `String(format:)` would otherwise follow) is left
+    //    untouched here.
+    let german = Locale(identifier: "de_DE")
+    let underGerman = String(format: "%.4f", locale: german, 0.75)
+    #expect(underGerman == "0,7500", "the failure mode this fix guards against must be real, not hypothetical")
+
+    let row = ResultsRow(experiment: 1, commit: "abc1234", status: "keep", score: 0.75,
+                         reason: "", unsafeCount: 0, toolVersion: "0.1.0", timestamp: "2026-09-16T00:00:00Z")
+    #expect(row.tsv.contains("0.7500"), "ResultsRow.tsv must pin en_US_POSIX regardless of Locale.current")
+    #expect(!row.tsv.contains("0,7500"))
 }

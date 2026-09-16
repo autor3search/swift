@@ -20,29 +20,105 @@
 //    JSON itself has no NaN/Infinity literal, and `JSONEncoder` THROWS by
 //    default on a non-conforming float - which, for this payload, would mean
 //    `eval` produces NO json at all on exactly the runs most worth reporting
-//    (a `no_measurements` discard, or a baseline that measured zero). Three
-//    options were on the table: throw (breaks the agent's loop on the runs
-//    that most need a verdict - rejected), substitute 0 (indistinguishable
-//    from a real 0.0 ratio/score - a lie, rejected per the task ruling), or
-//    represent the value as a string token via
-//    `nonConformingFloatEncodingStrategy`. This file uses the third: NaN and
-//    +/-Infinity encode as the strings "NaN", "Infinity", "-Infinity" -
-//    self-documenting, round-trippable by any consumer that checks for them,
-//    and - critically - the encode call still succeeds, so a verdict with a
-//    NaN score still produces exactly one valid JSON object on stdout.
+//    (a `no_measurements` discard, or a baseline that measured zero).
+//
+//    FIX ROUND 1: this file originally used
+//    `nonConformingFloatEncodingStrategy = .convertToString(...)`, encoding
+//    NaN/Infinity as the strings "NaN"/"Infinity"/"-Infinity". Review caught
+//    that this trades a throw for a TYPE CHANGE on `score` (and, since the
+//    strategy fires on every Double the encoder touches, on `ratio`,
+//    `baselineMedian`, `candidateMedian`, and `pValue` too): a typed
+//    consumer expecting `score: Double`, or doing `json["score"] as?
+//    Double`, gets `nil`/a decode failure - reintroducing the exact lie
+//    (score silently reads as absent/0) that rejecting `score.isNaN ? 0 :
+//    score` was meant to prevent, and doing so only on the degenerate runs
+//    that most need a clean signal.
+//
+//    The fix: every Double field that can genuinely be non-finite (`score`
+//    on `Verdict`; `baselineMedian`, `candidateMedian`, `ratio`, `pValue` on
+//    each `BenchmarkDelta`) is converted to `Double?` before it ever reaches
+//    the encoder, `nil` when `!value.isFinite`, and each field's `encode(to:)`
+//    calls `container.encode(value, forKey:)` (not `encodeIfPresent`) so a
+//    `nil` writes an explicit JSON `null` - present in the payload with the
+//    correct field name, distinguishable from "field omitted", and valid in
+//    a numeric field's type position for any consumer declaring `Double?`.
+//    `nonConformingFloatEncodingStrategy` is no longer set at all: because
+//    no non-finite Double can reach the encoder (every one was already
+//    converted to `nil`/`null` upstream), the encoder's default
+//    (throw-on-non-conforming-float) behavior is simply never triggered.
+//    Nothing is lost by dropping the NaN-vs-Infinity distinction:
+//    `reason == "no_measurements"` implies a NaN score, and a `+inf` ratio
+//    can only arise from `baselineMedian == 0`, itself visible (as `null`,
+//    by the same rule) on the same `BenchmarkDelta`. `kind` and `reason`
+//    already carry the authoritative account; `score` and the per-benchmark
+//    numbers are informational in exactly these cases.
 import Foundation
 
+private extension Double {
+    /// `self` if finite, else `nil` - the single choke point that keeps a
+    /// non-finite Double from ever reaching `JSONEncoder` in this file. A
+    /// field built from this always encodes as a JSON number or an explicit
+    /// JSON `null`, never as a string and never by throwing.
+    var finiteOrNil: Double? { isFinite ? self : nil }
+}
+
 extension Verdict {
+    /// Mirrors `BenchmarkDelta` (Task 13, frozen - untouched by this file)
+    /// field-for-field, but represents each measured Double as `Double?`,
+    /// nil when non-finite. See the file-level comment for why.
+    private struct BenchmarkDeltaPayload: Encodable {
+        let benchmark: String
+        let baselineMedian: Double?
+        let candidateMedian: Double?
+        let ratio: Double?
+        let pValue: Double?
+        let significantAtAlpha: Bool
+        let significantAtCorrected: Bool
+
+        init(_ d: BenchmarkDelta) {
+            benchmark = d.benchmark
+            baselineMedian = d.baselineMedian.finiteOrNil
+            candidateMedian = d.candidateMedian.finiteOrNil
+            ratio = d.ratio.finiteOrNil
+            pValue = d.pValue.finiteOrNil
+            significantAtAlpha = d.significantAtAlpha
+            significantAtCorrected = d.significantAtCorrected
+        }
+
+        // Manual encode(to:): synthesis would call `encodeIfPresent` for the
+        // Optional Double fields, which OMITS the key on nil. We need the
+        // opposite - an explicit `null` - so every one of these is written
+        // with plain `encode(_:forKey:)`, whose behavior for an Optional
+        // value is to encode `null` on `.none` (not to drop the key).
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(benchmark, forKey: .benchmark)
+            try c.encode(baselineMedian, forKey: .baselineMedian)
+            try c.encode(candidateMedian, forKey: .candidateMedian)
+            try c.encode(ratio, forKey: .ratio)
+            try c.encode(pValue, forKey: .pValue)
+            try c.encode(significantAtAlpha, forKey: .significantAtAlpha)
+            try c.encode(significantAtCorrected, forKey: .significantAtCorrected)
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case benchmark, baselineMedian, candidateMedian, ratio, pValue
+            case significantAtAlpha, significantAtCorrected
+        }
+    }
+
     private struct Payload: Encodable {
         let verdict: String
-        let exit_code: Int32
-        let score: Double
+        let exitCode: Int32
+        // nil (-> JSON null, never omitted - see encode(to:)) when this
+        // verdict's score is non-finite (the no_measurements case).
+        let score: Double?
         let reason: String?
         let warnings: [String]
         let unsafeHits: [UnsafeHit]
-        let benchmarks: [BenchmarkDelta]
-        let build_configuration: String
-        let stop_requested: Bool
+        let benchmarks: [BenchmarkDeltaPayload]
+        let buildConfiguration: String
+        let stopRequested: Bool
 
         // k = the number of benchmarks actually measured in this verdict
         // (`deltas.count`). Unlike `Scoring.keepAlpha(config:)` - which
@@ -52,29 +128,54 @@ extension Verdict {
         let k: Int
 
         // alpha / corrected_alpha: present only when the caller supplies a
-        // `Config` to `jsonData(config:)` (see below). When present,
-        // `corrected_alpha` is computed as `config.alpha / max(k, 1)` using
-        // THIS verdict's own `k`, not `config.benchmarks.count` - byte-
-        // identical to the correction `Scoring.decide` actually applied, by
-        // construction. Per-benchmark `significantAtAlpha` /
-        // `significantAtCorrected` on each `BenchmarkDelta` are the
-        // authoritative, always-present facts; these two scalars are a
+        // `Config` to `jsonData(config:)` (see below), in which case both
+        // are always finite by construction (`config.alpha` is a validated
+        // probability; `k` is a non-negative Int), so - unlike score/ratio/
+        // baselineMedian/candidateMedian/pValue above - these two use plain
+        // `encodeIfPresent`: omitted (key absent, not null) when no config
+        // was given, present as an ordinary JSON number otherwise. When
+        // present, `corrected_alpha` is computed as `config.alpha / max(k, 1)`
+        // using THIS verdict's own `k`, not `config.benchmarks.count` -
+        // byte-identical to the correction `Scoring.decide` actually
+        // applied, by construction. Per-benchmark `significantAtAlpha` /
+        // `significantAtCorrected` on each `BenchmarkDelta` remain the
+        // authoritative, always-present facts; these two scalars are only a
         // convenience for a consumer that wants "the" threshold without
-        // recomputing it, and are deliberately omitted (not defaulted to a
-        // guess) when no config was given.
+        // recomputing it.
         let alpha: Double?
-        let corrected_alpha: Double?
+        let correctedAlpha: Double?
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(verdict, forKey: .verdict)
+            try c.encode(exitCode, forKey: .exitCode)
+            try c.encode(score, forKey: .score) // explicit null when non-finite
+            try c.encodeIfPresent(reason, forKey: .reason)
+            try c.encode(warnings, forKey: .warnings)
+            try c.encode(unsafeHits, forKey: .unsafeHits)
+            try c.encode(benchmarks, forKey: .benchmarks)
+            try c.encode(buildConfiguration, forKey: .buildConfiguration)
+            try c.encode(stopRequested, forKey: .stopRequested)
+            try c.encode(k, forKey: .k)
+            try c.encodeIfPresent(alpha, forKey: .alpha)
+            try c.encodeIfPresent(correctedAlpha, forKey: .correctedAlpha)
+        }
 
         enum CodingKeys: String, CodingKey {
-            case verdict, exit_code, score, reason, warnings, benchmarks, k, alpha
+            case verdict, score, reason, warnings, benchmarks, k, alpha
+            case exitCode = "exit_code"
             case unsafeHits = "unsafe"
-            case build_configuration, stop_requested, corrected_alpha
+            case buildConfiguration = "build_configuration"
+            case stopRequested = "stop_requested"
+            case correctedAlpha = "corrected_alpha"
         }
     }
 
     /// Encodes this verdict as the single JSON object `--json` prints on
-    /// stdout. Never throws on NaN/Infinity (see the file-level comment);
-    /// the only realistic throw source left is a future encoder misuse.
+    /// stdout. Never throws on NaN/Infinity (see the file-level comment): a
+    /// non-finite `score` or `BenchmarkDelta` field is converted to `nil`
+    /// (-> JSON `null`) before the encoder ever sees it, so no non-finite
+    /// float value is ever handed to `JSONEncoder`.
     ///
     /// - Parameter config: optional. When supplied, the payload additionally
     ///   carries `alpha` (`config.alpha`, uncorrected) and `corrected_alpha`
@@ -92,25 +193,22 @@ extension Verdict {
         let k = deltas.count
         let payload = Payload(
             verdict: kind.rawValue,
-            exit_code: kind.exitCode,
-            score: score,
+            exitCode: kind.exitCode,
+            score: score.finiteOrNil,
             reason: reason,
             warnings: warnings,
             unsafeHits: unsafeHits,
-            benchmarks: deltas,
-            build_configuration: buildConfiguration,
-            stop_requested: stopRequested,
+            benchmarks: deltas.map(BenchmarkDeltaPayload.init),
+            buildConfiguration: buildConfiguration,
+            stopRequested: stopRequested,
             k: k,
             alpha: config?.alpha,
-            corrected_alpha: config.map { $0.alpha / Double(max(k, 1)) }
+            correctedAlpha: config.map { $0.alpha / Double(max(k, 1)) }
         )
         let encoder = JSONEncoder()
         // No pretty printing: the contract is one object on one line, not a
         // multi-line rendering that some naive stdout scraper might split.
         encoder.outputFormatting = [.sortedKeys]
-        encoder.nonConformingFloatEncodingStrategy = .convertToString(
-            positiveInfinity: "Infinity", negativeInfinity: "-Infinity", nan: "NaN"
-        )
         return try encoder.encode(payload)
     }
 
