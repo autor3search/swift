@@ -23,6 +23,22 @@ struct EvalCommand: ParsableCommand {
     var json = false
 
     func run() throws {
+        // BEFORE any child is spawned. `stop --force` sends SIGTERM to this
+        // process; with the default disposition that kills it instantly, runs
+        // no `defer`, and leaves the in-flight `swift build` / `swift test` /
+        // `BenchmarkTool` orphaned to init, still burning CPU and silently
+        // corrupting every later measurement on this machine. The trap kills
+        // that child's whole process group first. See `SignalTrap`.
+        if !SignalTrap.install() {
+            FileHandle.standardError.write(Data("""
+                warning: could not install the SIGTERM/SIGINT handler. `stop --force`, or Ctrl-C, \
+                will leave the running build, test or benchmark process orphaned and consuming \
+                CPU, which corrupts later measurements on this machine. Kill it by hand if you \
+                stop this run.
+
+                """.utf8))
+        }
+
         let repo = repoOption.repoURL
 
         // Best-effort and read-only. `jsonData(config:)` uses it only to add

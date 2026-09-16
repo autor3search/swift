@@ -140,6 +140,16 @@ public enum Subprocess {
             throw SubprocessError.launchFailed("\(error)")
         }
 
+        // Publish this child's process group so a SIGTERM from `stop --force`
+        // (or a Ctrl-C) can kill its whole tree before we die -- otherwise the
+        // child, which is its own group leader, is orphaned to init and keeps
+        // burning CPU, corrupting every later measurement on the machine. This
+        // is a no-op unless the executable installed the trap; see
+        // `SignalTrap`. Cleared below once the child has been reaped, so a
+        // later signal can never target a recycled pid.
+        SignalTrap.noteChildSpawned(pgid: child.pid)
+        defer { SignalTrap.noteChildReaped() }
+
         // Drain both pipes concurrently, starting *before* we wait. A child that
         // fills the 64 KiB pipe buffer would otherwise block on write while we
         // block on wait — a deadlock that no timeout could distinguish from a slow
