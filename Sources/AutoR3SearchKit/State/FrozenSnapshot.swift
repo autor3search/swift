@@ -31,10 +31,35 @@ public enum FrozenError: Error, CustomStringConvertible, Equatable {
     case symlinkInPath(String)
 
     /// The destination of a restore is a regular file with more than one
-    /// directory entry pointing at its inode. Writing to it in place would
-    /// change the contents seen through every other name for that inode,
-    /// including names outside the repository.
+    /// directory entry pointing at its inode.
+    ///
+    /// This is no longer an overwrite-prevention guard: the atomic write
+    /// renames a fresh file into place, which detaches the name rather than
+    /// rewriting the shared inode, so the other names are safe either way.
+    /// It is kept as an integrity signal. A frozen file that has acquired a
+    /// second name is not the file that was frozen, and a harness whose whole
+    /// job is to detect that the tree stopped matching baseline should say so
+    /// rather than quietly paper over it. The check is one `lstat` and has
+    /// near-zero false positives: git does not hard-link working-tree files,
+    /// neither does `git worktree`, and APFS clones leave the link count at 1.
     case hardLinkAtRestore(String)
+
+    /// A destination exists but could not be inspected. The guards are
+    /// fail-closed: not knowing what is about to be written over is a
+    /// refusal, never a pass.
+    case unreadableDestination(String)
+
+    /// A caller asked to scan a different set of directories from the set the
+    /// baseline actually froze.
+    ///
+    /// Neither `Config` nor `BaselineRecord` carries the frozen-directory
+    /// list, so the scan scope at evaluation time is plumbed separately from
+    /// the scope that was frozen. Hand the gate a narrower list than baseline
+    /// used and the files in the dropped directories are never scanned, never
+    /// compared against the manifest, and never reported as new — the gate
+    /// silently shrinks and nothing notices. The recorded list is the
+    /// authority; disagreeing with it is an error, not a preference.
+    case directoriesMismatch(recorded: [String], requested: [String])
 
     public var description: String {
         switch self {
@@ -54,8 +79,20 @@ public enum FrozenError: Error, CustomStringConvertible, Equatable {
             """
         case .hardLinkAtRestore(let p):
             return """
-            refusing to restore \(p): it is a hard link. Writing to it would also rewrite \
-            every other name for the same file, including names outside the repository.
+            refusing to restore \(p): it is a hard link, so the file in the repository is \
+            no longer the file that was frozen. The tree does not match baseline.
+            """
+        case .unreadableDestination(let p):
+            return """
+            refusing to restore \(p): it exists but its attributes could not be read, so \
+            there is no way to tell what the write would land on.
+            """
+        case .directoriesMismatch(let recorded, let requested):
+            return """
+            refusing to scan \(requested.joined(separator: ", ")): the baseline froze \
+            \(recorded.joined(separator: ", ")). Scanning a different set would compare \
+            the repository against a scope it was never frozen at, and files in any \
+            dropped directory would never be reported as new.
             """
         }
     }
@@ -76,8 +113,16 @@ public struct FrozenSnapshot: Sendable, Codable, Equatable {
     /// baseline, lowercase hex.
     public let manifest: [String: String]
 
-    public init(manifest: [String: String]) {
+    /// The directories that were scanned to build `manifest`, normalised and
+    /// sorted. Persisted with the manifest because the manifest alone cannot
+    /// answer "is this file new since baseline?" — an empty answer means
+    /// "nothing new here" and "I never looked here" indistinguishably, and
+    /// only the recorded scope tells the two apart.
+    public let directories: [String]
+
+    public init(manifest: [String: String], directories: [String] = []) {
         self.manifest = manifest
+        self.directories = directories
     }
 
     // MARK: - Path hygiene
@@ -117,11 +162,25 @@ public struct FrozenSnapshot: Sendable, Codable, Equatable {
         (attributes(url)?[.type] as? FileAttributeType) == .typeSymbolicLink
     }
 
-    /// Number of directory entries pointing at this inode. Absent or
-    /// unreadable is reported as 1 so a missing file is never mistaken for a
-    /// hard link; the caller has already established what it is looking at.
-    private static func linkCount(_ url: URL) -> Int {
-        (attributes(url)?[.referenceCount] as? Int) ?? 1
+    /// Number of directory entries pointing at this inode, or `nil` when
+    /// there is nothing at `url` at all.
+    ///
+    /// Fail-closed, via `lstat` directly rather than `attributesOfItem`, so
+    /// that "the file is not there" can be told apart from "the file is there
+    /// and I could not read it". The first is the ordinary case of restoring
+    /// a file the agent deleted. The second means we do not know what the
+    /// write is about to land on, which is a refusal. Collapsing both into a
+    /// default of 1 is fail-open, and a fail-open branch in a security check
+    /// is a bug waiting for the day something makes it reachable.
+    private static func linkCount(of url: URL, relative rel: String) throws -> Int? {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else {
+            // ENOENT: no such file. ENOTDIR: a component of the path is not a
+            // directory, so likewise nothing is there under that name.
+            if errno == ENOENT || errno == ENOTDIR { return nil }
+            throw FrozenError.unreadableDestination(rel)
+        }
+        return Int(info.st_nlink)
     }
 
     /// Refuses if any component of `rel` *before the last one* is a symbolic
@@ -209,12 +268,13 @@ public struct FrozenSnapshot: Sendable, Codable, Equatable {
     // MARK: - Snapshot
 
     /// Copies every file under `directories` into `store` and records its
-    /// SHA-256. Refuses if any of them is a symbolic link, or if any
-    /// directory on the way to one is.
+    /// SHA-256, along with the directory list itself. Refuses if any of the
+    /// files is a symbolic link, or if any directory on the way to one is.
     public static func snapshot(
         repo: URL, directories: [String], into store: URL
     ) throws -> FrozenSnapshot {
         try FileManager.default.createDirectory(at: store, withIntermediateDirectories: true)
+        let scope = try normalized(directories: directories)
         var manifest: [String: String] = [:]
         for path in try files(in: repo, directories: directories) {
             let rel = try checked(relative: path)
@@ -228,7 +288,14 @@ public struct FrozenSnapshot: Sendable, Codable, Equatable {
                 at: dst.deletingLastPathComponent(), withIntermediateDirectories: true)
             try data.write(to: dst, options: .atomic)
         }
-        return FrozenSnapshot(manifest: manifest)
+        return FrozenSnapshot(manifest: manifest, directories: scope)
+    }
+
+    /// Validates a directory list and puts it in a canonical form, so that
+    /// `["Tests/DemoTests/"]` and `["Tests/DemoTests"]` are recognised as the
+    /// same scope and ordering never matters.
+    private static func normalized(directories: [String]) throws -> [String] {
+        try Set(directories.map { try checked(relative: $0) }).sorted()
     }
 
     // MARK: - Restore
@@ -236,19 +303,33 @@ public struct FrozenSnapshot: Sendable, Codable, Equatable {
     /// Writes every frozen file back over the repository, erasing whatever
     /// the agent did to it.
     ///
-    /// The write is deliberately an ordinary in-place write, and the refusals
-    /// below are deliberately explicit rather than folded into the write
-    /// call. An in-place write follows a symbolic link at the destination, so
-    /// the guards here are the entire security boundary and deleting one is
-    /// immediately visible as an arbitrary-file-overwrite in the test suite.
-    /// A boundary that is enforced twice, once explicitly and once as a side
-    /// effect of a library call's implementation, is a boundary nobody can
-    /// tell is still working.
+    /// The explicit refusals below are the primary security boundary. The
+    /// atomic write is defence in depth behind them, and the two cover
+    /// different things, which is the part worth being precise about:
+    ///
+    /// - Against a symbolic link at the **leaf**, `.atomic` helps. It writes
+    ///   a temporary file and renames it into place, so it replaces the link
+    ///   rather than following it. `symlinkAtRestore` is still checked first,
+    ///   because silently replacing an agent's link is not the behaviour we
+    ///   want — noticing it and stopping the run is.
+    /// - Against a symbolic link at an **ancestor directory**, `.atomic` does
+    ///   nothing at all. The temporary file is created at `dirname(dst)`, and
+    ///   the kernel resolves that path through the link before `.atomic` gets
+    ///   to do anything, so the temporary file is created outside the
+    ///   repository and the rename replaces a file outside the repository.
+    ///   `checkAncestors` is therefore fully load-bearing: it is the only
+    ///   thing standing between an agent that swaps `Tests/` for a link and
+    ///   an arbitrary-file-overwrite primitive running unattended on the
+    ///   operator's machine. Measured, both ways round, in `docs/run-log.md`.
+    ///
+    /// `.atomic` also makes each file all-or-nothing, so a process killed
+    /// mid-restore cannot leave a half-written frozen file behind.
     ///
     /// A refusal aborts the whole restore, which can leave earlier files
-    /// already written back. That is intended: the caller treats a restore
-    /// failure as a hard abort of the run, and restore is idempotent, so the
-    /// next attempt after the operator has investigated starts clean.
+    /// already written back — whole files, not torn ones. That is intended:
+    /// the caller treats a restore failure as a hard abort of the run, and
+    /// restore is idempotent, so the next attempt after the operator has
+    /// investigated starts clean.
     public func restore(repo: URL, from store: URL) throws {
         for path in manifest.keys.sorted() {
             let rel = try FrozenSnapshot.checked(relative: path)
@@ -264,27 +345,49 @@ public struct FrozenSnapshot: Sendable, Codable, Equatable {
 
             // Check BEFORE writing. A link planted after baseline must fail loudly.
             guard !FrozenSnapshot.isSymlink(dst) else { throw FrozenError.symlinkAtRestore(rel) }
-            guard FrozenSnapshot.linkCount(dst) <= 1 else {
+            if let links = try FrozenSnapshot.linkCount(of: dst, relative: rel), links > 1 {
                 throw FrozenError.hardLinkAtRestore(rel)
             }
-            try data.write(to: dst)
+            try data.write(to: dst, options: .atomic)
         }
     }
 
     // MARK: - New files
 
-    /// Files present under `directories` now that were not in the manifest at
-    /// baseline. SwiftPM compiles a new file in an existing test target with
-    /// no `Package.swift` edit, so an unnoticed new file is a way to add a
-    /// passing test that shadows a frozen failing one.
-    public func newFiles(repo: URL, directories: [String]) throws -> [String] {
+    /// Files present under the frozen directories now that were not in the
+    /// manifest at baseline. SwiftPM compiles a new file in an existing test
+    /// target with no `Package.swift` edit, so an unnoticed new file is a way
+    /// to add a passing test that shadows a frozen failing one.
+    ///
+    /// This is the form callers should prefer: the scope comes from what
+    /// baseline recorded, so there is no way to ask the question at a scope
+    /// baseline never froze.
+    public func newFiles(repo: URL) throws -> [String] {
         try FrozenSnapshot.files(in: repo, directories: directories)
             .filter { manifest[$0] == nil }
     }
 
+    /// As `newFiles(repo:)`, for a caller that has its own copy of the
+    /// directory list, and refusing loudly if that copy disagrees with the
+    /// recorded one.
+    ///
+    /// A silently narrower list is the dangerous case: the dropped
+    /// directories are simply never scanned, so nothing in them is ever
+    /// reported as new and the gate shrinks without any symptom. Comparison
+    /// is on the normalised, sorted lists, so spelling and ordering do not
+    /// matter — only the actual scope does.
+    public func newFiles(repo: URL, directories: [String]) throws -> [String] {
+        let requested = try FrozenSnapshot.normalized(directories: directories)
+        guard requested == self.directories else {
+            throw FrozenError.directoriesMismatch(
+                recorded: self.directories, requested: requested)
+        }
+        return try newFiles(repo: repo)
+    }
+
     // MARK: - Persistence
 
-    /// Writes the manifest as JSON.
+    /// Writes the manifest, and the scope it was taken at, as JSON.
     ///
     /// The manifest has to outlive the process that made it. `baseline` and
     /// `eval` are separate invocations, and the question `eval` asks — "is
@@ -307,6 +410,7 @@ public struct FrozenSnapshot: Sendable, Codable, Equatable {
     public static func load(_ url: URL) throws -> FrozenSnapshot {
         let snapshot = try JSONDecoder().decode(FrozenSnapshot.self, from: Data(contentsOf: url))
         for path in snapshot.manifest.keys { try checked(relative: path) }
+        for directory in snapshot.directories { try checked(relative: directory) }
         return snapshot
     }
 }

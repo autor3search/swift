@@ -88,7 +88,9 @@ private func scratch() throws -> URL {
     try FileManager.default.removeItem(at: tests)
     try FileManager.default.createSymbolicLink(at: tests, withDestinationURL: outside)
 
-    #expect(throws: FrozenError.self) { try snap.restore(repo: repo, from: store) }
+    #expect(throws: FrozenError.symlinkInPath("Tests/DemoTests")) {
+        try snap.restore(repo: repo, from: store)
+    }
     #expect(try String(contentsOf: victim, encoding: .utf8) == "do not overwrite me",
             "restore wrote through a symlinked parent directory: arbitrary file overwrite")
 }
@@ -107,15 +109,16 @@ private func scratch() throws -> URL {
     try FileManager.default.createSymbolicLink(
         at: repo.appendingPathComponent("Tests/DemoTests"), withDestinationURL: outside)
 
-    #expect(throws: FrozenError.self) {
+    #expect(throws: FrozenError.symlinkInPath("Tests/DemoTests")) {
         try FrozenSnapshot.snapshot(repo: repo, directories: ["Tests/DemoTests"], into: store)
     }
 }
 
 /// A hard link is indistinguishable from the original by `lstat` type alone:
-/// both are regular files. Writing to one in place rewrites the contents seen
-/// through every other name for that inode, including names outside the
-/// repository. Only the link count gives it away.
+/// both are regular files, and only the link count gives it away. The atomic
+/// write would sever the link rather than rewrite the shared inode, so this
+/// guard is an integrity signal rather than an overwrite stop: a frozen file
+/// that has grown a second name is not the file that was frozen.
 @Test func restoreRefusesToWriteThroughAHardLink() throws {
     let repo = try scratch(), store = try scratch()
     let tests = repo.appendingPathComponent("Tests/DemoTests")
@@ -129,7 +132,9 @@ private func scratch() throws -> URL {
     try FileManager.default.removeItem(at: file)
     try FileManager.default.linkItem(at: victim, to: file)
 
-    #expect(throws: FrozenError.self) { try snap.restore(repo: repo, from: store) }
+    #expect(throws: FrozenError.hardLinkAtRestore("Tests/DemoTests/T.swift")) {
+        try snap.restore(repo: repo, from: store)
+    }
     #expect(try String(contentsOf: victim, encoding: .utf8) == "do not overwrite me",
             "restore wrote through a hard link: arbitrary file overwrite")
 }
@@ -140,7 +145,7 @@ private func scratch() throws -> URL {
     let repo = try scratch(), store = try scratch()
     for bad in ["../victim.txt", "/etc/hosts", "Tests/../../victim.txt",
                 "~/.ssh/authorized_keys", "Tests/./T.swift", "Tests//T.swift", ""] {
-        #expect(throws: FrozenError.self, "accepted escaping path \(bad)") {
+        #expect(throws: FrozenError.escapingPath(bad), "accepted escaping path \(bad)") {
             try FrozenSnapshot(manifest: [bad: "0"]).restore(repo: repo, from: store)
         }
     }
@@ -169,18 +174,55 @@ private func scratch() throws -> URL {
     #expect(reloaded.manifest["Tests/DemoTests/T.swift"]
             // SHA-256 of "a"
             == "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb")
+    // The scope crosses the process boundary with the manifest, or the
+    // question "new since baseline?" has no fixed frame of reference.
+    #expect(reloaded.directories == ["Tests/DemoTests"])
 
     // The reloaded manifest, not the store, is what answers the question.
     try "easy".write(to: tests.appendingPathComponent("Sneaky.swift"),
                      atomically: true, encoding: .utf8)
+    #expect(try reloaded.newFiles(repo: repo) == ["Tests/DemoTests/Sneaky.swift"])
     #expect(try reloaded.newFiles(repo: repo, directories: ["Tests/DemoTests"])
             == ["Tests/DemoTests/Sneaky.swift"])
 }
 
+/// The dangerous case is a NARROWER list than baseline used: the dropped
+/// directories are never scanned, so nothing in them is ever reported as new
+/// and the scope gate shrinks with no symptom at all.
+@Test func newFilesRefusesAScopeThatDisagreesWithBaseline() throws {
+    let repo = try scratch(), store = try scratch()
+    for dir in ["Tests/DemoTests", "Benchmarks"] {
+        let d = repo.appendingPathComponent(dir)
+        try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        try "a".write(to: d.appendingPathComponent("T.swift"), atomically: true, encoding: .utf8)
+    }
+    let snap = try FrozenSnapshot.snapshot(
+        repo: repo, directories: ["Tests/DemoTests", "Benchmarks"], into: store)
+    #expect(snap.directories == ["Benchmarks", "Tests/DemoTests"])
+
+    // Narrower: the silent-shrink case.
+    #expect(throws: FrozenError.directoriesMismatch(
+        recorded: ["Benchmarks", "Tests/DemoTests"], requested: ["Tests/DemoTests"])) {
+        try snap.newFiles(repo: repo, directories: ["Tests/DemoTests"])
+    }
+    // Wider is refused too: it would compare against a scope never frozen.
+    #expect(throws: FrozenError.self) {
+        try snap.newFiles(repo: repo, directories: ["Tests/DemoTests", "Benchmarks", "Sources"])
+    }
+    // Spelling and ordering are not scope, and must not be mistaken for it.
+    #expect(try snap.newFiles(repo: repo, directories: ["Benchmarks/", "Tests/DemoTests"]) == [])
+}
+
 @Test func loadRejectsAManifestWithAnEscapingPath() throws {
     let url = try scratch().appendingPathComponent("frozen-manifest.json")
-    try Data(#"{"manifest":{"../victim.txt":"0"}}"#.utf8).write(to: url)
-    #expect(throws: FrozenError.self) { try FrozenSnapshot.load(url) }
+    try Data(#"{"directories":["Tests"],"manifest":{"../victim.txt":"0"}}"#.utf8).write(to: url)
+    #expect(throws: FrozenError.escapingPath("../victim.txt")) { try FrozenSnapshot.load(url) }
+}
+
+@Test func loadRejectsARecordedDirectoryThatEscapesTheRepository() throws {
+    let url = try scratch().appendingPathComponent("frozen-manifest.json")
+    try Data(#"{"directories":["../elsewhere"],"manifest":{}}"#.utf8).write(to: url)
+    #expect(throws: FrozenError.escapingPath("../elsewhere")) { try FrozenSnapshot.load(url) }
 }
 
 /// A symlink planted after baseline is reported by the scope gate as well as
