@@ -36,6 +36,11 @@ public enum SubprocessError: Error, CustomStringConvertible {
 }
 
 public enum Subprocess {
+    /// How long the readers may keep draining after the child has been reaped.
+    /// Bounds `run` even when a descendant escaped the tree kill and is still
+    /// writing to the inherited pipe.
+    static let drainGracePeriod: TimeInterval = 0.25
+
     /// Runs `executable` to completion, or kills its whole process tree at `timeout`.
     ///
     /// - Parameter outputCapBytes: per-stream cap. A runaway child cannot exhaust
@@ -103,10 +108,13 @@ public enum Subprocess {
             }
         }
 
-        // The readers stop on EOF. If an orphan still holds a write end (which is
-        // exactly what a broken tree kill leaves behind) EOF never arrives, so the
-        // stop flag guarantees we return instead of hanging forever.
-        buffers.requestStop()
+        // The readers stop on EOF. If something still holds a write end — a broken
+        // tree kill, or a descendant that escaped the group by calling setsid for
+        // itself — EOF never arrives, so the stop request bounds the wait two ways:
+        // a quiet pipe ends it immediately, and a *noisy* one ends it at the grace
+        // deadline. Without the second bound a runaway escapee keeps `poll` ready
+        // forever and the harness hangs instead of reporting `timedOut`.
+        buffers.requestStop(grace: drainGracePeriod)
         drains.wait()
         close(child.stdoutFD)
         close(child.stderrFD)
@@ -143,6 +151,13 @@ public enum Subprocess {
             defer { buffer.deallocate() }
 
             while true {
+                let stop = buffers.stopState()
+                // Hard wall-clock bound, checked *before* readability. A descendant
+                // that escaped the process group can keep this pipe permanently
+                // readable; without this check the reader would never reach the
+                // quiet-pipe test below and `run` would never return.
+                if stop.graceExpired { return }
+
                 var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
                 let ready = poll(&descriptor, 1, 50)
                 if ready < 0 {
@@ -152,7 +167,7 @@ public enum Subprocess {
                 if ready == 0 {
                     // Nothing available for 50 ms. Anything the child buffered has
                     // been read by now, so it is safe to honour a stop request.
-                    if buffers.isStopRequested { return }
+                    if stop.requested { return }
                     continue
                 }
                 let count = read(fd, buffer, capacity)
@@ -179,7 +194,9 @@ private final class OutputBuffers: @unchecked Sendable {
     private var out = Data()
     private var err = Data()
     private var truncated = false
-    private var stopRequested = false
+    /// nil until `requestStop`; afterwards, the instant the readers must give up
+    /// even if the pipe is still readable.
+    private var graceDeadline: Date?
 
     init(cap: Int) { self.cap = max(0, cap) }
 
@@ -203,16 +220,19 @@ private final class OutputBuffers: @unchecked Sendable {
         if taken < count { truncated = true }
     }
 
-    func requestStop() {
+    func requestStop(grace: TimeInterval) {
         lock.lock()
-        stopRequested = true
+        graceDeadline = Date().addingTimeInterval(grace)
         lock.unlock()
     }
 
-    var isStopRequested: Bool {
+    /// `requested`: the child has been reaped, so a quiet pipe means we are done.
+    /// `graceExpired`: give up now regardless of how much is still arriving.
+    func stopState() -> (requested: Bool, graceExpired: Bool) {
         lock.lock()
         defer { lock.unlock() }
-        return stopRequested
+        guard let graceDeadline else { return (false, false) }
+        return (true, Date() >= graceDeadline)
     }
 
     func snapshot() -> Snapshot {

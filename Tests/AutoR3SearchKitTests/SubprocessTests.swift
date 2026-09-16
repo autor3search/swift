@@ -72,3 +72,58 @@ private let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
                                        env: nil, timeout: 10, outputCapBytes: 1 << 20)
     #expect(inherited.stdout == ProcessInfo.processInfo.environment["HOME"] ?? "missing")
 }
+
+/// `posix_spawn_file_actions_addchdir_np` rejects a path past PATH_MAX at *add*
+/// time (ENAMETOOLONG, verified on this machine). If that return value is ignored
+/// the file-action list simply ends up with no chdir entry, `posix_spawn` then
+/// succeeds, and the child runs in the HARNESS's own directory — a benchmark
+/// quietly measuring the wrong source tree. That must be a launch failure, not a
+/// result.
+@Test func aFailedSpawnSetupIsLoudNotSilent() throws {
+    let tooLong = URL(fileURLWithPath: "/" + String(repeating: "a", count: 4000))
+    #expect(throws: SubprocessError.self) {
+        _ = try Subprocess.run(sh, ["-c", "pwd"], cwd: tooLong, env: nil,
+                               timeout: 10, outputCapBytes: 1 << 20)
+    }
+}
+
+/// The tree kill reaches everything *in the group*. A descendant that calls
+/// `setsid` for itself leaves the group entirely and survives — and it still holds
+/// the inherited stdout pipe, so EOF never arrives and the pipe never goes quiet.
+/// Draining must therefore be bounded by wall clock, not by the child falling
+/// silent: otherwise the harness hangs here instead of reporting `timedOut`.
+///
+/// The time limit is the backstop, the `elapsed` expectation is the assertion — a
+/// regression must fail the test, not wedge the suite.
+@Test(.timeLimit(.minutes(1)))
+func drainStaysBoundedWhenADescendantEscapesTheProcessGroup() throws {
+    let pidFile = tmp.appendingPathComponent("escapee-\(UUID().uuidString).pid")
+    defer { try? FileManager.default.removeItem(at: pidFile) }
+
+    // setsid() succeeds here because the backgrounded perl is not a group leader
+    // (its parent sh is). It then writes every 5 ms for ~20 s, comfortably shorter
+    // than poll's 50 ms window, so the pipe is always ready and a reader that only
+    // stops on a quiet pipe would never stop.
+    let script = """
+    /usr/bin/perl -e 'use POSIX; POSIX::setsid(); open(my $f, ">", "\(pidFile.path)"); \
+    print $f $$; close $f; $| = 1; \
+    for (1..4000) { print "escaped\\n"; select(undef, undef, undef, 0.005); }' &
+    wait
+    """
+
+    let started = Date()
+    let r = try Subprocess.run(sh, ["-c", script], cwd: tmp, env: nil,
+                               timeout: 1.0, outputCapBytes: 1 << 20)
+    let elapsed = Date().timeIntervalSince(started)
+
+    // The escapee is unreachable by the tree kill by construction, so clean it up
+    // explicitly rather than leaving a stray process on the machine.
+    if let text = try? String(contentsOf: pidFile, encoding: .utf8),
+       let escapee = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) {
+        kill(escapee, SIGKILL)
+    }
+
+    #expect(r.timedOut == true)
+    #expect(elapsed < 5.0,
+            "run() blocked for \(elapsed)s draining a descendant that escaped the process group")
+}

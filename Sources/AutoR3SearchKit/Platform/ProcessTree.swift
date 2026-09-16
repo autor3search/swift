@@ -49,12 +49,15 @@ public struct SpawnedChild: Sendable {
 
 public enum SpawnError: Error, CustomStringConvertible {
     case pipeFailed(Int32)
+    case setupFailed(call: String, code: Int32)
     case spawnFailed(path: String, code: Int32)
 
     public var description: String {
         switch self {
         case .pipeFailed(let code):
             return "pipe() failed: \(String(cString: strerror(code))) (\(code))"
+        case .setupFailed(let call, let code):
+            return "\(call) failed: \(String(cString: strerror(code))) (\(code))"
         case .spawnFailed(let path, let code):
             return "posix_spawn(\(path)) failed: \(String(cString: strerror(code))) (\(code))"
         }
@@ -97,38 +100,70 @@ public enum POSIXSpawn {
             posix_spawnattr_destroy(&attr)
         }
 
+        // Every one of these setup calls returns an errno, and a silent failure here
+        // is worse than a loud one. `addchdir_np` is the dangerous case: if it fails
+        // (ENAMETOOLONG on a long path, EINVAL, ENOSYS on another libc) the spawn
+        // still succeeds and the child runs in the *harness's* cwd — a benchmark
+        // measuring the wrong source tree. We record the first failure and refuse to
+        // spawn rather than measure something we cannot name.
+        var setupFailure: (call: String, code: Int32)?
+        func checked(_ call: String, _ code: Int32) {
+            if code != 0 && setupFailure == nil { setupFailure = (call, code) }
+        }
+
         // The child becomes its own process-group leader *before* exec, so every
         // descendant it forks lands in that same group and `kill(-pgid)` reaches
         // all of them. This works identically on macOS and Linux.
         var flags = Int16(POSIX_SPAWN_SETPGROUP)
-        posix_spawnattr_setpgroup(&attr, 0)
+        checked("posix_spawnattr_setpgroup", posix_spawnattr_setpgroup(&attr, 0))
 
         // Reset inherited signal state. We must not hand the child an ignored
         // SIGPIPE (the Swift runtime ignores it): a `yes | head` pipeline whose
         // head has exited would then spin on EPIPE forever instead of dying.
         var defaulted = sigset_t()
         sigfillset(&defaulted)
-        posix_spawnattr_setsigdefault(&attr, &defaulted)
+        checked("posix_spawnattr_setsigdefault", posix_spawnattr_setsigdefault(&attr, &defaulted))
         flags |= Int16(POSIX_SPAWN_SETSIGDEF)
 
         var empty = sigset_t()
         sigemptyset(&empty)
-        posix_spawnattr_setsigmask(&attr, &empty)
+        checked("posix_spawnattr_setsigmask", posix_spawnattr_setsigmask(&attr, &empty))
         flags |= Int16(POSIX_SPAWN_SETSIGMASK)
 
-        posix_spawnattr_setflags(&attr, flags)
+        checked("posix_spawnattr_setflags", posix_spawnattr_setflags(&attr, flags))
 
         // stdin from /dev/null: a measurement child must never block reading our
         // terminal, and must never steal keystrokes from the harness.
-        posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
-        posix_spawn_file_actions_adddup2(&fileActions, outFDs[1], STDOUT_FILENO)
-        posix_spawn_file_actions_adddup2(&fileActions, errFDs[1], STDERR_FILENO)
+        checked(
+            "posix_spawn_file_actions_addopen(stdin, /dev/null)",
+            posix_spawn_file_actions_addopen(&fileActions, STDIN_FILENO, "/dev/null", O_RDONLY, 0)
+        )
+        checked(
+            "posix_spawn_file_actions_adddup2(stdout)",
+            posix_spawn_file_actions_adddup2(&fileActions, outFDs[1], STDOUT_FILENO)
+        )
+        checked(
+            "posix_spawn_file_actions_adddup2(stderr)",
+            posix_spawn_file_actions_adddup2(&fileActions, errFDs[1], STDERR_FILENO)
+        )
         // Close the inherited copies so the child holds only fd 0/1/2. Guarded on
         // `> STDERR_FILENO` so we can never close the dup2 target we just made.
         for fd in [outFDs[0], outFDs[1], errFDs[0], errFDs[1]] where fd > STDERR_FILENO {
-            posix_spawn_file_actions_addclose(&fileActions, fd)
+            checked(
+                "posix_spawn_file_actions_addclose(\(fd))",
+                posix_spawn_file_actions_addclose(&fileActions, fd)
+            )
         }
-        posix_spawn_file_actions_addchdir_np(&fileActions, cwd.path)
+        checked(
+            "posix_spawn_file_actions_addchdir_np(\(cwd.path))",
+            posix_spawn_file_actions_addchdir_np(&fileActions, cwd.path)
+        )
+
+        if let failure = setupFailure {
+            close(outFDs[0]); close(outFDs[1])
+            close(errFDs[0]); close(errFDs[1])
+            throw SpawnError.setupFailed(call: failure.call, code: failure.code)
+        }
 
         let argv = [executable.path] + args
         let environment = env ?? ProcessInfo.processInfo.environment
