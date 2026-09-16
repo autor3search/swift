@@ -28,6 +28,28 @@ public struct BenchmarkDelta: Codable, Sendable {
     public let pValue: Double
     public let significantAtAlpha: Bool
     public let significantAtCorrected: Bool
+
+    // Explicit public init: the synthesised memberwise initialiser on a
+    // public struct is only internal, so the executable target (which
+    // constructs Verdict/BenchmarkDelta values directly for .fail/.crash
+    // cases - see Task 17) could not otherwise build one.
+    public init(
+        benchmark: String,
+        baselineMedian: Double,
+        candidateMedian: Double,
+        ratio: Double,
+        pValue: Double,
+        significantAtAlpha: Bool,
+        significantAtCorrected: Bool
+    ) {
+        self.benchmark = benchmark
+        self.baselineMedian = baselineMedian
+        self.candidateMedian = candidateMedian
+        self.ratio = ratio
+        self.pValue = pValue
+        self.significantAtAlpha = significantAtAlpha
+        self.significantAtCorrected = significantAtCorrected
+    }
 }
 
 public struct Verdict: Sendable {
@@ -39,6 +61,30 @@ public struct Verdict: Sendable {
     public let unsafeHits: [UnsafeHit]
     public let buildConfiguration: String
     public let stopRequested: Bool
+
+    // Explicit public init, for the same reason as BenchmarkDelta's above:
+    // Task 17's CLI must be able to construct .fail and .crash verdicts
+    // itself when a gate rejects or the harness throws, outside of
+    // Scoring.decide.
+    public init(
+        kind: VerdictKind,
+        score: Double,
+        deltas: [BenchmarkDelta],
+        reason: String?,
+        warnings: [String],
+        unsafeHits: [UnsafeHit],
+        buildConfiguration: String,
+        stopRequested: Bool
+    ) {
+        self.kind = kind
+        self.score = score
+        self.deltas = deltas
+        self.reason = reason
+        self.warnings = warnings
+        self.unsafeHits = unsafeHits
+        self.buildConfiguration = buildConfiguration
+        self.stopRequested = stopRequested
+    }
 }
 
 /// THE VERDICT. KEEP requires all three of:
