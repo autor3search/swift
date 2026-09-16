@@ -6,12 +6,16 @@ import Foundation
 /// Two independent checks, both load-bearing:
 ///
 /// 1. **Manifest rejection.** Any change to `Package.swift` or
-///    `Package.resolved` is rejected outright, regardless of scope.
-///    `Package.swift` is not just a dependency list — it is the build-flag
-///    surface (`swiftSettings`, `unsafeFlags`, `-Ounchecked`,
+///    `Package.resolved` — at the repository root, in a nested package, as
+///    a version-specific manifest (`Package@swift-6.0.swift`), or as
+///    `.swiftpm/` configuration — is rejected outright, regardless of
+///    scope. See `isManifestPath` for the exact rules. `Package.swift` is
+///    not just a dependency list — it is the build-flag surface
+///    (`swiftSettings`, `unsafeFlags`, `-Ounchecked`,
 ///    `-enforce-exclusivity=unchecked`) and an executable Swift program run
-///    at build time. Without this, an agent could "win" by turning off
-///    bounds checking instead of writing faster code.
+///    at build time, and SwiftPM treats a whole family of filenames as
+///    equally capable of that. Without this, an agent could "win" by
+///    turning off bounds checking instead of writing faster code.
 /// 2. **Scope enforcement.** Every other changed path must fall under one of
 ///    the config's declared `scope` globs. This is what stops an agent
 ///    editing a benchmark *helper* target — one holding fixture data or a
@@ -21,11 +25,100 @@ import Foundation
 ///    benchmark's real workload. Rejecting the edit here, before measurement,
 ///    is the only thing stopping that.
 public enum ScopeGate {
-    /// Changes to these paths are rejected unconditionally, before the scope
-    /// check even runs. Compared to `changedPaths` by exact value: git
-    /// records the manifest at the repository root under these exact names,
-    /// so no glob is needed.
+    /// The two canonical manifest names at a repository root. Kept as a
+    /// fixed-interface `Set<String>` for exact-value lookups of the root
+    /// manifest, and still correct and documented for that specific case.
+    ///
+    /// `check` does NOT use this set directly — it calls `isManifestPath`,
+    /// which is strictly broader. A `Set<String>` can express only a fixed
+    /// list of exact names; it cannot express "any version-specific
+    /// manifest" or "anything under a `.swiftpm/` directory at any depth",
+    /// both of which are also manifest-equivalent surfaces (see
+    /// `isManifestPath`). Keeping this set unchanged, rather than folding it
+    /// into a differently-shaped interface, avoids a gratuitous break of a
+    /// fixed interface later tasks depend on.
     public static let manifestPaths: Set<String> = ["Package.swift", "Package.resolved"]
+
+    /// Whether `name` is a version-specific manifest's filename, e.g.
+    /// `"Package@swift-6.0.swift"`, `"Package@swift-5.9.swift"`. Matches the
+    /// *shape* (`Package@swift-...swift`), not an enumerated list of
+    /// toolchain versions, so a future Swift version's manifest is caught
+    /// without this code needing to change.
+    private static func isVersionSpecificManifestName(_ name: String) -> Bool {
+        name.hasPrefix("Package@swift-") && name.hasSuffix(".swift")
+    }
+
+    /// Whether `path` is a package manifest, or manifest-equivalent
+    /// configuration, by any of the forms SwiftPM recognises — not just the
+    /// two exact root-level names in `manifestPaths`.
+    ///
+    /// Three independent forms, each closing a real bypass of the
+    /// root-exact-match check:
+    ///
+    /// 1. **The last path component is `Package.swift` or
+    ///    `Package.resolved`.** Compared on the last component, not the
+    ///    whole path, so this also catches a *nested* package's manifest —
+    ///    e.g. `Subpackage/Package.swift` — which `manifestPaths.contains(path)`
+    ///    (an exact-value check against the whole path) never would.
+    /// 2. **The last path component matches a version-specific manifest's
+    ///    shape** (`isVersionSpecificManifestName`). SwiftPM substitutes a
+    ///    file like `Package@swift-6.0.swift` for `Package.swift` whenever
+    ///    it matches the active toolchain, so it is exactly as much a
+    ///    build-flag surface and dependency list as `Package.swift` itself
+    ///    — an agent could add one purely to change compile flags without
+    ///    `Package.swift` itself ever showing up as a changed path.
+    /// 3. **Any path component is exactly `.swiftpm`.** Catches
+    ///    `.swiftpm/configuration/mirrors.json` (which can redirect a
+    ///    dependency to an entirely different source) at any depth, not
+    ///    just at the repository root.
+    ///
+    /// A path that merely *looks* manifest-ish without matching one of
+    /// these three forms exactly — `Sources/PackageHelper.swift`,
+    /// `Sources/Package.swift.md` — is deliberately NOT treated as a
+    /// manifest: an over-broad pattern here would silently make ordinary,
+    /// in-scope source files un-editable, which is its own kind of bug.
+    public static func isManifestPath(_ path: String) -> Bool {
+        let components = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        guard let last = components.last else { return false }
+        if last == "Package.swift" || last == "Package.resolved" { return true }
+        if isVersionSpecificManifestName(last) { return true }
+        if components.contains(".swiftpm") { return true }
+        return false
+    }
+
+    /// The `manifest_change_rejected` detail for `path`, tailored to which
+    /// of `isManifestPath`'s three forms matched — each names the actual
+    /// reason for that family, rather than reusing one generic explanation
+    /// for all of them.
+    private static func manifestRejectionDetail(for path: String) -> String {
+        let last = path.split(separator: "/", omittingEmptySubsequences: false).last.map(String.init) ?? path
+        if isVersionSpecificManifestName(last) {
+            return """
+            \(path) was modified. This is rejected regardless of scope. SwiftPM substitutes a \
+            version-specific manifest like this one for Package.swift whenever it matches the \
+            active toolchain, so it is exactly as much the dependency list and the build-flag \
+            surface (swiftSettings, unsafeFlags, -Ounchecked, -enforce-exclusivity=unchecked) as \
+            Package.swift itself — this is how an agent could change compile flags without \
+            Package.swift ever showing up as a changed path.
+            """
+        }
+        if last != "Package.swift" && last != "Package.resolved" {
+            // The only remaining way isManifestPath can have matched.
+            return """
+            \(path) was modified. This is rejected regardless of scope. Files under .swiftpm/ \
+            include configuration such as configuration/mirrors.json, which can redirect a \
+            dependency to an entirely different source — changing what is being measured \
+            rather than how fast it runs.
+            """
+        }
+        return """
+        \(path) was modified. This is rejected regardless of scope. Package.swift is \
+        the dependency list, the build-flag surface (swiftSettings, unsafeFlags, \
+        -Ounchecked, -enforce-exclusivity=unchecked) and an executable Swift program \
+        run at build time. A dependency or flag change alters what is being measured \
+        rather than how fast it runs, and is a human decision, not an autonomous one.
+        """
+    }
 
     /// Whether `path` falls under `glob`.
     ///
@@ -108,24 +201,21 @@ public enum ScopeGate {
     /// Checks every changed path against `scope`, throwing the first
     /// failure found.
     ///
-    /// Manifest paths are checked first and unconditionally — before the
-    /// scope loop even starts — so a `Package.swift` edit is always reported
-    /// as `manifest_change_rejected`, never as merely `out_of_scope` (which
-    /// would imply that widening `scope` could fix it; it cannot).
+    /// Manifest paths — by `isManifestPath`, not merely `manifestPaths` —
+    /// are checked first and unconditionally, before the scope loop even
+    /// starts, so a manifest-equivalent edit is always reported as
+    /// `manifest_change_rejected`, never as merely `out_of_scope` (which
+    /// would imply that widening `scope` could fix it; it cannot, and under
+    /// `scope: ["**"]` an `out_of_scope` verdict could never even fire,
+    /// which is exactly the bypass this ordering closes).
     ///
     /// An empty `changedPaths` has nothing to iterate over in either loop,
     /// so it passes trivially — a no-op change is not a scope violation.
     public static func check(changedPaths: [String], scope: [String]) throws {
-        for path in changedPaths where manifestPaths.contains(path) {
+        for path in changedPaths where isManifestPath(path) {
             throw GateFailure(
                 reason: "manifest_change_rejected",
-                detail: """
-                \(path) was modified. This is rejected regardless of scope. Package.swift is \
-                the dependency list, the build-flag surface (swiftSettings, unsafeFlags, \
-                -Ounchecked, -enforce-exclusivity=unchecked) and an executable Swift program \
-                run at build time. A dependency or flag change alters what is being measured \
-                rather than how fast it runs, and is a human decision, not an autonomous one.
-                """)
+                detail: manifestRejectionDetail(for: path))
         }
         for path in changedPaths {
             guard scope.contains(where: { matches(path, glob: $0) }) else {

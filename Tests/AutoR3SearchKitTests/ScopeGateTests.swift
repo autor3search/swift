@@ -135,3 +135,64 @@ import Testing
     try ScopeGate.check(changedPaths: [], scope: ["Sources/**"])
     try ScopeGate.check(changedPaths: [], scope: [])
 }
+
+// MARK: - Fix round 1: manifest detection must cover the whole family,
+// not just the two exact root-level names.
+//
+// `manifestPaths.contains(path)` is an exact-value check against the whole
+// path, so it silently misses three real bypasses: a version-specific
+// manifest (which SwiftPM substitutes for Package.swift whenever it matches
+// the active toolchain), .swiftpm/ configuration (which can redirect a
+// dependency), and a nested package's manifest (a different whole-path
+// string than "Package.swift"). `isManifestPath` closes all three. Each
+// test below asserts the REASON CODE, not merely that something threw —
+// under scope: ["**"], a bug that fell through to the scope loop would
+// still pass (out_of_scope never fires when everything is in scope), so
+// only checking `reason == "manifest_change_rejected"` actually proves the
+// bypass is closed.
+private func expectManifestRejection(changedPaths: [String], scope: [String]) {
+    do {
+        try ScopeGate.check(changedPaths: changedPaths, scope: scope)
+        Issue.record("expected a GateFailure, got no error")
+    } catch let f as GateFailure {
+        #expect(f.reason == "manifest_change_rejected")
+    } catch {
+        Issue.record("wrong error type: \(error)")
+    }
+}
+
+/// The bypass test: under scope: ["**"], everything is in scope, so this is
+/// the one configuration where a version-specific manifest would previously
+/// have sailed through both loops entirely (not even reported as
+/// out_of_scope). Proves the bypass is closed.
+@Test func versionSpecificManifestIsRejectedEvenUnderWildcardScope() {
+    #expect(ScopeGate.isManifestPath("Package@swift-6.0.swift"))
+    expectManifestRejection(changedPaths: ["Package@swift-6.0.swift"], scope: ["**"])
+}
+
+/// .swiftpm/ configuration (e.g. mirrors.json, which can redirect a
+/// dependency to a different source) must be rejected as a manifest change,
+/// not merely allowed through because scope is unrestricted.
+@Test func swiftpmConfigurationIsRejectedEvenUnderWildcardScope() {
+    #expect(ScopeGate.isManifestPath(".swiftpm/configuration/mirrors.json"))
+    expectManifestRejection(changedPaths: [".swiftpm/configuration/mirrors.json"], scope: ["**"])
+}
+
+/// A nested package's manifest is not matched by exact equality against the
+/// whole path "Package.swift" — only by comparing the last component.
+@Test func nestedPackageManifestIsRejected() {
+    #expect(ScopeGate.isManifestPath("Subpackage/Package.swift"))
+    expectManifestRejection(changedPaths: ["Subpackage/Package.swift"], scope: ["Subpackage/**"])
+}
+
+/// Negative control: a path that merely looks manifest-ish must NOT be
+/// treated as a manifest, and must be allowed through when it is in scope.
+/// Without this, an over-broad pattern would silently make ordinary source
+/// files un-editable.
+@Test func manifestLookingFilenamesThatAreNotManifestsAreNotFlagged() throws {
+    #expect(!ScopeGate.isManifestPath("Sources/PackageHelper.swift"))
+    #expect(!ScopeGate.isManifestPath("Sources/Package.swift.md"))
+    try ScopeGate.check(
+        changedPaths: ["Sources/PackageHelper.swift", "Sources/Package.swift.md"],
+        scope: ["Sources/**"])
+}
