@@ -102,12 +102,22 @@ public enum InitRunner {
     /// array and preserve length/line structure 1:1 by construction, so offsets found
     /// in one are valid offsets into the other.
     ///
-    /// A name built by interpolation (`Benchmark("\(prefix)Name")`) or a first
+    /// A name built by interpolation (`Benchmark("\(prefix)Name")`), by string
+    /// concatenation (`Benchmark("A" + "B")`, `Benchmark("A" + suffix)`), or a first
     /// argument that isn't a string literal at all (`Benchmark(someConstant)`) cannot
-    /// be resolved statically. Both are skipped rather than guessed at: a fabricated
+    /// be resolved statically. All are skipped rather than guessed at: a fabricated
     /// or mangled name would silently end up in config.yaml and mismatch whatever the
-    /// benchmark executable actually registers at runtime, which is a worse failure
-    /// mode than simply not discovering that one benchmark.
+    /// benchmark executable actually registers at runtime — worse than not
+    /// discovering that one benchmark, because `validateDiscovered` would see a
+    /// non-empty list and `init` would succeed with a config that can never match a
+    /// real benchmark filter (a zero-match `BenchmarkTool` filter run produces no
+    /// percentile table, which `MetricSource` turns into a confusing failure at
+    /// measurement time, far from the config that actually caused it). A concatenated
+    /// literal is detected by a `+` immediately after the closing quote (skipping
+    /// whitespace) — `"A" + "B"` and `"A" + suffix` both trip it. A `+` before the
+    /// opening quote (`prefix + "A"`) never reaches that check at all: the argument
+    /// then doesn't start with `"`, so it is already caught by the plain "not a
+    /// string literal" branch below.
     public static func discoverBenchmarks(benchmarkSource: String) -> [String] {
         let cleaned = Array(UnsafeDetector.stripCommentsAndStrings(benchmarkSource))
         let original = Array(benchmarkSource)
@@ -132,7 +142,7 @@ public enum InitRunner {
             }
             j += 1
             var name = ""
-            var interpolated = false
+            var unresolvable = false
             var closed = false
             while j < original.count {
                 let c = original[j]
@@ -140,7 +150,7 @@ public enum InitRunner {
                     // String interpolation: not statically resolvable. Skip past the
                     // balanced parens of the interpolated expression and keep scanning
                     // for the literal's close, but remember not to trust the result.
-                    interpolated = true
+                    unresolvable = true
                     var depth = 1
                     j += 2
                     while j < original.count, depth > 0 {
@@ -158,11 +168,26 @@ public enum InitRunner {
                     j += 2
                     continue
                 }
-                if c == "\"" { closed = true; j += 1; break }
+                if c == "\"" {
+                    closed = true
+                    j += 1
+                    // A `+` immediately after this closing quote (module whitespace)
+                    // means the literal is being concatenated with something else —
+                    // `"A" + "B"` or `"A" + suffix`. The name registered at runtime
+                    // would be the full concatenation, which cannot be resolved
+                    // statically; treat it the same as an interpolation rather than
+                    // reporting the truncated left-hand literal as the whole name.
+                    var k = j
+                    while k < original.count, original[k] == " " || original[k] == "\t" || original[k] == "\n" {
+                        k += 1
+                    }
+                    if k < original.count, original[k] == "+" { unresolvable = true }
+                    break
+                }
                 name.append(c)
                 j += 1
             }
-            if closed, !interpolated, !name.isEmpty { names.append(name) }
+            if closed, !unresolvable, !name.isEmpty { names.append(name) }
             i = max(j, i + needle.count)
         }
         return names
@@ -206,34 +231,72 @@ public enum InitRunner {
     /// depend on the `Benchmark` product — is not frozen (freeze detection keys on
     /// that product dependency), so it would be writable by the agent under a
     /// blanket scope, or even under a scope built from a naive "not a test, not a
-    /// benchmark" target filter: `PackageDescription` exposes each target's own
-    /// `productDependencies` but not its target-to-target dependency graph, so there
-    /// is no reliable way to ask "is this target only ever consumed by the benchmark
-    /// target" directly.
+    /// benchmark" target filter. Two independent signals close this, applied together
+    /// ("belt and braces" — each catches a layout the other misses):
     ///
-    /// What IS available is each target's `path`, and in practice a benchmark's
-    /// helper targets live alongside it — nested under the same parent directory a
-    /// benchmark target's own path sits in (e.g. a `Fixtures` target at
-    /// `Benchmarks/Fixtures`, sibling to a benchmark target at `Benchmarks/Bench`).
-    /// So this excludes every non-test, non-benchmark target whose path falls under
-    /// any benchmark target's PARENT directory, not merely a benchmark target's own
-    /// exact path. This can be overly conservative — a genuine library target that
-    /// happens to share a benchmark's parent directory would also land out of scope —
-    /// but that failure mode is a loud, recoverable `out_of_scope` rejection at scope-
-    /// gate time (fixable by moving the target or widening `scope` by hand), which is
-    /// far preferable to the alternative: a benchmark-shrinking edit sailing through
-    /// silently because it was never in the frozen set OR excluded from scope. See
-    /// the ruling recorded for Task 15 in the plan for the full argument.
-    static func deriveScope(from description: PackageDescription) -> [String] {
+    /// 1. **Path adjacency.** In practice a benchmark's helper targets live alongside
+    ///    it — nested under the same parent directory a benchmark target's own path
+    ///    sits in (e.g. a `Fixtures` target at `Benchmarks/Fixtures`, sibling to a
+    ///    benchmark target at `Benchmarks/Bench`). This excludes every non-test,
+    ///    non-benchmark target whose path falls under any benchmark target's PARENT
+    ///    directory, not merely a benchmark target's own exact path.
+    /// 2. **The target-dependency graph** (`benchmarkHelperPaths`, resolved by the
+    ///    caller from a local decode of `target_dependencies` — see
+    ///    `benchmarkHelperPaths(of:repo:)` below). This catches a helper that is a
+    ///    *declared dependency* of the benchmark target but lives nowhere near it,
+    ///    e.g. `Sources/BenchFixtures` alongside a real library at `Sources/Lib` and a
+    ///    benchmark at `Benchmarks/Bench` — path adjacency alone misses this entirely,
+    ///    since `Sources/BenchFixtures` doesn't nest under `Benchmarks`.
+    ///
+    /// Both signals can be overly conservative — a genuine library target that shares
+    /// a benchmark's parent directory could land out of scope under signal 1. That is
+    /// a loud, recoverable `out_of_scope` rejection at scope-gate time, preferable to
+    /// a benchmark-shrinking edit sailing through silently, so signal 1 always
+    /// applies unconditionally.
+    ///
+    /// Signal 2 needs more care: `benchmarkHelperPaths` is every DIRECT target
+    /// dependency of the chosen benchmark, and in a real package that set almost
+    /// always includes the actual library under test alongside any genuine fixture
+    /// helpers — SwiftPM's manifest has no field distinguishing "the algorithm I'm
+    /// benchmarking" from "fixture data I feed it," so both show up identically in
+    /// `target_dependencies`. Excluding the whole set unconditionally was tried and
+    /// rejected during this fix's round 1: verified live against a real, working
+    /// single-library-single-benchmark package, it drove `scope` to empty — turning
+    /// `init` into a hard refusal for the single most common package shape this tool
+    /// exists to support, and (worse) against the THREE-target layout this signal was
+    /// added for (real library + fixture helper, both direct dependencies of the
+    /// benchmark) it excluded BOTH, re-emptying scope and backing out of the
+    /// exclusion entirely — silently reopening the exact hole this signal exists to
+    /// close.
+    ///
+    /// So exclusion here is greedy with a floor of one: helper paths are tried in a
+    /// fixed (sorted) order, each excluded only if at least one non-test,
+    /// non-benchmark target would still remain afterward. For the common shape (one
+    /// real library, zero or more genuine fixture helpers) this excludes every
+    /// fixture and leaves the library — verified live against exactly that layout.
+    /// The known remaining gap: if a benchmark genuinely depends on MORE than one
+    /// real, independently-optimizable library target (not just one library plus
+    /// fixtures), this floor stops at whichever one target happens to sort last and
+    /// excludes the rest — safe-direction-wrong (an `out_of_scope` rejection the
+    /// human can fix by widening `scope` by hand), not silent-direction-wrong, but a
+    /// real limitation worth flagging for whoever next revisits this.
+    static func deriveScope(from description: PackageDescription, benchmarkHelperPaths: Set<String> = []) -> [String] {
         let benchmarkTargets = description.benchmarkTargets
         let benchmarkNames = Set(benchmarkTargets.map(\.name))
-        let benchmarkRoots = Set(benchmarkTargets.map { parentDirectory(of: $0.path) })
-        let sourceTargets = description.targets.filter {
+        let pathAdjacencyRoots = Set(benchmarkTargets.map { parentDirectory(of: $0.path) })
+
+        var candidates = description.targets.filter {
             $0.type != "test"
                 && !benchmarkNames.contains($0.name)
-                && !isBenchmarkAdjacent($0.path, roots: benchmarkRoots)
+                && !isBenchmarkAdjacent($0.path, roots: pathAdjacencyRoots)
         }
-        let globs = Set(sourceTargets.map { "\($0.path)/**" })
+
+        for helperPath in benchmarkHelperPaths.sorted() {
+            guard candidates.count > 1 else { break }
+            candidates.removeAll { $0.path == helperPath }
+        }
+
+        let globs = Set(candidates.map { "\($0.path)/**" })
         return globs.sorted()
     }
 
@@ -250,6 +313,68 @@ public enum InitRunner {
         roots.contains { root in
             !root.isEmpty && (path == root || path.hasPrefix(root + "/"))
         }
+    }
+
+    /// Local, minimal JSON shape for the ONE additional field this task needs out of
+    /// `swift package describe --type json`: `target_dependencies`. Deliberately
+    /// separate from Task 8's `PackageDescribe.Raw`/`SwiftTarget` — those are frozen
+    /// interfaces Tasks 16 and 17 consume as-is, not to be modified here — rather than
+    /// widening a shared, frozen decode shape for one task's narrow need.
+    private struct RawTargetGraph: Decodable {
+        struct Target: Decodable {
+            let name: String
+            let path: String
+            let target_dependencies: [String]?
+        }
+        let targets: [Target]
+    }
+
+    /// Resolves `targetName`'s direct `target_dependencies` (same-package target
+    /// references, as opposed to `productDependencies`) to their own `path`s, from
+    /// already-fetched `swift package describe --type json` bytes. Split out from
+    /// `benchmarkHelperPaths(of:repo:)` so the parse/resolve logic itself is testable
+    /// against a literal JSON fixture, without a real `swift package describe`
+    /// subprocess in the hot path of the test suite — mirroring how
+    /// `PackageDescribeTests` tests `PackageDescribe.parse` against a fixture file
+    /// rather than shelling out.
+    static func parseTargetDependencyPaths(_ json: Data, of targetName: String) throws -> Set<String> {
+        let graph: RawTargetGraph
+        do {
+            graph = try JSONDecoder().decode(RawTargetGraph.self, from: json)
+        } catch {
+            throw PackageDescribeError.failed("could not decode swift package describe output: \(error)")
+        }
+        guard let target = graph.targets.first(where: { $0.name == targetName }) else { return [] }
+        let pathsByName = Dictionary(uniqueKeysWithValues: graph.targets.map { ($0.name, $0.path) })
+        let depNames = target.target_dependencies ?? []
+        return Set(depNames.compactMap { pathsByName[$0] })
+    }
+
+    /// Runs `swift package describe --type json` a second time (the first, via
+    /// `PackageDescribe.describe`, already ran to build `description` in `run`) purely
+    /// to recover `target_dependencies` for `targetName` — a field `PackageDescription`
+    /// does not expose. Acceptable: `init` runs once per repository and is not on the
+    /// measurement path.
+    ///
+    /// Throws rather than silently returning no exclusions on failure. This data feeds
+    /// a safety-narrowing decision (`deriveScope`'s belt-and-braces exclusion set);
+    /// silently treating a failure here as "no additional helpers found" would make a
+    /// transient or environmental failure indistinguishable from a genuinely helper-
+    /// free benchmark target, which is exactly the kind of silent guess this project's
+    /// own ethos rejects everywhere else. The first `describe` call already proved the
+    /// manifest parses and the toolchain works, so a failure here should be rare.
+    static func benchmarkHelperPaths(of targetName: String, repo: URL, timeout: TimeInterval = 300) throws -> Set<String> {
+        let swift = URL(fileURLWithPath: "/usr/bin/swift")
+        let r = try Subprocess.run(swift, ["package", "describe", "--type", "json"],
+                                    cwd: repo, env: nil, timeout: timeout)
+        guard r.exitCode == 0 else { throw PackageDescribeError.failed(r.stderr) }
+        guard !r.outputTruncated else {
+            throw PackageDescribeError.failed("swift package describe output was truncated at the capture cap")
+        }
+        guard let start = r.stdout.firstIndex(of: "{") else {
+            throw PackageDescribeError.failed("no JSON in output")
+        }
+        return try parseTargetDependencyPaths(Data(r.stdout[start...].utf8), of: targetName)
     }
 
     /// Picks the one target to measure, or refuses. Split out from `run` so the
@@ -289,7 +414,8 @@ public enum InitRunner {
     /// cannot be measured.
     ///
     /// Ordering matters for partial-write safety: every check that can refuse — the
-    /// existing-config check, `swift package describe`, benchmark discovery,
+    /// existing-config check, both `swift package describe` invocations (target
+    /// selection and the target-dependency graph), benchmark discovery,
     /// `Config.validate()`, and rendering both files to strings — happens BEFORE any
     /// file is touched. A refusal therefore never leaves a half-written
     /// `.autor3search/` directory or a `program.md` with no matching config: either
@@ -312,7 +438,8 @@ public enum InitRunner {
         let names = try discoverBenchmarks(repo: repo, target: chosenTarget)
         try validateDiscovered(names)
 
-        let scope = deriveScope(from: description)
+        let helperPaths = try benchmarkHelperPaths(of: chosenTarget.name, repo: repo)
+        let scope = deriveScope(from: description, benchmarkHelperPaths: helperPaths)
 
         let config = Config(
             version: 1,

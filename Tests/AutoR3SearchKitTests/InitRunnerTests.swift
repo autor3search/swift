@@ -51,6 +51,51 @@ import Foundation
     #expect(md.contains("autor3search-swift/sep16"))
 }
 
+// MARK: - Fix round 1: a concatenated literal must be skipped, not truncated
+//
+// Truncating `Benchmark("A" + "B")` to `"A"` produces a plausible WRONG name:
+// `validateDiscovered` passes (the list is non-empty), `init` succeeds, and it writes
+// `benchmarks: ["A"]` for a benchmark actually registered as `"AB"`. At measurement
+// time a `--filter '^A$'` match against the real `BenchmarkTool` finds nothing, which
+// (verified against the real tool) exits 0 with no percentile table — a confusing
+// `noPercentileTable` failure caused by a config `init` itself generated. Skipping
+// entirely, so a source file containing ONLY a concatenated name routes to the
+// well-tested `noBenchmarks` refusal with its full explanatory text, is the correct
+// outcome and matches this scanner's existing philosophy for interpolation.
+
+@Test func concatenatedLiteralNamesAreSkippedNotTruncated() {
+    let src = #"""
+    import Benchmark
+    nonisolated(unsafe) let benchmarks = {
+      Benchmark("A" + "B") { b in }
+    }
+    """#
+    #expect(InitRunner.discoverBenchmarks(benchmarkSource: src).isEmpty)
+}
+
+@Test func aFileOfOnlyConcatenatedNamesRoutesToNoBenchmarks() throws {
+    let src = #"""
+    import Benchmark
+    nonisolated(unsafe) let benchmarks = {
+      Benchmark("A" + "B") { b in }
+      Benchmark("A" + suffix) { b in }
+    }
+    """#
+    let names = InitRunner.discoverBenchmarks(benchmarkSource: src)
+    #expect(names.isEmpty)
+    #expect(throws: InitError.self) { try InitRunner.validateDiscovered(names) }
+    do {
+        try InitRunner.validateDiscovered(names)
+    } catch let e as InitError {
+        guard case .noBenchmarks = e else {
+            Issue.record("wrong InitError case: \(e)")
+            return
+        }
+    } catch {
+        Issue.record("wrong error type")
+    }
+}
+
 // MARK: - Extra coverage beyond the brief's five required tests
 //
 // The five tests above are verbatim from the brief and must not be weakened.
@@ -106,6 +151,83 @@ private func target(_ name: String, type: String = "library", path: String, prod
     // agent shrinking the benchmark's real workload by editing it.
     #expect(!scope.contains(where: { $0.hasPrefix("Benchmarks/") }))
     #expect(scope != ["**"])
+}
+
+// MARK: - Fix round 1: target-dependency graph as a second scope-exclusion signal
+//
+// Path adjacency alone misses a benchmark helper that is a DECLARED target
+// dependency of the benchmark but lives nowhere near it, e.g. `Sources/BenchFixtures`
+// alongside a real library at `Sources/Lib` and a benchmark at `Benchmarks/Bench` —
+// `Sources/BenchFixtures` never nests under `Benchmarks`, so the path rule alone
+// cannot catch it. `swift package describe --type json` reports this as
+// `"target_dependencies": ["BenchFixtures"]` on the benchmark target's own JSON
+// object; `parseTargetDependencyPaths` decodes exactly that field, independent of
+// Task 8's frozen `PackageDescribe`/`SwiftTarget`.
+
+private func describeJSON(targets: [(name: String, path: String, type: String, productDependencies: [String], targetDependencies: [String])]) -> Data {
+    let targetsJSON = targets.map {
+        """
+        {
+          "name": "\($0.name)",
+          "path": "\($0.path)",
+          "type": "\($0.type)",
+          "product_dependencies": [\($0.productDependencies.map { "\"\($0)\"" }.joined(separator: ", "))],
+          "target_dependencies": [\($0.targetDependencies.map { "\"\($0)\"" }.joined(separator: ", "))]
+        }
+        """
+    }.joined(separator: ",\n")
+    return Data("""
+    { "targets": [ \(targetsJSON) ] }
+    """.utf8)
+}
+
+@Test func parseTargetDependencyPathsResolvesNamesToPaths() throws {
+    let json = describeJSON(targets: [
+        (name: "Lib", path: "Sources/Lib", type: "library", productDependencies: [], targetDependencies: []),
+        (name: "BenchFixtures", path: "Sources/BenchFixtures", type: "library", productDependencies: [], targetDependencies: []),
+        (name: "Bench", path: "Benchmarks/Bench", type: "executable",
+         productDependencies: ["Benchmark"], targetDependencies: ["Lib", "BenchFixtures"]),
+    ])
+    let paths = try InitRunner.parseTargetDependencyPaths(json, of: "Bench")
+    #expect(paths == ["Sources/Lib", "Sources/BenchFixtures"])
+}
+
+/// The exact layout the round-1 review specified: benchmarks in a separate
+/// top-level directory (`Benchmarks/Bench`), a helper under `Sources/`
+/// (`Sources/BenchFixtures`) declared as a target dependency of the benchmark, and a
+/// REAL library also present (`Sources/Lib`). The helper must be excluded from
+/// scope; the real library must not be — this is the case
+/// `deriveScopeExcludesTestsAndBenchmarksButKeepsLibraryTargets` does not cover
+/// (that test's helper is path-adjacent; this one only shows up in the dependency
+/// graph).
+@Test func deriveScopeExcludesAGraphOnlyHelperUnderSourcesButKeepsTheRealLibrary() {
+    let description = PackageDescription(targets: [
+        target("Lib", path: "Sources/Lib"),
+        target("BenchFixtures", path: "Sources/BenchFixtures"),
+        target("Bench", type: "executable", path: "Benchmarks/Bench", productDependencies: ["Benchmark"]),
+    ])
+    let scope = InitRunner.deriveScope(from: description, benchmarkHelperPaths: ["Sources/BenchFixtures"])
+    #expect(scope.contains("Sources/Lib/**"), "the real library must stay in scope")
+    #expect(!scope.contains("Sources/BenchFixtures/**"), "the graph-declared helper must be excluded")
+    #expect(!scope.contains(where: { $0.hasPrefix("Benchmarks/") }))
+}
+
+/// Regression test for the exact failure mode caught during this fix: a benchmark's
+/// SOLE non-test, non-benchmark dependency is very often the actual library under
+/// test (verified against a real, working single-library-single-benchmark package —
+/// see the report). Unconditionally excluding every graph-declared dependency would
+/// drive `scope` to empty for this — the single most common package shape — turning
+/// `init` into a hard refusal rather than a per-edit `out_of_scope` rejection.
+/// `deriveScope` must back the graph signal out when applying it would empty scope.
+@Test func deriveScopeDoesNotEmptyItselfWhenTheOnlyDependencyIsTheRealLibrary() {
+    let description = PackageDescription(targets: [
+        target("Lib", path: "Sources/Lib"),
+        target("Bench", type: "executable", path: "Benchmarks/Bench", productDependencies: ["Benchmark"]),
+    ])
+    // As if `parseTargetDependencyPaths` reported Bench's only dependency, "Lib", as
+    // a helper — the worst case for the graph signal.
+    let scope = InitRunner.deriveScope(from: description, benchmarkHelperPaths: ["Sources/Lib"])
+    #expect(scope == ["Sources/Lib/**"], "must fall back rather than leave scope empty")
 }
 
 @Test func selectBenchmarkTargetRefusesToPickAmongSeveral() {
