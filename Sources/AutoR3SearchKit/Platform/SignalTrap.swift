@@ -204,27 +204,23 @@ public enum SignalTrap {
         killProcessGroupFromSignalContext(sig_atomic_t(pgid))
     }
 
-    /// As above, but reading the global exactly as the handler does. Used only
-    /// to bind the "nothing in flight" case, where the value is unambiguously 0.
-    static func killLiveChildTreeForTesting() {
-        killLiveChildTreeFromSignalContext()
-    }
-
-    /// Test-only: undo `install()`'s arming so a test that publishes a pgid
-    /// cannot leave the library in a state where parallel test cases publish
-    /// over each other.
-    static func disarmForTesting() {
-        liveChildPGID = 0
-        trapArmed = false
-    }
-
-    /// Test-only: arm without installing any OS handler, so the publication
-    /// path can be exercised without changing the test process's signal
-    /// disposition (which would break the test runner itself).
-    static func armWithoutInstallingForTesting() {
-        liveChildPGID = 0
-        trapArmed = true
-    }
+    // DELIBERATELY NO `armForTesting` / `disarmForTesting`.
+    //
+    // An earlier version of this file had them, and they were a trap of their
+    // own. `trapArmed` and `liveChildPGID` are PROCESS-WIDE, and swift-testing
+    // runs cases in parallel: while any test had the trap armed, EVERY other
+    // case that spawned through `Subprocess` -- the git fixtures, the eval
+    // tests, the baseline tests -- published its own child's pgid into the
+    // same slot, for tens to hundreds of milliseconds each, across a
+    // 25-second run. Two interleavings follow directly: a test that reads the
+    // slot sees another case's live pgid, and, far worse, a test that kills
+    // "whatever is in the slot" SIGKILLs an unrelated case's child and fails
+    // it with a confusing error nobody would trace back here.
+    //
+    // The library is therefore inert until the executable arms it, no test
+    // ever arms it, and every test below reaches the logic through explicit
+    // parameters instead of through the global. `theLibraryPublishesNothing...`
+    // is what holds that property in place.
 }
 
 #endif

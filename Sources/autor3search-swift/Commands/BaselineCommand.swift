@@ -17,6 +17,21 @@ struct BaselineCommand: ParsableCommand {
     var tag: String
 
     func run() throws {
+        // `stop --force` does not signal `baseline`, so the exposure here is Ctrl-C
+        // only -- but a Ctrl-C'd `swift build` (24-33 seconds cold, per spec.md 2.2)
+        // orphaned to init is mistake #4 verbatim, on the same machine, burning CPU
+        // while corrupting the very measurements this harness exists to take. The warm
+        // builds below go through the same single `Subprocess` path that publishes the
+        // in-flight child's pgid, so one call is all it takes. See `SignalTrap`.
+        if !SignalTrap.install() {
+            FileHandle.standardError.write(Data("""
+                warning: could not install the SIGTERM/SIGINT handler. Ctrl-C will leave the \
+                running build orphaned and consuming CPU, which corrupts later measurements on \
+                this machine. Kill it by hand if you interrupt this run.
+
+                """.utf8))
+        }
+
         let record = try BaselineRunner.run(
             repo: repoOption.repoURL, tag: tag, env: ProcessInfo.processInfo.environment)
         print("""

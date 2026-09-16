@@ -23,9 +23,19 @@ import Glibc
 // real `eval` process and shows the child surviving without the handler and gone with
 // it. A flaky signal-timing test in this suite would be worse than none.
 //
-// Every test here disarms the trap in a `defer`. The library only publishes a pgid when
-// armed, and swift-testing runs cases in parallel, so leaving it armed would let
-// unrelated cases' children write over each other's published pgid.
+// NO TEST HERE ARMS THE TRAP, and none writes the process-wide slot. An earlier version
+// did, and the 10x rerun that was supposed to prove it non-flaky could not have seen the
+// flake: it was run as `--filter SignalTrapTests`, which executes only these four cases
+// and therefore excludes the ~180 others that create the hazard. Under a full parallel
+// run, while the trap is armed, EVERY case that spawns through `Subprocess` -- the git
+// fixtures, `EvalRunnerTests`, `BaselineRunnerTests`, `SubprocessTests` -- publishes its
+// own child's pgid into that one slot. Two interleavings follow: a test that reads the
+// slot sees someone else's live pgid and fails, and a test that kills "whatever is in
+// the slot" SIGKILLs an unrelated case's child, failing it with a git error nobody would
+// trace back to this file.
+//
+// So every test below reaches the logic through EXPLICIT PARAMETERS, exactly as the kill
+// test already did. Nothing here needs `.serialized`, because nothing here shares state.
 
 /// Spawns `sh -c` as its own process-group leader, exactly as the harness spawns every
 /// child, and returns it. The caller owns reaping it.
@@ -54,20 +64,32 @@ private func processExists(_ pid: pid_t) -> Bool {
     kill(pid, 0) == 0 || errno == EPERM
 }
 
-@Test func aSpawnedChildsProcessGroupIsPublishedAndClearedAgain() throws {
-    SignalTrap.armWithoutInstallingForTesting()
-    defer { SignalTrap.disarmForTesting() }
+/// Renamed from `aSpawnedChildsProcessGroupIsPublishedAndClearedAgain`, which overstated
+/// what it bound: it asserted the slot was 0 before and 0 after and never observed a
+/// non-zero publication at all, so deleting `SignalTrap.noteChildSpawned(pgid:)` from
+/// `Subprocess.runRaw` left it green. Observing a real publication requires arming the
+/// process-wide trap, which -- see the header -- cannot be done safely while other cases
+/// spawn in parallel. So this now asserts the property it can actually hold, under a name
+/// that says so, and the publication call site is bound instead by the mutation evidence
+/// in docs/run-log.md: with the handler installed, a real `BenchmarkTool` child is killed
+/// on SIGTERM, which is only possible if `runRaw` published its pgid.
+@Test func theLibraryPublishesNothingUntilTheExecutableInstallsTheTrap() throws {
 
-    #expect(SignalTrap.livePGID == 0, "nothing in flight before a spawn")
+    #expect(SignalTrap.livePGID == 0,
+            "nothing may be published before the executable installs the trap")
 
-    // Go through the real entry point, so this binds Subprocess's publication and not a
-    // re-implementation of it. `true` exits immediately; what matters is that the pgid
-    // is cleared afterwards.
+    // A real spawn through the real entry point. If `Subprocess` published
+    // unconditionally instead of gating on the trap being armed, this would come back
+    // non-zero for the duration of the child -- and, across the rest of this suite,
+    // parallel cases would be overwriting each other's pgids in one shared slot.
     _ = try Subprocess.run(URL(fileURLWithPath: "/usr/bin/true"), [],
                            cwd: URL(fileURLWithPath: NSTemporaryDirectory()), timeout: 30)
 
-    #expect(SignalTrap.livePGID == 0,
-            "the pgid must be cleared once the child is reaped, so a later signal can never target a recycled pid")
+    #expect(SignalTrap.livePGID == 0, """
+        the library published a pgid without the trap being installed. Nothing in this \
+        test suite arms it, so this must hold for the whole run -- it is the property \
+        that makes it safe for every other case here to spawn children in parallel.
+        """)
 }
 
 @Test func theSignalHandlersKillReachesTheChildAndItsGrandchildren() throws {
@@ -132,23 +154,33 @@ private func processExists(_ pid: pid_t) -> Bool {
         """)
 }
 
-@Test func nothingIsPublishedWhileTheTrapIsDisarmed() throws {
-    // The library must stay inert until the executable installs the trap. swift-testing
-    // runs cases in parallel and several children are genuinely alive at once, so a
-    // library that always published would have them overwrite each other.
-    SignalTrap.disarmForTesting()
-    SignalTrap.noteChildSpawned(pgid: 424242)
-    #expect(SignalTrap.livePGID == 0)
-}
+@Test func killingWithNothingInFlightTouchesNothingAtAll() throws {
+    // The handler can fire BETWEEN children -- after one is reaped and before the next
+    // is spawned -- when the slot holds 0. `kill(0, ...)` signals the CALLER's entire
+    // process group, so without the `pgid > 0` guard that case would signal the test
+    // runner (in production, the shell that started eval and every other job in it).
+    //
+    // Asserting merely "the test process survived" would be weak. This spawns a real
+    // process group, asks for a kill of pgid 0 and of a negative pgid, and asserts the
+    // real child is STILL ALIVE afterwards -- so the guard is observed to stop the call,
+    // not just to avoid killing us.
+    let child = try spawnGroupLeader("sleep 60")
+    defer {
+        SignalTrap.killProcessGroupForTesting(pgid: child.pid)
+        _ = reap(child.pid)
+        close(child.stdoutFD)
+        close(child.stderrFD)
+    }
+    #expect(processExists(child.pid), "the fixture child must be alive to begin with")
 
-@Test func killingWithNothingInFlightIsANoOp() throws {
-    // The handler can fire between children -- after a reap and before the next spawn.
-    // A pgid of 0 must never reach `kill`, because `kill(0, ...)` signals the CALLER's
-    // entire process group, which in a test run is the test runner itself.
-    SignalTrap.armWithoutInstallingForTesting()
-    defer { SignalTrap.disarmForTesting() }
-    #expect(SignalTrap.livePGID == 0)
-    SignalTrap.killLiveChildTreeForTesting()
-    // Reaching this line at all is the assertion: the test process is still alive.
-    #expect(SignalTrap.livePGID == 0)
+    // Only 0 is exercised, deliberately. `kill(-1, ...)` signals every process the user
+    // can signal, so a test that relied on the guard to stop THAT would destroy the
+    // developer's session the day the guard broke. With 0 the blast radius of a broken
+    // guard is this test runner's own process group: loud, and contained.
+    SignalTrap.killProcessGroupForTesting(pgid: 0)
+
+    #expect(processExists(child.pid), """
+        a kill request with no live child reached `kill` anyway. With pgid 0 that signals \
+        the caller's own process group -- in production, the shell that started eval.
+        """)
 }
