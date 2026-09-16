@@ -516,8 +516,10 @@ public enum InitRunner {
     /// Idempotently ensures `.gitignore` covers every file this tool writes
     /// inside the repository under test. Keyed on a marker comment rather than a raw
     /// substring match, so a re-run of `init` (with `--force`) never appends a
-    /// duplicate block, whether `.gitignore` did not exist, already existed without
-    /// this entry, or already has it from a previous `init`.
+    /// duplicate MARKER LINE, whether `.gitignore` did not exist, already existed
+    /// without this entry, or already has it from a previous `init` -- but see the
+    /// UPGRADE note below: the marker being present no longer means every entry is,
+    /// so this now checks each entry independently even when the marker is found.
     ///
     /// Four entries. `.autor3search/config.yaml` itself is deliberately NOT
     /// among them — it is committed on purpose, since `baseline` hashes it and
@@ -541,21 +543,54 @@ public enum InitRunner {
     ///   entry a profiling run followed by `git add -A` would commit exactly the
     ///   same class of harness-output-as-agent-edit bug `results.tsv`/`run.log`
     ///   exist above to prevent, and `eval`'s scope gate would reject the commit.
+    ///
+    /// UPGRADE, NOT JUST FIRST-WRITE. A repository initialised before Task 20 has
+    /// `.gitignore` with the marker AND the original three entries, but NOT
+    /// `.autor3search/profiles/` — and the original version of this function
+    /// returned immediately the moment it saw the marker, which left every
+    /// already-initialised repository (including a re-`init --force`, since the
+    /// marker survives that too) permanently on whatever entry set existed the day
+    /// it was first initialised. That is the exact bug this whole function exists
+    /// to prevent, reached through its own upgrade path: `profile` followed by
+    /// `git add -A` would still commit the raw sample files on any repo `init`'d
+    /// before this entry was added, and `eval`'s scope gate would still reject it.
+    /// So: when the marker is present, this no longer returns early -- it checks
+    /// each required entry as its own line and appends only whatever is missing,
+    /// leaving the rest of the file (including whatever the human added below the
+    /// marker) untouched. A repository that already has every entry is left
+    /// byte-for-byte unchanged, which is what keeps this idempotent.
     private static let gitignoreMarker = "# autor3search-swift"
+    private static let requiredGitignoreEntries = [
+        ".build/", "results.tsv", "run.log", ".autor3search/profiles/",
+    ]
 
     /// Not `private`: exercised directly by `InitRunnerTests` so idempotence can be
     /// verified without a full, toolchain-and-possibly-network-dependent `run()`.
     static func ensureGitignoreCoversBuildOutput(repo: URL) throws {
         let url = repo.appendingPathComponent(".gitignore")
-        let block = "\(gitignoreMarker)\n.build/\nresults.tsv\nrun.log\n.autor3search/profiles/\n"
+        let entries = requiredGitignoreEntries
+
         guard FileManager.default.fileExists(atPath: url.path) else {
+            let block = ([gitignoreMarker] + entries).joined(separator: "\n") + "\n"
             try block.write(to: url, atomically: true, encoding: .utf8)
             return
         }
+
         let existing = try String(contentsOf: url, encoding: .utf8)
-        guard !existing.contains(gitignoreMarker) else { return }
+        let existingLines = Set(existing.split(separator: "\n", omittingEmptySubsequences: true).map(String.init))
+
+        // Whatever is genuinely missing, whether the marker is present (an
+        // UPGRADE: this repo was `init`'d before some of these entries existed)
+        // or absent entirely (a `.gitignore` this tool has never touched).
+        var missing = entries.filter { !existingLines.contains($0) }
+        if !existingLines.contains(gitignoreMarker) {
+            missing = [gitignoreMarker] + missing
+        }
+        guard !missing.isEmpty else { return }  // Every entry already present: untouched, byte-for-byte.
+
         let needsNewline = !existing.isEmpty && !existing.hasSuffix("\n")
-        let updated = existing + (needsNewline ? "\n" : "") + (existing.isEmpty ? "" : "\n") + block
+        let updated = existing + (needsNewline ? "\n" : "") + (existing.isEmpty ? "" : "\n") +
+            missing.joined(separator: "\n") + "\n"
         try updated.write(to: url, atomically: true, encoding: .utf8)
     }
 }

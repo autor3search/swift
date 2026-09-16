@@ -381,6 +381,38 @@ private func describeJSON(targets: [(name: String, path: String, type: String, p
     }
 }
 
+@Test func gitignoreUpgradesAnAlreadyInitialisedRepoMissingANewerEntry() throws {
+    // Reproduces the round-1 regression directly: a repo `init`'d BEFORE Task 20
+    // added `.autor3search/profiles/` has the marker and the original three
+    // entries, but not the fourth. The old implementation returned the instant it
+    // saw the marker, so this repo -- and every repo `init`'d before this task,
+    // `init --force` included, since the marker survives that too -- stayed on
+    // the stale three-entry set forever. `profile` followed by `git add -A`
+    // would then commit the raw sample files, and eval's scope gate would reject
+    // the commit as out_of_scope for a file the harness itself wrote.
+    let dir = tempDir()
+    try withTempDirectories(dir) {
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try write("# autor3search-swift\n.build/\nresults.tsv\nrun.log\n",
+                  to: dir.appendingPathComponent(".gitignore"))
+        try InitRunner.ensureGitignoreCoversBuildOutput(repo: dir)
+        let text = try String(contentsOf: dir.appendingPathComponent(".gitignore"), encoding: .utf8)
+        let lines = text.split(separator: "\n").map(String.init)
+        #expect(lines.contains(".autor3search/profiles/"),
+                "an already-initialised repo must be upgraded, not left on its original entry set")
+        #expect(lines.contains(".build/"), "pre-existing entries must survive the upgrade")
+        #expect(lines.contains("results.tsv"), "pre-existing entries must survive the upgrade")
+        #expect(lines.contains("run.log"), "pre-existing entries must survive the upgrade")
+        #expect(text.components(separatedBy: "# autor3search-swift").count == 2,
+                "the marker must still appear exactly once after an upgrade")
+
+        // A second call against the now-upgraded file changes nothing further.
+        try InitRunner.ensureGitignoreCoversBuildOutput(repo: dir)
+        let second = try String(contentsOf: dir.appendingPathComponent(".gitignore"), encoding: .utf8)
+        #expect(text == second, "a repo with every entry already present must be left byte-for-byte unchanged")
+    }
+}
+
 @Test func gitignoreIsIdempotentAcrossRepeatedCalls() throws {
     let dir = tempDir()
     try withTempDirectories(dir) {

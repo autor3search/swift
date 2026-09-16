@@ -7,19 +7,22 @@ import Foundation
 /// command only chooses which benchmarks to profile and formats the result --
 /// the same division `report` uses for `ReportRunner`'s structured summary.
 ///
-/// WHY THE BINARY THIS PROFILES IS BUILT WITH `-Xswiftc -g` BUT `eval` NEVER
-/// IS. `-g` only tells the compiler to emit DWARF/debug-map info alongside
-/// the `-O` output `-c release` already selects; it does not change what
-/// `-O` decides to inline, vectorize or fold, so the CODE `sample` observes
-/// here is the same code `eval`'s gate 5 measures. What differs is the
-/// on-disk artifact: `Sampler.profile` rebuilds `config.benchmarkTarget`
-/// into this SAME repository's `.build/release/`, with `-g` added -- the
-/// same directory eval's own bare `swift build -c release` populates -- so
-/// running `profile` leaves that binary carrying debug info until the next
-/// `eval` (or `baseline`) rebuilds it once more without `-g`. That rebuild
-/// happens automatically (SwiftPM's build cache is keyed on the flags), so
-/// nothing is left stale; the only cost is one extra compile the first time
-/// `eval` runs after a `profile`.
+/// `-Xswiftc -g`, AND WHY IT TURNED OUT NOT TO MATTER. `Sampler.profile`
+/// builds `config.benchmarkTarget` with `-Xswiftc -g` explicitly, on the
+/// original theory that `eval`'s own bare `swift build -c release` might not
+/// carry debug info and the extra flag would leave a rebuilt, differently-
+/// keyed binary behind. MEASURED, not assumed: `swift build -c release -v`
+/// already passes `-g -debug-info-format=dwarf -dwarf-version=4` with no
+/// extra flags at all (this toolchain's release configuration emits debug
+/// info by default), and a SHA256 of `.build/release/<target>` taken after a
+/// plain `swift build -c release`, after `profile`'s `-Xswiftc -g` build, and
+/// after a second plain build were BYTE-IDENTICAL across all three. So the
+/// explicit flag is redundant with what SwiftPM already does -- it changes
+/// nothing about the binary, there is no extra rebuild, and the binary
+/// `sample` observes here is not merely equivalent-by-reasoning to the one
+/// `eval`'s gate 5 measures, it is bit-for-bit the same file. Left in the
+/// build invocation anyway, as explicit intent that stays correct even if a
+/// future toolchain ever stops defaulting to `-g` for release builds.
 struct ProfileCommand: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "profile",

@@ -70,12 +70,25 @@ public enum SamplerError: Error, CustomStringConvertible {
     case buildFailed(String)
     case launchFailed(String)
     case toolFailed(String)
-    /// The profiler attached (or tried to) but came away with nothing
-    /// attributable -- most often because the benchmark's own run finished
-    /// before sampling could catch it on-CPU at all. Distinct from
-    /// `toolFailed`: the tool itself did not error, there is simply nothing
-    /// to rank, and that must be said plainly rather than shown as an
-    /// empty table that looks identical to "measured, found nothing hot".
+    /// The benchmark named produced NO output at all when run directly --
+    /// the compiled binary does not register a benchmark by this name (a
+    /// stale `config.yaml`, a rename on one side only, a typo). Checked and
+    /// thrown BEFORE `parseSampleOutput` is even consulted: a filter that
+    /// matches nothing still leaves a live pid for a few milliseconds, long
+    /// enough for a sampler to catch real, symbolicated, plausible-looking
+    /// argument-parsing/startup frames that have nothing to do with the
+    /// benchmark asked for -- exactly the dangerous shape (a result that
+    /// reads as a finding) this case exists to refuse instead of returning.
+    case benchmarkNotFound(String)
+    /// The benchmark DID run (produced real output) but the profiler
+    /// attached (or tried to) and came away with nothing attributable --
+    /// most often because its run finished before sampling could catch it
+    /// on-CPU at all. Distinct from `toolFailed`: the tool itself did not
+    /// error, there is simply nothing to rank, and that must be said
+    /// plainly rather than shown as an empty table that looks identical to
+    /// "measured, found nothing hot". Distinct from `.benchmarkNotFound`:
+    /// this is only ever thrown once real output has already ruled that
+    /// cause out, so the message never misattributes one for the other.
     case tooFastToSample(String)
     case metricsFailed(String)
 
@@ -89,6 +102,8 @@ public enum SamplerError: Error, CustomStringConvertible {
             return "could not launch the benchmark to profile: \(detail)"
         case .toolFailed(let detail):
             return "the sampler failed: \(detail)"
+        case .benchmarkNotFound(let detail):
+            return "benchmark not found in the profiled binary: \(detail)"
         case .tooFastToSample(let detail):
             return "nothing attributable was captured: \(detail)"
         case .metricsFailed(let detail):
@@ -250,18 +265,27 @@ public enum Sampler {
     // =====================================================================
 
     /// Builds `config.benchmarkTarget` in release WITH `-Xswiftc -g` (debug
-    /// info only -- see the file-level note in `ProfileCommand` for why
-    /// this does not change what is measured), spawns it directly (not
-    /// through `BenchmarkTool`; the target's own compiled binary accepts
-    /// the same `--filter` a driver would pass it), attaches the
+    /// info -- see the file-level note in `ProfileCommand` for the MEASURED
+    /// fact that `swift build -c release` already passes `-g` by default,
+    /// so this changes nothing about what gets built), spawns it directly
+    /// (not through `BenchmarkTool`; the target's own compiled binary
+    /// accepts the same `--filter` a driver would pass it), attaches the
     /// platform's sampler for up to `seconds`, persists the raw output
     /// under `.autor3search/profiles/<benchmark>.sample.txt` inside
     /// `repo`, and returns the ranked, aggregated result.
     ///
     /// Throws `SamplerError.notPermitted` before touching the filesystem
-    /// when no sampler is available, and `.tooFastToSample` when the
-    /// sampler ran cleanly but came away with nothing attributable --
-    /// never returns an empty array pretending that is the same thing as
+    /// when no sampler is available; `.benchmarkNotFound` when `benchmark`
+    /// produced no output at all when run directly (the compiled binary
+    /// does not actually register a benchmark by this name -- checked
+    /// BEFORE looking at what the sampler caught, since a filter that
+    /// matches nothing still leaves a live pid for a few milliseconds, and
+    /// whatever real, symbolicated, plausible-looking startup/argument-
+    /// parsing code the sampler happens to catch in that window has
+    /// nothing to do with the benchmark asked for); and `.tooFastToSample`
+    /// when the benchmark DID run (real output was produced) but the
+    /// sampler came away with nothing attributable regardless. Never
+    /// returns an empty array pretending that is the same thing as
     /// "measured, and nothing was hot".
     public static func profile(
         benchmark: String, repo: URL, config: Config, seconds: Double
@@ -273,12 +297,6 @@ public enum Sampler {
         let swift = URL(fileURLWithPath: "/usr/bin/swift")
         let timeout = TimeInterval(config.timeoutSeconds)
 
-        // `-g` only adds DWARF/debug-map emission; it does not change
-        // `-O`'s codegen. It DOES change the build's cache key, though, so
-        // this rebuilds the target with debug info now, and a later plain
-        // `swift build -c release` (what `eval`'s gate 5 runs) will rebuild
-        // it once more WITHOUT `-g` before anything is measured again --
-        // costing one extra build, never staleness.
         try build(swift: swift, repo: repo, product: config.benchmarkTarget,
                    extraFlags: ["-Xswiftc", "-g"], timeout: timeout)
         // `BenchmarkTool` needs no debug info -- only the benchmark
@@ -307,14 +325,38 @@ public enum Sampler {
         // children: a Ctrl-C (or `stop --force`, though nothing currently
         // sends `profile` a stop request) must kill this child's whole
         // process-group tree, not leave it orphaned and burning CPU.
-        SignalTrap.noteChildSpawned(pgid: child.pid)
+        //
+        // `profile` holds TWO children alive at once for the whole sampling
+        // window below -- this benchmark, and (inside `runSampleTool`/
+        // `runPerfTool`) the sampler attached to it -- which is exactly the
+        // case `SignalTrap`'s registry now has multiple slots for. A `false`
+        // return means the registry is completely full; refuse rather than
+        // let this child run untracked by the trap for the whole sampling
+        // window, the same policy `Subprocess.runRaw` applies to every
+        // other child this project spawns.
+        guard SignalTrap.noteChildSpawned(pgid: child.pid) else {
+            Platform.processTree.killTree(pgid: child.pid)
+            var reapStatus: Int32 = 0
+            waitpid(child.pid, &reapStatus, 0)
+            close(child.stdoutFD)
+            close(child.stderrFD)
+            throw SamplerError.launchFailed(
+                "SignalTrap's live-child registry is full; refusing to run \(exe.path) " +
+                "untracked by the SIGTERM/SIGINT trap")
+        }
 
-        // The benchmark's own stdout/stderr (its progress bar, its own
-        // percentile tables) are not needed here -- only what the sampler
-        // observes matters -- but the pipes must still be drained or a
-        // full 64 KiB buffer would block the benchmark on a write.
-        let outDrain = DiscardingDrain(fd: child.stdoutFD)
-        let errDrain = DiscardingDrain(fd: child.stderrFD)
+        // The benchmark's own stdout is CAPTURED, not discarded: it is the
+        // signal `benchmark` actually exists in this binary (see the
+        // `.benchmarkNotFound` check below) -- verified live, the raw
+        // executable run standalone with `--filter` prints its own full
+        // results to stdout even under `--quiet true` when the filter
+        // matches something, and prints NOTHING AT ALL, in well under
+        // 50ms, when it matches nothing. Stderr is drained but not
+        // inspected. Either way the pipes must be drained or a full 64 KiB
+        // buffer would block the benchmark on a write while the sampler is
+        // attached to it.
+        let outDrain = CapturingDrain(fd: child.stdoutFD)
+        let errDrain = CapturingDrain(fd: child.stderrFD)
 
         defer {
             // Best-effort: a no-op if the benchmark already exited on its
@@ -324,7 +366,7 @@ public enum Sampler {
             Platform.processTree.killTree(pgid: child.pid)
             var status: Int32 = 0
             waitpid(child.pid, &status, 0)
-            SignalTrap.noteChildReaped()
+            SignalTrap.noteChildReaped(pgid: child.pid)
             outDrain.wait()
             errDrain.wait()
             close(child.stdoutFD)
@@ -340,19 +382,33 @@ public enum Sampler {
         throw SamplerError.notPermitted(unavailableReason() ?? "unsupported platform")
         #endif
 
+        // Checked BEFORE inspecting what the sampler caught -- see the
+        // extended reasoning in this function's doc comment. A snapshot is
+        // safe here (before the child has necessarily been reaped): the
+        // drain threads are already running in the background and append
+        // under lock as bytes arrive, independent of when this is read.
+        guard !outDrain.snapshot().isEmpty else {
+            throw SamplerError.benchmarkNotFound("""
+                "\(benchmark)" produced no output at all when run directly against \(exe.path) \
+                with --filter ^\(escaped)$. The compiled binary does not appear to register a \
+                benchmark by this name -- config.yaml and the benchmark target's source may have \
+                gone out of sync, or the name has a typo. Nothing was profiled.
+                """)
+        }
+
         try persistRawOutput(raw, benchmark: benchmark, repo: repo)
 
         let hot = parseSampleOutput(raw)
         guard !hot.isEmpty else {
             throw SamplerError.tooFastToSample("""
-                the sampler attached to "\(benchmark)" but captured no attributable samples in \
-                \(seconds)s. The most likely cause: this benchmark's own run finished before \
-                sampling could catch anything on-CPU -- a standalone run of a lightly-loaded \
-                benchmark body can complete in well under a second, faster than most samplers can \
-                reliably attach to a freshly spawned process. Raise this benchmark's own duration \
-                or iteration count (or profile a heavier workload) to give the sampler something \
-                to catch. The raw (near-empty) sampler output was still written to \
-                \(rawOutputURL(repo: repo, benchmark: benchmark).path).
+                "\(benchmark)" ran -- it produced real output -- but the sampler attached to pid \
+                \(child.pid) and captured no attributable samples in \(seconds)s. The most likely \
+                cause: this benchmark's own run finished before sampling could catch anything \
+                on-CPU -- a lightly-loaded benchmark body can complete in well under a second, \
+                faster than most samplers can reliably attach to a freshly spawned process. Raise \
+                this benchmark's own duration or iteration count (or profile a heavier workload) \
+                to give the sampler something to catch. The raw (near-empty) sampler output was \
+                still written to \(rawOutputURL(repo: repo, benchmark: benchmark).path).
                 """)
         }
         return hot
@@ -604,27 +660,53 @@ public enum Sampler {
     }
 }
 
-/// Drains a pipe read end to EOF in the background, discarding every byte.
-/// The spawned benchmark's own stdout/stderr are not needed here -- only
-/// what the sampler observes matters -- but the pipe still has to be
-/// drained, or the child can block writing to a full 64 KiB buffer while
-/// the sampler is attached to it.
-private final class DiscardingDrain: @unchecked Sendable {
+/// Drains a pipe read end to EOF in the background, capturing every byte
+/// (bounded to `cap`) into a lock-guarded buffer that can be inspected
+/// mid-flight via `snapshot()` -- used by `Sampler.profile` to tell "the
+/// benchmark ran and printed real output" from "the filter matched nothing
+/// and it exited immediately with none" -- as well as after `wait()`. The
+/// pipe must still be drained regardless of whether anything reads the
+/// capture: a full 64 KiB buffer would otherwise block the child on a
+/// write while the sampler is attached to it.
+private final class CapturingDrain: @unchecked Sendable {
     private let group = DispatchGroup()
+    private let lock = NSLock()
+    private var captured = Data()
+    // 1 MiB: ample for the existence check this exists for (the raw
+    // executable's own results report), not a general-purpose capture --
+    // callers that need the FULL stream use `Subprocess.run`/`runData`.
+    private let cap = 1 << 20
 
     init(fd: Int32) {
         group.enter()
-        let group = self.group
         DispatchQueue.global(qos: .utility).async {
-            defer { group.leave() }
+            defer { self.group.leave() }
             let capacity = 64 * 1024
-            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
-            defer { buffer.deallocate() }
+            let readBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
+            defer { readBuffer.deallocate() }
             while true {
-                let n = read(fd, buffer, capacity)
+                let n = read(fd, readBuffer, capacity)
                 if n <= 0 { break }  // EOF, or the fd was torn down under us.
+                self.append(readBuffer, count: n)
             }
         }
+    }
+
+    private func append(_ bytes: UnsafePointer<UInt8>, count: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        let room = cap - captured.count
+        guard room > 0 else { return }  // Keep reading (never block the child); discard past cap.
+        captured.append(bytes, count: min(room, count))
+    }
+
+    /// A point-in-time copy of everything captured so far. Safe to call
+    /// before `wait()` -- the read loop appends under `lock` from its own
+    /// thread regardless of when this is read.
+    func snapshot() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return captured
     }
 
     func wait() { group.wait() }

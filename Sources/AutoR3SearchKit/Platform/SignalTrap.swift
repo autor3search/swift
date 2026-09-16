@@ -21,7 +21,21 @@
 // killTree over a registry of live children -- that registry has no owner at
 // task 2". `eval` is that owner: it runs children strictly sequentially --
 // build, then test, then each measurement round -- so at any instant there is
-// at most ONE live child, and the "registry" is a single integer.
+// at most ONE live child.
+//
+// TASK 20 CORRECTION: "at most one live child" is a property of `eval` and
+// `baseline`, not of every executable that installs this trap. `profile`
+// holds TWO children alive at once for the whole sampling window -- the
+// benchmark it is profiling, and the sampler (`sample`/`perf`) attached to
+// it -- and a single-slot registry silently OVERWRITES the first pgid with
+// the second the moment the sampler spawns, which is exactly the orphan
+// this file exists to prevent: reproduced live, `kill -TERM` during
+// `profile`'s sampling window left the benchmark reparented to pid 1 at
+// 100% CPU, because the registry pointed at the sampler, not it. The
+// registry below is therefore a small FIXED-CAPACITY SET of live pgids
+// (`maxLiveChildren` slots), not a single integer -- still no allocation,
+// no ARC and no locks inside the handler, just a few more `kill(2)` calls
+// over a few more already-allocated words of memory.
 //
 // WHY NOT `kill(-evalPid)` FROM `stop --force`. It looks like the obvious fix
 // and reaches nothing: the children are deliberately NOT in eval's process
@@ -75,18 +89,32 @@ import Glibc
 
 #if canImport(Darwin) || os(Linux)
 
-/// Process-group id of the child currently in flight, or 0 when none.
+/// Fixed capacity for concurrently live child process groups. `eval` and
+/// `baseline` run children strictly sequentially (one live child at a time);
+/// `profile` genuinely holds TWO at once for the whole sampling window -- the
+/// benchmark it is profiling, and the sampler (`sample`/`perf`) attached to
+/// it. 8 is ample headroom over the two this project currently ever needs at
+/// once, with room to spare should a future command need a third or fourth.
+private let maxLiveChildren = 8
+
+/// Fixed-capacity, signal-handler-safe storage for up to `maxLiveChildren`
+/// live child process-group ids, indexed `0..<maxLiveChildren`, each either 0
+/// (free) or a live pgid.
 ///
-/// `sig_atomic_t` is the one type the C standard promises can be read and
-/// written atomically with respect to signal delivery. Written by
-/// `Subprocess.runRaw` around each spawn; read by the signal handler.
-nonisolated(unsafe) private var liveChildPGID: sig_atomic_t = 0
+/// A raw `malloc`'d buffer, not a Swift `Array`: allocated exactly ONCE, in
+/// `install()`, before the handler can possibly run (see hazard (3) below),
+/// so the handler and both `note*` functions afterward only ever do pointer
+/// arithmetic over ALREADY-allocated memory -- no allocation, no ARC, none of
+/// Swift `Array`'s own copy-on-write machinery, none of which is
+/// async-signal-safe. `sig_atomic_t` is the one type the C standard promises
+/// can be read and written atomically with respect to signal delivery.
+nonisolated(unsafe) private var liveChildPGIDs: UnsafeMutablePointer<sig_atomic_t>?
 
 /// Whether a trap has been installed. Until it has, `Subprocess` publishes
-/// nothing -- which keeps this global untouched in the test process, where
+/// nothing -- which keeps the registry untouched in the test process, where
 /// swift-testing runs cases in parallel and several children really are alive
-/// at once. The single-live-child invariant this type depends on is a property
-/// of the `eval` EXECUTABLE, not of the library.
+/// at once. The single-live-child invariant `eval`/`baseline` depend on is a
+/// property of those EXECUTABLES, not of the library.
 nonisolated(unsafe) private var trapArmed = false
 
 /// Kills one process group. Async-signal-safe: a comparison and, at most, two
@@ -105,10 +133,18 @@ private func killProcessGroupFromSignalContext(_ pgid: sig_atomic_t) {
     POSIXProcessTree().killTree(pgid: pid_t(pgid))
 }
 
-/// The body of the handler, minus the exit: one load of a `sig_atomic_t`, then
-/// the kill above.
+/// The body of the handler, minus the exit: kills EVERY currently-registered
+/// pgid, not just one -- `profile` genuinely has two live children (the
+/// benchmark and the sampler attached to it) for the whole sampling window,
+/// and a handler that only ever killed "the" child would leave whichever one
+/// is not in the single slot orphaned. Reading a few more already-allocated
+/// words of memory and issuing a few more `kill(2)` calls is exactly as
+/// async-signal-safe as reading one word and issuing two.
 private func killLiveChildTreeFromSignalContext() {
-    killProcessGroupFromSignalContext(liveChildPGID)
+    guard let slots = liveChildPGIDs else { return }
+    for index in 0..<maxLiveChildren {
+        killProcessGroupFromSignalContext(slots[index])
+    }
 }
 
 private func terminatingSignalHandler(_ signalNumber: Int32) {
@@ -132,9 +168,19 @@ public enum SignalTrap {
     /// rather than silently believe it is protected.
     @discardableResult
     public static func install() -> Bool {
-        // Force both globals' lazy initialisation to completion BEFORE a
-        // handler can possibly run -- see hazard (3) in the file comment.
-        liveChildPGID = 0
+        // Force both globals' lazy initialisation to completion, AND the
+        // registry buffer's one-time allocation, BEFORE a handler can
+        // possibly run -- see hazard (3) in the file comment. Allocated only
+        // once: a second `install()` call (there is no legitimate reason for
+        // one, but nothing prevents it) re-zeroes the existing buffer instead
+        // of leaking a second one.
+        if let existing = liveChildPGIDs {
+            existing.update(repeating: 0, count: maxLiveChildren)
+        } else {
+            let buffer = UnsafeMutablePointer<sig_atomic_t>.allocate(capacity: maxLiveChildren)
+            buffer.initialize(repeating: 0, count: maxLiveChildren)
+            liveChildPGIDs = buffer
+        }
         trapArmed = true
 
         // `signal(2)` rather than `sigaction(2)`: the struct's handler member
@@ -157,32 +203,72 @@ public enum SignalTrap {
         return installed
     }
 
-    /// Records the process group of the child that is now in flight.
+    /// Claims a free slot for the process group of a child that is now in
+    /// flight. Returns `true` once the trap is not armed at all (nothing to
+    /// track) or the pgid is now registered; returns `false` ONLY when the
+    /// registry is completely full -- all `maxLiveChildren` slots already
+    /// hold a live pgid.
+    ///
+    /// A `false` return is NOT swallowed anywhere in this file: the two call
+    /// sites (`Subprocess.runRaw`, `Sampler.profile`) both treat it as a
+    /// launch failure and kill the child they just spawned rather than let
+    /// it run untracked by the SIGTERM/SIGINT trap for its whole lifetime --
+    /// an untracked child during a forced stop is exactly the orphan this
+    /// whole file exists to prevent, and silently dropping the newest pgid
+    /// here would recreate that bug quietly instead of fixing it. This
+    /// should never happen given this project's actual concurrency (`eval`:
+    /// one child at a time; `profile`: two at once, eight slots of
+    /// headroom), so hitting it is itself a sign something is badly wrong.
     ///
     /// KNOWN WINDOW, stated rather than papered over: a signal delivered
-    /// between `posix_spawn` returning and this call lands while the pgid is
-    /// still 0, and that one child is orphaned. The window is the few
+    /// between `posix_spawn` returning and this call lands before the slot is
+    /// claimed, and that one child is orphaned. The window is the few
     /// microseconds of a function return against a child that runs for seconds
     /// to minutes, and it cannot be closed with `pthread_sigmask`, which masks
     /// per-thread while the signal is process-directed and may be delivered to
     /// one of the pipe-drain threads instead. The residual failure is one
     /// orphan in a vanishingly rare interleaving, against one orphan in
     /// **every** forced stop without this trap.
-    static func noteChildSpawned(pgid: pid_t) {
-        guard trapArmed else { return }
-        liveChildPGID = sig_atomic_t(pgid)
+    @discardableResult
+    static func noteChildSpawned(pgid: pid_t) -> Bool {
+        guard trapArmed, let slots = liveChildPGIDs else { return true }
+        for index in 0..<maxLiveChildren where slots[index] == 0 {
+            slots[index] = sig_atomic_t(pgid)
+            return true
+        }
+        return false
     }
 
-    /// Records that no child is in flight. Called once the child has been
-    /// reaped, so a later signal cannot signal a pid the kernel may since have
-    /// recycled.
-    static func noteChildReaped() {
-        guard trapArmed else { return }
-        liveChildPGID = 0
+    /// Clears `pgid`'s own slot, matched by VALUE -- never "the last slot
+    /// written", and never an index the caller happens to remember -- so
+    /// reaping one of several concurrently live children can only ever clear
+    /// THAT child's slot, never another live child's. Called once the child
+    /// has been reaped, so a later signal cannot signal a pid the kernel may
+    /// since have recycled. A pgid that is not currently registered (the trap
+    /// was not armed when it was spawned, or `noteChildSpawned` refused it)
+    /// is a silent no-op, matching `noteChildSpawned`'s own "nothing to
+    /// track" case.
+    static func noteChildReaped(pgid: pid_t) {
+        guard trapArmed, let slots = liveChildPGIDs else { return }
+        let target = sig_atomic_t(pgid)
+        for index in 0..<maxLiveChildren where slots[index] == target {
+            slots[index] = 0
+            return
+        }
     }
 
-    /// The currently published process group, for tests and diagnostics.
-    static var livePGID: pid_t { pid_t(liveChildPGID) }
+    /// The first currently-published process group found in the registry, or
+    /// 0 if none -- for tests and diagnostics. With more than one child live
+    /// at once (only `profile` does this) this reports just one of them;
+    /// nothing in this file relies on it for more than "is anything
+    /// registered right now", which is all the existing tests ask of it.
+    static var livePGID: pid_t {
+        guard let slots = liveChildPGIDs else { return 0 }
+        for index in 0..<maxLiveChildren where slots[index] != 0 {
+            return pid_t(slots[index])
+        }
+        return 0
+    }
 
     /// Runs exactly the body the signal handler runs, minus the `_exit`.
     ///
@@ -207,15 +293,15 @@ public enum SignalTrap {
     // DELIBERATELY NO `armForTesting` / `disarmForTesting`.
     //
     // An earlier version of this file had them, and they were a trap of their
-    // own. `trapArmed` and `liveChildPGID` are PROCESS-WIDE, and swift-testing
+    // own. `trapArmed` and the registry are PROCESS-WIDE, and swift-testing
     // runs cases in parallel: while any test had the trap armed, EVERY other
     // case that spawned through `Subprocess` -- the git fixtures, the eval
-    // tests, the baseline tests -- published its own child's pgid into the
-    // same slot, for tens to hundreds of milliseconds each, across a
+    // tests, the baseline tests -- would publish its own child's pgid into
+    // the same registry, for tens to hundreds of milliseconds each, across a
     // 25-second run. Two interleavings follow directly: a test that reads the
-    // slot sees another case's live pgid, and, far worse, a test that kills
-    // "whatever is in the slot" SIGKILLs an unrelated case's child and fails
-    // it with a confusing error nobody would trace back here.
+    // registry sees another case's live pgid, and, far worse, a test that
+    // kills "whatever is registered" SIGKILLs an unrelated case's child and
+    // fails it with a confusing error nobody would trace back here.
     //
     // The library is therefore inert until the executable arms it, no test
     // ever arms it, and every test below reaches the logic through explicit

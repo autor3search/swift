@@ -147,8 +147,26 @@ public enum Subprocess {
         // is a no-op unless the executable installed the trap; see
         // `SignalTrap`. Cleared below once the child has been reaped, so a
         // later signal can never target a recycled pid.
-        SignalTrap.noteChildSpawned(pgid: child.pid)
-        defer { SignalTrap.noteChildReaped() }
+        //
+        // `noteChildSpawned` returns `false` only when its fixed-size registry
+        // is completely full -- every slot already holds a live pgid. Rather
+        // than let this child run for its whole lifetime untracked by the
+        // trap (the exact orphan hazard this file exists to prevent), refuse
+        // outright: kill what was just spawned, reap it, and fail the launch.
+        // This should never happen given this project's actual concurrency;
+        // hitting it means something is badly wrong, and a loud failure here
+        // is the only acceptable response to that, not a silent drop.
+        guard SignalTrap.noteChildSpawned(pgid: child.pid) else {
+            Platform.processTree.killTree(pgid: child.pid)
+            var reapStatus: Int32 = 0
+            waitpid(child.pid, &reapStatus, 0)
+            close(child.stdoutFD)
+            close(child.stderrFD)
+            throw SubprocessError.launchFailed(
+                "SignalTrap's live-child registry is full; refusing to run " +
+                "\(executable.path) untracked by the SIGTERM/SIGINT trap")
+        }
+        defer { SignalTrap.noteChildReaped(pgid: child.pid) }
 
         // Drain both pipes concurrently, starting *before* we wait. A child that
         // fills the 64 KiB pipe buffer would otherwise block on write while we
