@@ -27,6 +27,10 @@ let package = Package(
                 .product(name: "Crypto", package: "swift-crypto"),
             ]
         ),
-        .testTarget(name: "AutoR3SearchKitTests", dependencies: ["AutoR3SearchKit"]),
+        .testTarget(
+            name: "AutoR3SearchKitTests",
+            dependencies: ["AutoR3SearchKit"],
+            resources: [.process("Fixtures")]
+        ),
     ]
 )
