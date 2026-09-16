@@ -22,8 +22,84 @@ public enum InitError: Error, CustomStringConvertible {
     /// looks like instead of picking for them.
     case multipleBenchmarkTargets(names: [String])
 
+    /// `swift package resolve` did not succeed, so whether this package needs
+    /// a `Package.resolved` -- and therefore whether `init` has anything to
+    /// commit before the freeze -- could not be established. Fatal rather
+    /// than a warning: proceeding would leave the repository in exactly the
+    /// state `baseline` now refuses, discovered one step later for no benefit.
+    case dependencyResolveFailed(String)
+
+    /// `Package.resolved` is named by an ignore rule. This is the state
+    /// `doctor` itself used to RECOMMEND ("commit or .gitignore it"), and
+    /// taking that branch leaves `packageResolvedSHA256` pinning the hash of
+    /// zero bytes forever -- the tool's own remedy silently disabling the
+    /// dependency pin gate 2 exists to enforce.
+    case lockfileGitIgnored
+
+    /// `swift package resolve` CHANGED an already-tracked `Package.resolved`,
+    /// which means the committed lockfile and the manifest disagree. `init`
+    /// refuses to commit that on the operator's behalf: a rewritten lockfile
+    /// is a real dependency change, and quietly committing one under the
+    /// banner of "setting up the harness" is precisely the kind of decision
+    /// this tool does not make for people.
+    case lockfileOutOfDate
+
+    /// Staging or committing the harness prerequisites failed (no git
+    /// identity configured, a hook rejecting the commit, an index lock).
+    case prerequisiteCommitFailed(String)
+
     public var description: String {
         switch self {
+        case .dependencyResolveFailed(let why):
+            return """
+            refusing to configure this repository: `swift package resolve` did not succeed \
+            (\(why)).
+
+            init has to know whether this package produces a \(Lockfile.name), because that file \
+            must be TRACKED before `baseline` freezes anything. `swift package describe` (which \
+            init also runs) never writes it, but `swift build` does, into the package root -- so \
+            a repository left without a committed lockfile has every eval after the first fail \
+            permanently, as manifest_change_rejected or dirty_working_tree, with no way out.
+
+            Fix whatever stopped the resolve -- network, credentials for a private dependency, \
+            an unreachable dependency URL -- and re-run init.
+            """
+        case .lockfileGitIgnored:
+            return """
+            refusing to configure this repository: \(Lockfile.name) is excluded by an ignore rule \
+            (check .gitignore).
+
+            An ignored lockfile cannot be pinned. baseline records its hash so the dependency set \
+            cannot move mid-run; ignored, it is absent from frozenCommit, every later worktree \
+            resolves its own, and the recorded pin describes a file no run is guaranteed to see. \
+            Earlier versions of `autor3search-swift doctor` actively suggested this -- that advice \
+            was wrong and has been removed.
+
+            Fix: delete the \(Lockfile.name) line from .gitignore and re-run init.
+            """
+        case .lockfileOutOfDate:
+            return """
+            refusing to configure this repository: `swift package resolve` rewrote the tracked \
+            \(Lockfile.name), so the committed lockfile and Package.swift disagree.
+
+            That is a real dependency change, not harness setup, and init will not commit one on \
+            your behalf. Review the diff and commit it yourself:
+
+              git diff \(Lockfile.name)
+              git add \(Lockfile.name) && git commit -m "update dependency pins"
+
+            Then re-run init.
+            """
+        case .prerequisiteCommitFailed(let why):
+            return """
+            wrote the config, but could not commit the harness prerequisites (\(why)).
+
+            \(Lockfile.name) and .gitignore have to be TRACKED before `baseline` freezes anything, \
+            or the first eval's own build will leave an untracked lockfile behind and every \
+            experiment after it will fail permanently. Commit them by hand and re-run baseline:
+
+              git add \(Lockfile.name) .gitignore && git commit -m "pin dependencies"
+            """
         case .configExists:
             return "config already exists; pass --force to overwrite"
         case .multipleBenchmarkTargets(let names):
@@ -509,8 +585,122 @@ public enum InitRunner {
         try programMDText.write(
             to: repo.appendingPathComponent("program.md"), atomically: true, encoding: .utf8)
         try ensureGitignoreCoversBuildOutput(repo: repo)
+        try ensureLockfileTracked(repo: repo)
 
         return config
+    }
+
+    // =====================================================================
+    // MARK: - The dependency lockfile
+    // =====================================================================
+
+    /// Leaves the repository with a COMMITTED `Package.resolved`, if this
+    /// package produces one at all -- and commits `.gitignore` along with it.
+    ///
+    /// WHY THIS HAS TO HAPPEN IN `init`. `swift package describe --type json`
+    /// -- all `init` used to run -- exits 0 and writes no `Package.resolved`.
+    /// `swift build -c release --product <X>` DOES write one, into the package
+    /// ROOT (`--scratch-path` does not move it). So on any repository with
+    /// source-control dependencies and no tracked lockfile, `baseline`
+    /// recorded a hash of nothing, and the FIRST `eval`'s own build then
+    /// created the file. From that moment the repository was permanently
+    /// stuck: commit the lockfile and gate 1 answers
+    /// `manifest_change_rejected`; leave it and gate 2b answers
+    /// `dirty_working_tree`. Gate 1 diffs `frozenCommit..HEAD` and
+    /// `frozenCommit` never advances, so neither door ever reopens. That is
+    /// essentially every real-world Swift package with external dependencies.
+    ///
+    /// `swift package resolve` is used rather than a full build -- verified to
+    /// write `Package.resolved` (rc 0) without compiling anything, so `init`
+    /// does not pay a cold release build to learn this.
+    ///
+    /// THE EDGE CASE THAT MUST KEEP WORKING: a package with no external
+    /// dependencies. SwiftPM writes no lockfile for one, not on `resolve` and
+    /// not on `swift build -c release` (both verified, rc 0, no file), so
+    /// `probe` answers `.notProduced` and this returns having changed nothing
+    /// at all. Nothing here refuses such a package, and `BaselineRunner`
+    /// records `Lockfile.absentPin` for it.
+    ///
+    /// Not `private`: exercised directly by `InitRunnerTests`, the same way
+    /// `ensureGitignoreCoversBuildOutput` is, so the git behaviour can be
+    /// bound without a full `run()` (which needs a real benchmark package and
+    /// therefore the network).
+    static func ensureLockfileTracked(repo: URL) throws {
+        switch Lockfile.probe(in: repo) {
+        case .undetermined(let why):
+            throw InitError.dependencyResolveFailed(why)
+        case .notProduced:
+            // No external dependencies anywhere in the graph. SwiftPM has said
+            // so itself; there is no lockfile to track and never will be.
+            // `.gitignore` may still need its first commit.
+            try commitHarnessPrerequisites(repo: repo, paths: [".gitignore"])
+            return
+        case .required:
+            break
+        }
+
+        // An ignore rule over the lockfile is fatal, whether or not the file
+        // is currently tracked: it is the exact remedy `doctor` used to
+        // recommend, and it silently un-pins every dependency.
+        if Lockfile.isGitIgnored(repo: repo) == true {
+            throw InitError.lockfileGitIgnored
+        }
+
+        // `isTracked` returns nil when this is not a git repository at all.
+        // `init` still does useful work there (config, program.md,
+        // .gitignore), and there is nothing to commit into; `baseline`
+        // requires git and refuses an unpinned dependency set on its own, so
+        // the guarantee is not lost, only deferred to the command that can
+        // actually enforce it.
+        guard let tracked = Lockfile.isTracked(repo: repo) else { return }
+        if tracked, try isModified(repo: repo, path: Lockfile.name) {
+            // resolve rewrote a lockfile that was already committed: the
+            // manifest and the pins disagree. That is a dependency change, and
+            // init does not make one silently.
+            throw InitError.lockfileOutOfDate
+        }
+        try commitHarnessPrerequisites(repo: repo, paths: [Lockfile.name, ".gitignore"])
+    }
+
+    /// Commits whichever of `paths` git currently reports as untracked or
+    /// modified, as ONE commit, staging BY PATH.
+    ///
+    /// Never `git add -A`: `init` runs in a repository whose other
+    /// uncommitted work is none of its business, and sweeping that into a
+    /// harness-setup commit would be both surprising and, once `baseline`
+    /// freezes the result, unrecoverable without rewriting history.
+    ///
+    /// A no-op when nothing needs committing -- which also keeps `git commit`
+    /// from failing with "nothing to commit" and turning a clean re-run of
+    /// `init --force` into an error.
+    private static func commitHarnessPrerequisites(repo: URL, paths: [String]) throws {
+        let git = Git(repo: repo)
+        guard (try? git.run(["rev-parse", "--git-dir"])) != nil else { return }
+
+        var pending: [String] = []
+        for path in paths {
+            guard FileManager.default.fileExists(
+                atPath: repo.appendingPathComponent(path).path) else { continue }
+            if (try? isModified(repo: repo, path: path)) == true { pending.append(path) }
+        }
+        guard !pending.isEmpty else { return }
+
+        do {
+            try git.run(["add", "--"] + pending)
+            try git.run(["commit", "-q", "-m",
+                         "chore: track \(pending.joined(separator: " and ")) for autor3search-swift",
+                         "--"] + pending)
+        } catch {
+            throw InitError.prerequisiteCommitFailed("\(error)")
+        }
+    }
+
+    /// Whether git reports any change for `path` -- untracked, modified, or
+    /// staged. `git status --porcelain -- <path>` prints one line per changed
+    /// path and nothing at all for a clean, tracked file, which is exactly the
+    /// three-way distinction needed here in a single call.
+    private static func isModified(repo: URL, path: String) throws -> Bool {
+        try !Git(repo: repo).run(["status", "--porcelain", "--", path]).isEmpty
     }
 
     /// Idempotently ensures `.gitignore` covers every file this tool writes

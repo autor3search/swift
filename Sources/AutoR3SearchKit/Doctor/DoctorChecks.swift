@@ -263,8 +263,10 @@ public enum DoctorChecks {
                     The working tree has uncommitted changes. `eval` builds and measures the WORKING \
                     TREE while the scope gate inspects committed diffs, so an uncommitted edit would be \
                     measured but never gated -- so both `baseline` and `eval` refuse to run at all on a \
-                    dirty tree. A common innocent cause is an untracked Package.resolved; commit or \
-                    .gitignore it, then commit or stash whatever else is left.
+                    dirty tree. A common cause is an untracked Package.resolved, which `swift build` \
+                    writes into the package root; COMMIT it -- see the dependency-pin check below for \
+                    why ignoring it instead is the one thing you must not do -- then commit or stash \
+                    whatever else is left.
                     """
             )
         }
@@ -374,6 +376,119 @@ public enum DoctorChecks {
         return Finding(level: .ok, title: "Configuration", detail: ".autor3search/config.yaml found.")
     }
 
+    /// THE DEPENDENCY PIN. Reports, loudly, the state that used to brick every
+    /// repository with external dependencies -- and the state `doctor`'s own
+    /// advice used to create.
+    ///
+    /// `swift package describe` (all `init` used to run) exits 0 and writes no
+    /// `Package.resolved`. `swift build -c release --product <X>` writes one
+    /// into the package ROOT. So a repository with source-control dependencies
+    /// and no tracked lockfile had `baseline` record the hash of ZERO BYTES --
+    /// a well-formed 64-hex value indistinguishable from a real pin -- and the
+    /// first `eval`'s own build then created the file. From then on,
+    /// permanently: `manifest_change_rejected` if the agent commits it,
+    /// `dirty_working_tree` if it does not, with no way out because
+    /// `frozenCommit` never advances.
+    ///
+    /// The second-order hole is why this check exists at all rather than just
+    /// a better `baseline` refusal: `doctor` used to advise "commit or
+    /// .gitignore it". The `.gitignore` branch leaves `packageResolvedSHA256`
+    /// pinning nothing FOREVER, silently un-pinning every dependency -- the
+    /// tool's own remedy disabling the check gate 2 exists to enforce. That
+    /// advice is gone, and its outcome is now an alarm.
+    ///
+    /// - Parameters:
+    ///   - externalDependencies: identities of declared dependencies SwiftPM
+    ///     would pin (everything whose describe `type` is not `fileSystem`).
+    ///     ADVISORY: it reads DIRECT dependencies only, so it can under-report
+    ///     -- a path dependency whose own manifest pulls a source-control one
+    ///     produces a root lockfile while this list is empty (verified live).
+    ///     `lockfileExists` is therefore also treated as evidence of a real
+    ///     dependency set, so the transitive case is not missed.
+    ///   - lockfileTracked: `nil` when the question could not be asked (not a
+    ///     git repository), which is not the same as a confident "no".
+    ///   - recordedPins: `tag -> packageResolvedSHA256` for every baseline
+    ///     record found for this repository. A pin equal to the SHA-256 of
+    ///     zero bytes is the fingerprint of a baseline taken under the broken
+    ///     behaviour.
+    public static func dependencyPin(
+        externalDependencies: [String],
+        lockfileExists: Bool,
+        lockfileTracked: Bool?,
+        lockfileGitIgnored: Bool,
+        recordedPins: [String: String]
+    ) -> Finding {
+        let title = "Dependency pin (Package.resolved)"
+        let brokenTags = recordedPins.filter { Lockfile.isEmptyDataPin($0.value) }.keys.sorted()
+        var problems: [String] = []
+
+        // An ignore rule over the lockfile is the alarm, whatever else looks
+        // healthy: it is one `git rm --cached` away from un-pinning
+        // everything, and it is what this tool used to recommend.
+        if lockfileGitIgnored {
+            problems.append("""
+                Package.resolved is excluded by an ignore rule (check .gitignore). An ignored \
+                lockfile cannot be pinned: it is absent from frozenCommit, every worktree \
+                checkout resolves its own, and baseline's recorded hash describes a file no run \
+                is guaranteed to see. Earlier versions of this very check advised doing exactly \
+                this. That advice was wrong. Remove the Package.resolved line from .gitignore.
+                """)
+        }
+
+        if !lockfileExists, !externalDependencies.isEmpty {
+            problems.append("""
+                This package declares external dependencies \
+                (\(externalDependencies.joined(separator: ", "))) and has no Package.resolved. \
+                `swift package describe` never writes that file but `swift build` does, into the \
+                package root -- so the first eval creates it and every experiment after that \
+                fails permanently as manifest_change_rejected or dirty_working_tree. Fix: \
+                `swift package resolve && git add Package.resolved && git commit -m "pin \
+                dependencies"` (or re-run `autor3search-swift init`, which now does this). \
+                baseline refuses this state outright.
+                """)
+        }
+
+        if lockfileExists, lockfileTracked == false {
+            problems.append("""
+                Package.resolved exists but git is not tracking it, so it is not pinned by \
+                anything and leaves the working tree permanently dirty -- which eval refuses. \
+                Fix: `git add Package.resolved && git commit -m "pin dependencies"`.
+                """)
+        }
+
+        if !brokenTags.isEmpty {
+            problems.append("""
+                Baseline record(s) \(brokenTags.joined(separator: ", ")) pin \
+                packageResolvedSHA256 to the SHA-256 of ZERO BYTES -- the fingerprint of a \
+                baseline taken before this defect was fixed. It looks like a real pin and pins \
+                nothing, so gate 2 cannot notice a dependency change for that run. Nothing here \
+                rewrites it: silently "correcting" a recorded pin would mask exactly the change \
+                the pin exists to catch. Commit Package.resolved, then re-run \
+                `autor3search-swift baseline` under a NEW tag and continue from there; the old \
+                run's results were measured against an unpinned dependency set and should not be \
+                mixed with the new one's.
+                """)
+        }
+
+        guard problems.isEmpty else {
+            return Finding(level: .warn, title: title, detail: problems.joined(separator: "\n\n"))
+        }
+
+        if lockfileExists {
+            return Finding(level: .ok, title: title,
+                            detail: "Package.resolved is present and tracked, so baseline pins a real " +
+                                "dependency set.")
+        }
+        // No lockfile AND no declared external dependencies: the legitimate,
+        // supported case. SwiftPM writes no Package.resolved for such a
+        // package, not on `resolve` and not on `swift build -c release` (both
+        // verified). Warning here would be a worse bug than the one this check
+        // exists for, and the fastest way to teach people to skip this line.
+        return Finding(level: .ok, title: title,
+                        detail: "No external dependencies and no Package.resolved -- correct for this " +
+                            "package; SwiftPM never creates one here.")
+    }
+
     /// Judges the OUTCOME of an actual build attempt `all(repo:)` performs
     /// (`swift build -c release --product <benchmarkTarget>` and
     /// `--product BenchmarkTool`, BY NAME). A bare `swift build -c release`
@@ -454,7 +569,13 @@ public enum DoctorChecks {
     ///   attempt (which writes `.build/` in `repo` and can take on the order
     ///   of 20-30s) and reports it as skipped instead. Default `false`
     ///   preserves the full check.
-    public static func all(repo: URL, skipBuild: Bool = false) -> [Finding] {
+    /// - Parameter env: process environment, only so the state home (and with
+    ///   it this repository's baseline records, which carry the dependency
+    ///   pin) can be located the same way every other command locates it.
+    ///   Trailing and defaulted, so every existing `all(repo:)` /
+    ///   `all(repo:skipBuild:)` call site keeps working unchanged.
+    public static func all(repo: URL, skipBuild: Bool = false,
+                           env: [String: String] = ProcessInfo.processInfo.environment) -> [Finding] {
         var findings: [Finding] = []
 
         // --- XCTest availability (headline) ---
@@ -508,6 +629,21 @@ public enum DoctorChecks {
                     "Swift package? Skipping the scan for conditionally-gated tests."))
         }
 
+        // --- The dependency pin ---
+        //
+        // Deliberately does NOT run `swift package resolve` the way `init` and
+        // `baseline` do: `doctor` is a read-only report on a repository the
+        // operator may be in the middle of working in, and resolve WRITES
+        // Package.resolved and .build/. So this reports from the manifest and
+        // from git, and says plainly (via `dependencyPin`'s own wording) that
+        // the manifest signal reads direct dependencies only.
+        findings.append(dependencyPin(
+            externalDependencies: (try? Lockfile.externalDependencyIdentities(repo: repo)) ?? [],
+            lockfileExists: Lockfile.exists(in: repo),
+            lockfileTracked: Lockfile.isTracked(repo: repo),
+            lockfileGitIgnored: Lockfile.isGitIgnored(repo: repo) ?? false,
+            recordedPins: recordedDependencyPins(repo: repo, env: env)))
+
         // --- Config-dependent checks: need .autor3search/config.yaml ---
         let configURL = repo.appendingPathComponent(".autor3search/config.yaml")
         guard let config = try? Config.load(configURL) else {
@@ -537,6 +673,32 @@ public enum DoctorChecks {
     // =====================================================================
 
     private static let swiftBinary = URL(fileURLWithPath: "/usr/bin/swift")
+
+    /// `tag -> packageResolvedSHA256` for every baseline record this
+    /// repository has in the state home.
+    ///
+    /// Walks the state home's immediate children rather than asking for one
+    /// tag, because `doctor` is not told which run the operator cares about --
+    /// and a stale run carrying a pin of nothing is exactly what needs
+    /// surfacing. Every failure degrades to "no records found": an unreadable
+    /// or absent state home means doctor has nothing to say about recorded
+    /// pins, not that doctor should fail.
+    private static func recordedDependencyPins(repo: URL, env: [String: String]) -> [String: String] {
+        guard let home = try? StateHome(repo: repo, env: env),
+              let entries = try? FileManager.default.contentsOfDirectory(
+                at: home.root, includingPropertiesForKeys: nil)
+        else { return [:] }
+
+        var pins: [String: String] = [:]
+        for entry in entries {
+            let recordURL = entry.appendingPathComponent("baseline.json")
+            guard FileManager.default.fileExists(atPath: recordURL.path),
+                  let record = try? BaselineRecord.load(recordURL)
+            else { continue }
+            pins[record.tag] = record.packageResolvedSHA256
+        }
+        return pins
+    }
 
     /// `xcode-select -p`, trimmed. `nil` if the command fails to launch or
     /// exits non-zero (no developer directory configured at all).

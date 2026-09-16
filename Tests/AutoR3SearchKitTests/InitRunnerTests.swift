@@ -427,3 +427,94 @@ private func describeJSON(targets: [(name: String, path: String, type: String, p
                 "the marker must appear exactly once")
     }
 }
+
+// =========================================================================
+// MARK: - The dependency lockfile
+// =========================================================================
+//
+// `init` must leave a repository with dependencies holding a COMMITTED
+// Package.resolved, before `baseline` freezes anything. `swift package
+// describe` -- all init used to run -- exits 0 and writes no lockfile;
+// `swift build` writes one into the package root. So the first `eval`'s own
+// build created the file and every experiment after it failed permanently:
+// manifest_change_rejected if the agent committed it, dirty_working_tree if it
+// did not, forever, because gate 1 diffs frozenCommit..HEAD and frozenCommit
+// never advances.
+
+/// THE FIX. A package with a real source-control dependency and no lockfile
+/// must come out of `init` with `Package.resolved` created AND committed.
+@Test func initResolvesAndCommitsTheLockfileForAPackageWithDependencies() throws {
+    let (root, repo) = try makeDependentGitFixture()
+    try withTempDirectories(root) {
+        let lockfile = repo.appendingPathComponent("Package.resolved")
+        #expect(!FileManager.default.fileExists(atPath: lockfile.path),
+                "the fixture must start with no lockfile")
+
+        try InitRunner.ensureLockfileTracked(repo: repo)
+
+        #expect(FileManager.default.fileExists(atPath: lockfile.path),
+                "swift package resolve must have written the lockfile")
+        #expect(Lockfile.isTracked(repo: repo) == true, "the lockfile must be tracked")
+        let git = Git(repo: repo)
+        #expect(try git.isClean(), "init must leave no uncommitted lockfile behind")
+        // Committed, not merely staged: baseline freezes a COMMIT.
+        let atHead = try git.run(["ls-tree", "--name-only", "HEAD", "--", "Package.resolved"])
+        #expect(atHead == "Package.resolved", "the lockfile must exist at HEAD, got \"\(atHead)\"")
+    }
+}
+
+/// THE EDGE CASE THAT MUST KEEP WORKING. A package with no external
+/// dependencies has no lockfile and SwiftPM never creates one (verified:
+/// `swift package resolve` and `swift build -c release` both exit 0 and write
+/// nothing). `init` must change nothing and must not refuse.
+@Test func initLeavesADependencyFreePackageAloneAndDoesNotRefuseIt() throws {
+    let (repo, git) = try makeGitFixture()
+    try withTempDirectories(repo) {
+        let before = try git.head()
+        try InitRunner.ensureLockfileTracked(repo: repo)
+        #expect(!FileManager.default.fileExists(atPath: repo.appendingPathComponent("Package.resolved").path),
+                "SwiftPM must not have invented a lockfile for a package with no dependencies")
+        #expect(try git.head() == before, "nothing needed committing, so nothing may be committed")
+        #expect(try git.isClean())
+    }
+}
+
+/// Idempotent: `init --force` on an already-prepared repository commits
+/// nothing further. A second commit here would be harmless noise the first
+/// time and a "nothing to commit" failure the time after.
+@Test func initLockfileHandlingIsIdempotent() throws {
+    let (root, repo) = try makeDependentGitFixture()
+    try withTempDirectories(root) {
+        try InitRunner.ensureLockfileTracked(repo: repo)
+        let afterFirst = try Git(repo: repo).head()
+        try InitRunner.ensureLockfileTracked(repo: repo)
+        #expect(try Git(repo: repo).head() == afterFirst,
+                "a second init must not produce a second commit")
+    }
+}
+
+/// THE SECOND-ORDER HOLE, CLOSED AT THE SOURCE. `doctor` used to advise
+/// "commit or .gitignore it". A repository that took the .gitignore branch has
+/// `packageResolvedSHA256` pinning the hash of zero bytes forever -- every
+/// dependency silently un-pinned, and gate 2 unable to see a dependency
+/// change. `init` refuses that state rather than working around it.
+@Test func initRefusesAGitignoredLockfile() throws {
+    let (root, repo) = try makeDependentGitFixture()
+    try withTempDirectories(root) {
+        let gitignore = repo.appendingPathComponent(".gitignore")
+        try (try String(contentsOf: gitignore, encoding: .utf8) + "Package.resolved\n")
+            .write(to: gitignore, atomically: true, encoding: .utf8)
+        let commit = try Subprocess.run(URL(fileURLWithPath: "/bin/sh"),
+                                        ["-c", "git add -A && git commit -q -m ignore"],
+                                        cwd: repo, env: nil, timeout: 60)
+        #expect(commit.exitCode == 0, "\(commit.stderr)")
+
+        do {
+            try InitRunner.ensureLockfileTracked(repo: repo)
+            Issue.record("expected init to refuse a .gitignore'd Package.resolved")
+        } catch let error as InitError {
+            #expect("\(error)".contains(".gitignore"),
+                    "the refusal must point at the ignore rule: \(error)")
+        }
+    }
+}

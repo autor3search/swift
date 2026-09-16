@@ -303,3 +303,85 @@ import Foundation
     #expect(gating?.detail.contains("Sources/Lib/Lib.swift") == false,
              "a marker mentioned only in a comment must not be flagged")
 }
+
+// =========================================================================
+// MARK: - The dependency pin
+// =========================================================================
+
+/// THE SECOND-ORDER HOLE. `doctor`'s dirty-tree advice used to read "a common
+/// innocent cause is an untracked Package.resolved; commit or .gitignore it".
+/// Taking the `.gitignore` branch leaves `packageResolvedSHA256` pinning the
+/// hash of zero bytes FOREVER, silently un-pinning every dependency -- so the
+/// tool's own remedy quietly disabled the very check gate 2 exists to enforce.
+/// The advice is not softened here, it is gone: `.gitignore` must not appear as
+/// a suggested treatment for the lockfile anywhere in this finding.
+@Test func dirtyTreeAdviceNeverSuggestsGitignoringTheLockfile() {
+    let f = DoctorChecks.workingTree(clean: false)
+    #expect(f.level == .warn)
+    #expect(!f.detail.contains(".gitignore"),
+            "doctor must never advise .gitignore as a remedy: \(f.detail)")
+}
+
+/// A dependency-free package legitimately has no lockfile and SwiftPM never
+/// creates one. That must read as fine, not as a problem -- a `doctor` that
+/// warned here would train people to ignore this check.
+@Test func dependencyPinIsQuietForADependencyFreePackage() {
+    let f = DoctorChecks.dependencyPin(externalDependencies: [], lockfileExists: false,
+                                       lockfileTracked: nil, lockfileGitIgnored: false,
+                                       recordedPins: [:])
+    #expect(f.level == .ok)
+}
+
+/// Dependencies present, no lockfile: the exact state `baseline` now refuses,
+/// reported before the operator hits that refusal.
+@Test func dependencyPinWarnsWhenDependenciesHaveNoLockfile() {
+    let f = DoctorChecks.dependencyPin(externalDependencies: ["benchmark"], lockfileExists: false,
+                                       lockfileTracked: nil, lockfileGitIgnored: false,
+                                       recordedPins: [:])
+    #expect(f.level == .warn)
+    #expect(f.detail.contains("Package.resolved"))
+}
+
+/// Lockfile on disk but NOT tracked -- either never committed, or committed
+/// once and then ignored. `eval`'s build recreates it every run, so this is
+/// permanent `dirty_working_tree` territory.
+@Test func dependencyPinWarnsWhenTheLockfileIsUntracked() {
+    let f = DoctorChecks.dependencyPin(externalDependencies: ["benchmark"], lockfileExists: true,
+                                       lockfileTracked: false, lockfileGitIgnored: false,
+                                       recordedPins: [:])
+    #expect(f.level == .warn)
+    #expect(f.detail.contains("git add"))
+}
+
+/// The harmful remedy, detected. A `.gitignore` entry for `Package.resolved` is
+/// itself the alarm, whatever else looks healthy.
+@Test func dependencyPinWarnsWhenTheLockfileIsGitignored() {
+    let f = DoctorChecks.dependencyPin(externalDependencies: ["benchmark"], lockfileExists: true,
+                                       lockfileTracked: true, lockfileGitIgnored: true,
+                                       recordedPins: [:])
+    #expect(f.level == .warn)
+    #expect(f.detail.contains(".gitignore"))
+}
+
+/// MIGRATION. A repository baselined under the broken behaviour carries
+/// `packageResolvedSHA256 == <sha256 of zero bytes>` -- a legitimate-looking
+/// pin that pins nothing. `doctor` names it and names the tag; it does NOT
+/// rewrite it, because silently "fixing" a recorded pin would mask a genuine
+/// dependency change, which is precisely what the pin is for.
+@Test func dependencyPinFlagsABaselineTakenUnderTheBrokenBehaviour() {
+    let f = DoctorChecks.dependencyPin(externalDependencies: ["benchmark"], lockfileExists: true,
+                                       lockfileTracked: true, lockfileGitIgnored: false,
+                                       recordedPins: ["sep16": Lockfile.emptyDataSHA256])
+    #expect(f.level == .warn)
+    #expect(f.detail.contains("sep16"))
+    #expect(f.detail.contains("baseline"), "the operator must be told to re-run baseline")
+}
+
+/// Everything in order: dependencies, a tracked lockfile, and a real pin.
+@Test func dependencyPinIsQuietWhenEverythingIsPinnedProperly() {
+    let f = DoctorChecks.dependencyPin(
+        externalDependencies: ["benchmark"], lockfileExists: true, lockfileTracked: true,
+        lockfileGitIgnored: false,
+        recordedPins: ["sep16": String(repeating: "a", count: 64)])
+    #expect(f.level == .ok)
+}

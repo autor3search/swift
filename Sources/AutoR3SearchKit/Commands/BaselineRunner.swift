@@ -57,6 +57,43 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
     /// other path.
     case emptyFreezeManifest
 
+    /// A file that must be hashed is not there. Previously `sha256File`
+    /// answered "the hash of zero bytes" for this, which is how "this
+    /// repository has no `Package.resolved`" became indistinguishable from
+    /// "this repository's `Package.resolved` is empty" -- a well-formed
+    /// 64-hex pin that pins nothing at all, recorded without a word of
+    /// complaint. Missing and empty are different states and this makes them
+    /// different outcomes.
+    case missingFileForHash(String)
+
+    /// The package has an external dependency set SwiftPM pins in
+    /// `Package.resolved`, and there is no `Package.resolved` to pin it.
+    ///
+    /// Refused rather than recorded as "absent", because an unpinned
+    /// dependency set defeats the purpose of gate 2 -- the agent could win by
+    /// changing a dependency -- and because the first `eval`'s own build
+    /// CREATES the file, after which every experiment is permanently
+    /// `manifest_change_rejected` (if the agent commits it) or
+    /// `dirty_working_tree` (if it does not), with no way out, since
+    /// `frozenCommit` never advances.
+    case unpinnedDependencies(identities: [String])
+
+    /// A `Package.resolved` is on disk but git is not tracking it -- almost
+    /// always because it is named in `.gitignore`, which is what `doctor`
+    /// itself used to recommend. An ignored lockfile is not pinned by
+    /// anything: it is absent from `frozenCommit`, so every later worktree
+    /// checkout resolves its own, and the hash recorded here describes a file
+    /// no subsequent run is guaranteed to see.
+    case lockfileNotTracked
+
+    /// Whether this package needs a lockfile could not be established --
+    /// `swift package resolve` failed to run or exited non-zero (no network,
+    /// a private dependency without credentials, an unreachable URL). Failing
+    /// closed, because the alternative is to record "no dependencies to pin"
+    /// on the strength of a check that never ran, which is the exact class of
+    /// silent-success failure this project has been bitten by repeatedly.
+    case dependencyPinUndetermined(String)
+
     public var description: String {
         switch self {
         case .dirtyTree:
@@ -98,19 +135,135 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
             package has no test or benchmark targets (add one and re-run init), or every \
             frozen directory is empty.
             """
+        case .missingFileForHash(let path):
+            return """
+            refusing to establish a baseline: \(path) does not exist, so there is nothing to \
+            hash. Recording the hash of zero bytes here would look exactly like a real pin while \
+            pinning nothing -- "missing" and "empty" must not be the same 64 hex characters.
+            """
+        case .unpinnedDependencies(let identities):
+            let named = identities.isEmpty
+                ? ""
+                : " (declared dependencies: \(identities.joined(separator: ", ")))"
+            return """
+            refusing to establish a baseline: this package resolves external dependencies\(named) \
+            but has no \(Lockfile.name). baseline pins that file's hash so the dependency set \
+            cannot move mid-run -- gate 2 exists precisely so the agent cannot win by changing a \
+            dependency -- and with no lockfile there is nothing to pin.
+
+            This is not a cosmetic refusal. `swift package describe` does not write \
+            \(Lockfile.name), but `swift build` does, into the package root -- so the FIRST eval \
+            would create it, and from then on every experiment would fail permanently: \
+            manifest_change_rejected if the agent commits it, dirty_working_tree if it does not. \
+            frozenCommit never advances, so neither door reopens.
+
+            Fix: run `autor3search-swift init` (which now runs `swift package resolve` and \
+            commits the result), or by hand:
+
+              swift package resolve && git add \(Lockfile.name) && git commit -m "pin dependencies"
+
+            Do NOT add \(Lockfile.name) to .gitignore. That silences the symptom and leaves every \
+            dependency unpinned forever.
+            """
+        case .lockfileNotTracked:
+            return """
+            refusing to establish a baseline: \(Lockfile.name) exists on disk but git is not \
+            tracking it -- check whether .gitignore names it. An ignored lockfile is pinned by \
+            nothing: it is absent from frozenCommit, so every later worktree checkout resolves \
+            its own, and the hash recorded here would describe a file no subsequent run is \
+            guaranteed to see.
+
+            Fix: remove \(Lockfile.name) from .gitignore, then \
+            `git add \(Lockfile.name) && git commit -m "pin dependencies"`.
+            """
+        case .dependencyPinUndetermined(let why):
+            return """
+            refusing to establish a baseline: could not determine whether this package needs a \
+            \(Lockfile.name), because `swift package resolve` did not succeed (\(why)).
+
+            Treating that as "no dependencies to pin" would record a baseline on the strength of \
+            a check that never ran. Fix whatever stopped the resolve -- network, credentials for \
+            a private dependency, an unreachable dependency URL, a broken manifest -- and retry.
+            """
         }
     }
 }
 
 public enum BaselineRunner {
-    /// SHA-256 of a file's exact bytes, lowercase hex. A missing file (e.g. a
-    /// package with no `Package.resolved` because it has no dependencies)
-    /// hashes as empty data rather than throwing -- `BaselineRecord` always
-    /// carries all three hash fields, and "this file doesn't exist" is itself
-    /// part of what gets pinned, not a reason to fail the whole baseline.
+    /// SHA-256 of a file's exact bytes, lowercase hex.
+    ///
+    /// A MISSING FILE THROWS. It used to hash as empty data, on the theory
+    /// that "this file doesn't exist" is itself part of what gets pinned --
+    /// and that theory is exactly how this project shipped a defect that
+    /// bricked every repository with external dependencies. The hash of zero
+    /// bytes (`e3b0c442...`) is a perfectly well-formed SHA-256; written into
+    /// `baseline.json` it is indistinguishable from a real pin, so a
+    /// repository with source-control dependencies and no lockfile recorded
+    /// "no dependencies at all" and reported success. Missing and empty are
+    /// different states; they now have different outcomes, and the caller
+    /// decides what a missing file means rather than being handed a
+    /// plausible-looking wrong answer.
+    ///
+    /// The one caller that legitimately has to cope with absence is the
+    /// lockfile pin (see `resolveLockfilePin`), which records
+    /// `Lockfile.absentPin` -- a value no hash can ever equal -- and only
+    /// after SwiftPM itself has confirmed the package produces no lockfile.
     static func sha256File(_ url: URL) throws -> String {
-        let data = (try? Data(contentsOf: url)) ?? Data()
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw BaselineError.missingFileForHash(url.path)
+        }
+        let data = try Data(contentsOf: url)
         return SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined()
+    }
+
+    /// What goes into `BaselineRecord.packageResolvedSHA256`: either the
+    /// lockfile's real hash, or `Lockfile.absentPin` -- never the hash of
+    /// nothing, and never a pin established without checking.
+    ///
+    /// Four states, three of them refusals:
+    ///
+    /// 1. A lockfile exists and git tracks it -> pin its real bytes. (The
+    ///    dirty-tree guard at the top of `run` already guarantees a tracked
+    ///    file on disk matches what is committed at `frozenCommit`.)
+    /// 2. A lockfile exists and git does NOT track it -> `lockfileNotTracked`.
+    ///    A clean tree plus an untracked file means an ignore rule is hiding
+    ///    it; see that case's own reasoning.
+    /// 3. No lockfile, and SwiftPM produces none -> `Lockfile.absentPin`. THE
+    ///    EDGE CASE THAT MUST KEEP WORKING: a package with no external
+    ///    dependencies legitimately has no lockfile and never will, and
+    ///    refusing here would be a worse bug than the one this fixes.
+    /// 4. No lockfile, but SwiftPM produces one -> `unpinnedDependencies`.
+    ///
+    /// The 3-vs-4 split is decided by ASKING SWIFTPM, not by reading the
+    /// manifest. `swift package describe`'s top-level `dependencies` array
+    /// reports only DIRECT dependencies, and a `fileSystem` (path) dependency
+    /// whose own manifest declares a `sourceControl` one makes the root
+    /// package produce a `Package.resolved` while describe shows nothing but
+    /// `fileSystem` -- verified live, and the reason a manifest-only test
+    /// would silently under-report. `Lockfile.probe` runs `swift package
+    /// resolve` and reads what appears on disk, which cannot be fooled that
+    /// way.
+    ///
+    /// The probe runs in the PINNED WORKTREE, never in `repo`: it writes
+    /// `Package.resolved` and `.build/`, and `repo`'s cleanliness is what
+    /// every later gate depends on. The worktree is disposable and is reset
+    /// to `frozenCommit` at the end of `run` anyway.
+    private static func resolveLockfilePin(repo: URL, worktree: URL) throws -> String {
+        if Lockfile.exists(in: repo) {
+            guard Lockfile.isTracked(repo: repo) != false else {
+                throw BaselineError.lockfileNotTracked
+            }
+            return try sha256File(Lockfile.url(in: repo))
+        }
+        switch Lockfile.probe(in: worktree) {
+        case .notProduced:
+            return Lockfile.absentPin
+        case .required:
+            throw BaselineError.unpinnedDependencies(
+                identities: (try? Lockfile.externalDependencyIdentities(repo: repo)) ?? [])
+        case .undetermined(let why):
+            throw BaselineError.dependencyPinUndetermined(why)
+        }
     }
 
     private static func warn(_ message: String) {
@@ -271,6 +424,15 @@ public enum BaselineRunner {
         let worktreeURL = try home.worktreeURL(tag: tag)
         try pinWorktree(git: git, at: worktreeURL, to: commit)
 
+        // THE DEPENDENCY PIN, decided before anything expensive happens and
+        // before `baseline.json` is written. Runs here rather than alongside
+        // the other two hashes at the bottom because it needs the pinned
+        // worktree to probe in -- see `resolveLockfilePin`. A refusal at this
+        // point leaves only idempotent, retryable side effects behind (the
+        // branch, the frozen snapshot, the worktree), exactly like every other
+        // refusal after the two pre-side-effect guards.
+        let packageResolvedPin = try resolveLockfilePin(repo: repo, worktree: worktreeURL)
+
         // Warm the release build so every eval after this one reuses it
         // instead of paying a cold Swift build. Best-effort: see
         // `warmBuild`'s doc comment for why a repository that cannot
@@ -310,9 +472,11 @@ public enum BaselineRunner {
             } else {
                 warn("""
                     the warmed release build left untracked or modified files in the pinned \
-                    worktree (commonly a fresh Package.resolved for a package with a \
-                    source-control dependency); reset the worktree to frozenCommit to restore \
-                    the cleanliness Task 17's worktree-integrity gate depends on.
+                    worktree; reset the worktree to frozenCommit to restore the cleanliness \
+                    Task 17's worktree-integrity gate depends on. A fresh Package.resolved used \
+                    to be the usual cause and no longer can be: a package that produces one now \
+                    has to have it tracked before this point (see resolveLockfilePin), so \
+                    anything left here is something else worth looking at.
                     """)
             }
         }
@@ -323,7 +487,7 @@ public enum BaselineRunner {
             measurementCommit: commit,
             configSHA256: try sha256File(repo.appendingPathComponent(".autor3search/config.yaml")),
             packageSwiftSHA256: try sha256File(repo.appendingPathComponent("Package.swift")),
-            packageResolvedSHA256: try sha256File(repo.appendingPathComponent("Package.resolved")),
+            packageResolvedSHA256: packageResolvedPin,
             toolVersion: BuildInfo.version)
         try record.save(to: recordURL)
         return record
