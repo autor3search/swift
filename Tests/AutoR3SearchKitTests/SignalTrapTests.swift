@@ -184,3 +184,88 @@ private func processExists(_ pid: pid_t) -> Bool {
         the caller's own process group -- in production, the shell that started eval.
         """)
 }
+
+// The two tests below bind the multi-slot registry added to fix the CRITICAL
+// finding that `profile`'s second live child (the sampler attached to the
+// benchmark being profiled) silently overwrote the first's pgid in a
+// single-slot registry. Neither arms the trap or touches the real,
+// process-wide registry: `ChildRegistrySlots` takes its storage as an
+// explicit parameter specifically so "the registry is full" can be tested
+// against a small, test-owned buffer without racing or polluting every
+// other case that spawns through `Subprocess` in parallel -- the same
+// reason the kill tests above thread the pgid through explicitly instead of
+// reading the shared slot.
+
+@Test func theRegistrySlotsClaimReleaseAndRefuseWhenFull() throws {
+    let capacity = 2
+    let slots = UnsafeMutablePointer<sig_atomic_t>.allocate(capacity: capacity)
+    slots.initialize(repeating: 0, count: capacity)
+    defer { slots.deallocate() }
+
+    #expect(ChildRegistrySlots.claim(111, in: slots, count: capacity),
+            "the first slot must be claimable")
+    #expect(ChildRegistrySlots.claim(222, in: slots, count: capacity),
+            "the second slot must be claimable")
+    #expect(!ChildRegistrySlots.claim(333, in: slots, count: capacity), """
+        a third claim must be refused once both slots already hold a live pgid -- a \
+        dropped pgid here is the exact silent-orphan failure this registry exists to \
+        eliminate, not an edge case to tolerate.
+        """)
+
+    // Releasing one of the two live pgids -- matched by VALUE -- frees exactly that
+    // slot and no other.
+    ChildRegistrySlots.release(111, in: slots, count: capacity)
+    #expect(ChildRegistrySlots.claim(444, in: slots, count: capacity),
+            "releasing one live pgid must free exactly one slot for reuse")
+
+    // 222 (never released) and 444 (just claimed) must still occupy both slots. A
+    // release for a pgid that was never registered must be a silent no-op, not
+    // accidentally free something it was never holding.
+    ChildRegistrySlots.release(999, in: slots, count: capacity)
+    #expect(!ChildRegistrySlots.claim(555, in: slots, count: capacity),
+            "both slots must still be occupied (222 and 444); a no-op release must not free either")
+}
+
+@Test func noteChildSpawnedRefusesOnceEveryProductionSlotIsFull() throws {
+    // `SignalTrap.noteChildSpawned` is, at the trap-armed case, exactly
+    // `ChildRegistrySlots.claim` against its own process-wide buffer sized
+    // `SignalTrap.capacity` (8) -- so filling an identically-sized LOCAL
+    // buffer via the same claim function binds "returns false once full" at
+    // the exact size production actually uses, without arming the trap.
+    let capacity = SignalTrap.capacity
+    let slots = UnsafeMutablePointer<sig_atomic_t>.allocate(capacity: capacity)
+    slots.initialize(repeating: 0, count: capacity)
+    defer { slots.deallocate() }
+
+    for pgid in 1...capacity {
+        #expect(ChildRegistrySlots.claim(sig_atomic_t(pgid), in: slots, count: capacity),
+                "slot for pgid \(pgid) of \(capacity) must still be claimable")
+    }
+    #expect(!ChildRegistrySlots.claim(sig_atomic_t(capacity + 1), in: slots, count: capacity), """
+        every one of SignalTrap's \(capacity) production slots is full; one more claim must \
+        be refused, matching exactly what noteChildSpawned returns to Subprocess.runRaw and \
+        Sampler.profile once the registry is exhausted.
+        """)
+}
+
+@Test func refuseUntrackedChildKillsReapsAndFailsTheLaunch() throws {
+    // Binds the REFUSAL PATH itself -- kill, blocking reap, fd cleanup, the
+    // specific thrown error -- independent of how a `false` registration
+    // outcome was produced (a full `SignalTrap` registry in production).
+    // `Subprocess.refuseUntrackedChild` is called directly with a real,
+    // just-spawned child: no trap armed, no shared state touched, so this
+    // cannot race or pollute any other case running in parallel.
+    let child = try spawnGroupLeader("sleep 60")
+    #expect(processExists(child.pid), "the fixture child must be alive to begin with")
+
+    let error = Subprocess.refuseUntrackedChild(child, executable: URL(fileURLWithPath: "/bin/sh"))
+
+    #expect(!processExists(child.pid), """
+        the just-spawned child must actually be killed and reaped, not leaked, when it \
+        cannot be registered with the SIGTERM/SIGINT trap -- an untracked live child for \
+        even one instant is the exact orphan hazard this refusal exists to prevent.
+        """)
+    let description = "\(error)"
+    #expect(description.contains("registry is full"), "the failure reason must be named, not generic")
+    #expect(description.contains("untracked"), "the failure reason must name what was refused, and why")
+}

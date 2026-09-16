@@ -117,6 +117,42 @@ nonisolated(unsafe) private var liveChildPGIDs: UnsafeMutablePointer<sig_atomic_
 /// property of those EXECUTABLES, not of the library.
 nonisolated(unsafe) private var trapArmed = false
 
+/// The registry's claim/release logic, parameterized over an explicit
+/// buffer and slot count rather than reaching for the process-wide global
+/// directly. Still pure pointer arithmetic -- no allocation, no ARC, safe to
+/// call from `noteChildSpawned`/`noteChildReaped` -- but taking storage as a
+/// parameter also makes it directly testable: a test can exercise "the
+/// registry is full" against a small, test-owned buffer it allocates and
+/// frees itself, without arming the trap or touching the shared,
+/// process-wide registry every other parallel test spawns through. See
+/// `SignalTrapTests` for exactly that.
+enum ChildRegistrySlots {
+    /// Claims the first free (zero) slot for `pgid`. `false` if all `count`
+    /// slots already hold a live pgid.
+    @discardableResult
+    static func claim(
+        _ pgid: sig_atomic_t, in slots: UnsafeMutablePointer<sig_atomic_t>, count: Int
+    ) -> Bool {
+        for index in 0..<count where slots[index] == 0 {
+            slots[index] = pgid
+            return true
+        }
+        return false
+    }
+
+    /// Clears the slot holding `pgid`, matched by VALUE -- never an index --
+    /// so this can only ever clear the slot that actually holds `pgid`. A
+    /// `pgid` not currently present is a silent no-op.
+    static func release(
+        _ pgid: sig_atomic_t, in slots: UnsafeMutablePointer<sig_atomic_t>, count: Int
+    ) {
+        for index in 0..<count where slots[index] == pgid {
+            slots[index] = 0
+            return
+        }
+    }
+}
+
 /// Kills one process group. Async-signal-safe: a comparison and, at most, two
 /// `kill(2)` calls.
 ///
@@ -232,12 +268,14 @@ public enum SignalTrap {
     @discardableResult
     static func noteChildSpawned(pgid: pid_t) -> Bool {
         guard trapArmed, let slots = liveChildPGIDs else { return true }
-        for index in 0..<maxLiveChildren where slots[index] == 0 {
-            slots[index] = sig_atomic_t(pgid)
-            return true
-        }
-        return false
+        return ChildRegistrySlots.claim(sig_atomic_t(pgid), in: slots, count: maxLiveChildren)
     }
+
+    /// The registry's fixed slot count (8), exposed so a test can allocate
+    /// its own buffer of exactly this size and exercise "every slot full"
+    /// against it via `ChildRegistrySlots` directly -- see
+    /// `SignalTrapTests.noteChildSpawnedRefusesOnceEveryProductionSlotIsFull`.
+    static let capacity = maxLiveChildren
 
     /// Clears `pgid`'s own slot, matched by VALUE -- never "the last slot
     /// written", and never an index the caller happens to remember -- so
@@ -250,11 +288,7 @@ public enum SignalTrap {
     /// track" case.
     static func noteChildReaped(pgid: pid_t) {
         guard trapArmed, let slots = liveChildPGIDs else { return }
-        let target = sig_atomic_t(pgid)
-        for index in 0..<maxLiveChildren where slots[index] == target {
-            slots[index] = 0
-            return
-        }
+        ChildRegistrySlots.release(sig_atomic_t(pgid), in: slots, count: maxLiveChildren)
     }
 
     /// The first currently-published process group found in the registry, or

@@ -335,14 +335,10 @@ public enum Sampler {
         // window, the same policy `Subprocess.runRaw` applies to every
         // other child this project spawns.
         guard SignalTrap.noteChildSpawned(pgid: child.pid) else {
-            Platform.processTree.killTree(pgid: child.pid)
-            var reapStatus: Int32 = 0
-            waitpid(child.pid, &reapStatus, 0)
-            close(child.stdoutFD)
-            close(child.stderrFD)
-            throw SamplerError.launchFailed(
-                "SignalTrap's live-child registry is full; refusing to run \(exe.path) " +
-                "untracked by the SIGTERM/SIGINT trap")
+            // Same teardown `Subprocess.runRaw` applies to every other child
+            // this project spawns -- shared rather than duplicated, so the
+            // two paths cannot quietly drift apart.
+            throw SamplerError.launchFailed("\(Subprocess.refuseUntrackedChild(child, executable: exe))")
         }
 
         // The benchmark's own stdout is CAPTURED, not discarded: it is the

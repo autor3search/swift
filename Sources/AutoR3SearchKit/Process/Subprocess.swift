@@ -157,14 +157,7 @@ public enum Subprocess {
         // hitting it means something is badly wrong, and a loud failure here
         // is the only acceptable response to that, not a silent drop.
         guard SignalTrap.noteChildSpawned(pgid: child.pid) else {
-            Platform.processTree.killTree(pgid: child.pid)
-            var reapStatus: Int32 = 0
-            waitpid(child.pid, &reapStatus, 0)
-            close(child.stdoutFD)
-            close(child.stderrFD)
-            throw SubprocessError.launchFailed(
-                "SignalTrap's live-child registry is full; refusing to run " +
-                "\(executable.path) untracked by the SIGTERM/SIGINT trap")
+            throw refuseUntrackedChild(child, executable: executable)
         }
         defer { SignalTrap.noteChildReaped(pgid: child.pid) }
 
@@ -234,6 +227,33 @@ public enum Subprocess {
             timedOut: timedOut,
             outputTruncated: snapshot.truncated
         )
+    }
+
+    /// Tears down a child that was just spawned but could not be registered
+    /// with `SignalTrap`'s live-child registry (`noteChildSpawned` returned
+    /// `false`): kills its whole process-group tree, blocking-reaps it so no
+    /// zombie is left behind, closes its pipes, and returns the error to
+    /// throw. Never lets such a child run even briefly untracked by the
+    /// SIGTERM/SIGINT trap -- that is precisely the orphan hazard this
+    /// registry exists to prevent.
+    ///
+    /// Split out from `runRaw` -- not `private` -- so the refusal PATH
+    /// itself (kill, blocking reap, fd cleanup, the specific error) can be
+    /// exercised directly in a test with a real spawned child, independent
+    /// of how a `false` registration outcome was produced. Filling
+    /// `SignalTrap`'s real, process-wide registry to capacity in a test
+    /// would mean arming the trap, which -- see `SignalTrap`'s own tests --
+    /// pollutes every other case spawning through `Subprocess` in parallel;
+    /// calling this directly needs neither.
+    static func refuseUntrackedChild(_ child: SpawnedChild, executable: URL) -> SubprocessError {
+        Platform.processTree.killTree(pgid: child.pid)
+        var reapStatus: Int32 = 0
+        waitpid(child.pid, &reapStatus, 0)
+        close(child.stdoutFD)
+        close(child.stderrFD)
+        return SubprocessError.launchFailed(
+            "SignalTrap's live-child registry is full; refusing to run " +
+            "\(executable.path) untracked by the SIGTERM/SIGINT trap")
     }
 
     /// `wait(2)` status decoding; the `W*` macros are not available in Swift.
