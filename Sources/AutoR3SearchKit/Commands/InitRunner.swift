@@ -519,9 +519,12 @@ public enum InitRunner {
     /// duplicate block, whether `.gitignore` did not exist, already existed without
     /// this entry, or already has it from a previous `init`.
     ///
-    /// Three entries, and the last two are not cosmetic (spec.md 9: "The only
-    /// harness outputs inside the repository are `results.tsv` ... and `run.log`
-    /// ..., both gitignored by `init`"):
+    /// Four entries. `.autor3search/config.yaml` itself is deliberately NOT
+    /// among them — it is committed on purpose, since `baseline` hashes it and
+    /// the scope/config-integrity gates depend on it being tracked. The other
+    /// three are not cosmetic (spec.md 9: "The only harness outputs inside the
+    /// repository are `results.tsv` ... and `run.log` ..., both gitignored by
+    /// `init`"), plus one Task 20 adds for the same reason:
     ///
     /// - `.build/` — what `swift build` populates while this tool measures.
     /// - `results.tsv` — `eval` appends a row to this on every experiment, so from
@@ -532,13 +535,19 @@ public enum InitRunner {
     ///   file the harness itself wrote. Ignoring it keeps the harness's own log out
     ///   of the diff it judges.
     /// - `run.log` — the same argument, for subprocess transcripts.
+    /// - `.autor3search/profiles/` — where `profile` (Task 20) writes each
+    ///   benchmark's raw sampler output (`<benchmark>.sample.txt`). It lives
+    ///   INSIDE `.autor3search/`, whose `config.yaml` is tracked, so without this
+    ///   entry a profiling run followed by `git add -A` would commit exactly the
+    ///   same class of harness-output-as-agent-edit bug `results.tsv`/`run.log`
+    ///   exist above to prevent, and `eval`'s scope gate would reject the commit.
     private static let gitignoreMarker = "# autor3search-swift"
 
     /// Not `private`: exercised directly by `InitRunnerTests` so idempotence can be
     /// verified without a full, toolchain-and-possibly-network-dependent `run()`.
     static func ensureGitignoreCoversBuildOutput(repo: URL) throws {
         let url = repo.appendingPathComponent(".gitignore")
-        let block = "\(gitignoreMarker)\n.build/\nresults.tsv\nrun.log\n"
+        let block = "\(gitignoreMarker)\n.build/\nresults.tsv\nrun.log\n.autor3search/profiles/\n"
         guard FileManager.default.fileExists(atPath: url.path) else {
             try block.write(to: url, atomically: true, encoding: .utf8)
             return

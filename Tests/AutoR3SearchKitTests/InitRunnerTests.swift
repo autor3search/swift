@@ -374,6 +374,10 @@ private func describeJSON(targets: [(name: String, path: String, type: String, p
         #expect(lines.contains(".build/"))
         #expect(lines.contains("results.tsv"), "eval writes results.tsv into the repository under test")
         #expect(lines.contains("run.log"), "run.log is the other in-repository harness output")
+        let profilesReason = "profile (Task 20) writes each benchmark's raw sampler output " +
+            "under .autor3search/profiles/, inside the same directory config.yaml is tracked " +
+            "in; without this entry a profiling run followed by git add -A commits it"
+        #expect(lines.contains(".autor3search/profiles/"), "\(profilesReason)")
     }
 }
 

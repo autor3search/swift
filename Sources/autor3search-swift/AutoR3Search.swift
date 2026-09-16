@@ -8,6 +8,7 @@ struct AutoR3Search: AsyncParsableCommand {
         subcommands: [
             VersionCommand.self, InitCommand.self, BaselineCommand.self, EvalCommand.self,
             StatusCommand.self, StopCommand.self, ReportCommand.self, DoctorCommand.self,
+            ProfileCommand.self,
         ]
     )
 }
