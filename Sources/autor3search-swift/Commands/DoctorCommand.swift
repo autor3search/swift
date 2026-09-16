@@ -13,8 +13,15 @@ struct DoctorCommand: ParsableCommand {
 
     @OptionGroup var repoOption: RepoOption
 
+    @Flag(name: .customLong("skip-build"), help: """
+        Skip the real `swift build -c release --product <benchmarkTarget>` / \
+        `--product BenchmarkTool` check. Faster and untouched by .build/, but the build \
+        outcome is then unverified.
+        """)
+    var skipBuild: Bool = false
+
     func run() {
-        let findings = DoctorChecks.all(repo: repoOption.repoURL)
+        let findings = DoctorChecks.all(repo: repoOption.repoURL, skipBuild: skipBuild)
         print(DoctorChecks.report(findings: findings, repo: repoOption.repoURL))
     }
 }

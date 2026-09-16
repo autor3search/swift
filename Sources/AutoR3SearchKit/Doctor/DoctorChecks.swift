@@ -174,11 +174,12 @@ public enum DoctorChecks {
             level: .ok,
             title: "Expected measurement length",
             detail: String(format: """
-                %d benchmark(s) x %d round(s) x 2 sides = %d process runs for one `eval`. At roughly \
-                %.2fs per round (process-launch-plus-run; varies with the benchmark) that is about \
-                %@ of measurement time alone -- on top of one release build and one `swift test`, \
-                neither counted here. Multiply by however many experiments the agent's loop plans to \
-                run overnight.
+                %d benchmark(s) x %d round(s) x 2 sides = %d process runs for one `eval`. At a fixed, \
+                ASSUMED %.2fs per round (a built-in estimate, not a measurement of this repository's \
+                own benchmark) that is about %@ of measurement time alone -- on top of one release \
+                build and one `swift test`, neither counted here. The real per-round time varies with \
+                the benchmark; treat this as a rough order of magnitude, not a prediction. Multiply by \
+                however many experiments the agent's loop plans to run overnight.
                 """, config.benchmarks.count, config.count, processRuns, secondsPerRound,
                 Self.humanDuration(estimatedSeconds))
         )
@@ -273,38 +274,84 @@ public enum DoctorChecks {
     /// The softest link in the whole chain (flagged in `eval`'s own review):
     /// gate 6 runs the repository's OWN tests, which `@testable import` the
     /// code under optimization -- so a test gated with `.enabled(if:)` /
-    /// `.disabled(if:)`, or on an environment variable, or an `XCTSkip`, can
-    /// be switched off from IN-SCOPE library code the agent is free to edit,
-    /// WITHOUT touching any frozen file. `Package.swift` is frozen and the
-    /// test files are frozen and restored every experiment, but the
-    /// CONDITION such a gate reads can live entirely in optimizable code.
-    /// There is no clean fix, so this surfaces what it finds for a human to
-    /// look at rather than pretending to catch every case -- it is a
-    /// heuristic, not a guarantee: a plain substring match, not an AST walk,
-    /// so it can both miss a disguised condition and flag an innocent
-    /// comment or string containing the same text.
-    public static func conditionalTestGating(hits: [String]) -> Finding {
-        guard !hits.isEmpty else {
+    /// `.disabled(if:)`, an `XCTSkip`, or a custom `ConditionTrait` DEFINED in
+    /// optimizable source (e.g. `extension Trait { static var skipWhenSlow:
+    /// ConditionTrait { .enabled(if: someFlag) } }`, referenced from a frozen
+    /// test as `@Test(.skipWhenSlow)` -- the literal marker then never
+    /// appears in the test file at all) can be switched off from IN-SCOPE
+    /// code the agent is free to edit, WITHOUT touching any frozen file.
+    /// `Package.swift` is frozen and the test files are frozen and restored
+    /// every experiment, but the CONDITION such a gate reads can live
+    /// entirely in optimizable code -- which is why `strongHits` below is
+    /// scanned across BOTH the frozen test directories and the package's
+    /// non-test source directories, not just the tests.
+    ///
+    /// `environmentReadCount` is kept SEPARATE and deliberately WEAKER: a
+    /// bare `ProcessInfo.processInfo.environment` read with no skip construct
+    /// near it is ordinary (CI detection, feature flags) and true of most
+    /// real repositories -- warning on it would be the fastest way to train
+    /// people to stop reading this check, so it is reported as `.ok`
+    /// (informational), never `.warn`.
+    ///
+    /// There is no clean fix for every case, so this surfaces what it finds
+    /// for a human to look at rather than pretending to catch every case --
+    /// it is a heuristic, not a guarantee: a plain substring match, not an
+    /// AST walk, so it can both miss a disguised condition and flag an
+    /// innocent comment or string containing the same text. Its own stated
+    /// blind spot -- a plain `guard`/early-return whose condition lives in
+    /// optimizable code -- is NOT detectable by any text scan and is named
+    /// explicitly in every branch below, so a human who reads this output
+    /// knows what it cannot see, rather than assuming it caught everything.
+    public static func conditionalTestGating(strongHits: [String], environmentReadCount: Int) -> Finding {
+        let blindSpot = """
+            Known blind spot: a plain `guard ... else { return }` (or any other early return) at the \
+            top of a test, whose condition lives in optimizable code, disables that test using none \
+            of the constructs this check can see. No text scan can catch that -- review tests with \
+            non-trivial early setup by hand.
+            """
+
+        guard !strongHits.isEmpty else {
+            if environmentReadCount > 0 {
+                return Finding(
+                    level: .ok,
+                    title: "Conditionally-gated tests",
+                    detail: """
+                        \(environmentReadCount) test file line(s) read `ProcessInfo.processInfo.environment` \
+                        with no skip construct (`.enabled(if:`, `.disabled(if:`, `XCTSkip`, `ConditionTrait`) \
+                        nearby. Ordinary -- CI detection and feature flags both do this -- so this is \
+                        informational, not a warning. It is noted because reading the environment is also \
+                        how a test CAN be gated.
+                        \(blindSpot)
+                        """
+                )
+            }
             return Finding(
                 level: .ok,
                 title: "Conditionally-gated tests",
-                detail: "No `.enabled(if:)`, `.disabled(if:)`, `ProcessInfo.processInfo.environment`, " +
-                    "or `XCTSkip` usage found in the frozen test target directories."
+                detail: """
+                    No `.enabled(if:)`, `.disabled(if:)`, `XCTSkip`, or `ConditionTrait` usage found in \
+                    the frozen test target directories or the package's non-test source.
+                    \(blindSpot)
+                    """
             )
         }
-        let shown = hits.prefix(20).joined(separator: "\n    ")
-        let more = hits.count > 20 ? "\n    ... and \(hits.count - 20) more" : ""
+        let shown = strongHits.prefix(20).joined(separator: "\n    ")
+        let more = strongHits.count > 20 ? "\n    ... and \(strongHits.count - 20) more" : ""
         return Finding(
             level: .warn,
             title: "Conditionally-gated tests",
             detail: """
-                Found \(hits.count) place(s) in the frozen test target directories that could disable \
-                a test conditionally:
+                Found \(strongHits.count) place(s) that could disable a test conditionally -- inside a \
+                frozen test target directory, OR a `ConditionTrait` / `.enabled(if:` / `.disabled(if:` \
+                definition in the package's non-test source (optimizable code a frozen test can still \
+                reference by name, e.g. a custom `Trait` extension):
                     \(shown)\(more)
                 This is a HEURISTIC (a plain text match, not an AST walk), not a guarantee -- it can \
                 both miss a disguised condition and flag an innocent comment. Review each hit before \
-                trusting an unattended run: a test gated on a condition that lives in IN-SCOPE library \
-                code can be switched off by the agent without ever touching a frozen file.
+                trusting an unattended run: gate 6 runs the repository's OWN tests, which `@testable \
+                import` the code under optimization, so a condition living in in-scope code can switch \
+                a test off without ever touching a frozen file.
+                \(blindSpot)
                 """
         )
     }
@@ -401,7 +448,13 @@ public enum DoctorChecks {
     /// order, headline first. Never throws: every probe below degrades to a
     /// reported "could not determine" `Finding` instead, per the file
     /// comment's policy (1).
-    public static func all(repo: URL) -> [Finding] {
+    ///
+    /// - Parameter skipBuild: when true, skips the real `swift build -c
+    ///   release --product <benchmarkTarget> / --product BenchmarkTool`
+    ///   attempt (which writes `.build/` in `repo` and can take on the order
+    ///   of 20-30s) and reports it as skipped instead. Default `false`
+    ///   preserves the full check.
+    public static func all(repo: URL, skipBuild: Bool = false) -> [Finding] {
         var findings: [Finding] = []
 
         // --- XCTest availability (headline) ---
@@ -441,7 +494,12 @@ public enum DoctorChecks {
         // --- Conditionally-gated tests: needs `swift package describe` ---
         if let description = try? PackageDescribe.describe(repo: repo) {
             let testDirs = description.testTargets.map(\.path)
-            findings.append(conditionalTestGating(hits: scanForConditionalGating(repo: repo, testDirs: testDirs)))
+            let sourceDirs = description.targets.filter { $0.type != "test" }.map(\.path)
+            let testScan = scanTestDirsForConditionalGating(repo: repo, testDirs: testDirs)
+            let sourceHits = scanSourceDirsForConditionalGating(repo: repo, sourceDirs: sourceDirs)
+            findings.append(conditionalTestGating(
+                strongHits: testScan.strongHits + sourceHits,
+                environmentReadCount: testScan.environmentReadCount))
         } else {
             findings.append(Finding(
                 level: .warn,
@@ -459,8 +517,17 @@ public enum DoctorChecks {
         findings.append(packageConfiguration(configured: true))
         findings.append(expectedRunLength(config: config, secondsPerRound: 1.0))
 
-        let buildOutcome = probeMeasurementBuild(repo: repo, config: config)
-        findings.append(measurementBuild(succeeded: buildOutcome.succeeded, detail: buildOutcome.detail))
+        if skipBuild {
+            findings.append(Finding(
+                level: .ok,
+                title: "Benchmark build",
+                detail: "Skipped (--skip-build). Run without that flag before trusting an unattended " +
+                    "run -- `eval` still hard-fails with `benchmark_build_failed` on a broken build, " +
+                    "and this check exists to catch that earlier, not to replace it."))
+        } else {
+            let buildOutcome = probeMeasurementBuild(repo: repo, config: config)
+            findings.append(measurementBuild(succeeded: buildOutcome.succeeded, detail: buildOutcome.detail))
+        }
 
         return findings
     }
@@ -572,46 +639,110 @@ public enum DoctorChecks {
         return nil
     }
 
-    /// Substring markers for the conditional-test-gating heuristic. Order
-    /// does not matter here (unlike `UnsafeDetector`'s constructs): none of
-    /// these strings is a prefix of another.
-    private static let conditionalGatingMarkers = [
-        ".enabled(if:", ".disabled(if:", "ProcessInfo.processInfo.environment", "XCTSkip",
-    ]
+    /// Strong markers: an actual skip/condition mechanism, scanned in BOTH
+    /// the frozen test directories and the package's non-test source
+    /// directories. `ConditionTrait` is swift-testing's actual type for a
+    /// custom condition (`extension Trait { static var x: ConditionTrait {
+    /// .enabled(if: ...) } }`) -- its name is specific enough that a plain
+    /// substring match has low collision risk, unlike a generic word.
+    private static let strongGatingMarkers = [".enabled(if:", ".disabled(if:", "XCTSkip", "ConditionTrait"]
 
-    /// Walks every `.swift` file under each declared test target directory
-    /// and reports `"path:line: <trimmed line>"` for every line containing
-    /// one of `conditionalGatingMarkers`. Deliberately a plain substring
-    /// scan, not an AST walk or even comment/string stripping -- see
-    /// `conditionalTestGating`'s doc comment on why this is a heuristic, not
-    /// a guarantee, and why that is stated rather than hidden.
-    private static func scanForConditionalGating(repo: URL, testDirs: [String]) -> [String] {
-        var hits: [String] = []
+    /// Weak marker: reading the environment is ordinary and, alone, not
+    /// evidence of gating -- see `conditionalTestGating`'s doc comment on why
+    /// this is reported separately and at `.ok`, not folded into
+    /// `strongGatingMarkers`.
+    private static let environmentMarker = "ProcessInfo.processInfo.environment"
+
+    /// How many lines on either side of a strong-marker line still count as
+    /// "nearby" when deciding whether an environment read is accounted for
+    /// by a skip construct already flagged as a strong hit (so it is not
+    /// ALSO double-counted as a bare, weak read). A fixed, small window --
+    /// not a real dependency analysis, which a text scan cannot do.
+    private static let nearbyLineWindow = 3
+
+    /// Walks every `.swift` file under each declared TEST target directory.
+    /// Every `strongGatingMarkers` hit is reported as `"path:line: <trimmed
+    /// line>"`. Every `environmentMarker` line is counted toward
+    /// `environmentReadCount` UNLESS a strong-marker line sits within
+    /// `nearbyLineWindow` lines of it in the same file (then it is treated as
+    /// already covered by that strong hit, not counted again separately).
+    /// Deliberately a plain substring scan, not an AST walk or even
+    /// comment/string stripping -- see `conditionalTestGating`'s doc comment
+    /// on why this is a heuristic, not a guarantee.
+    private static func scanTestDirsForConditionalGating(
+        repo: URL, testDirs: [String]
+    ) -> (strongHits: [String], environmentReadCount: Int) {
+        var strongHits: [String] = []
+        var environmentReadCount = 0
         for dir in testDirs.sorted() {
-            let dirURL = repo.appendingPathComponent(dir)
-            guard let enumerator = FileManager.default.enumerator(
-                at: dirURL, includingPropertiesForKeys: [.isRegularFileKey],
-                options: [.skipsHiddenFiles])
-            else { continue }
-            var files: [URL] = []
-            for case let fileURL as URL in enumerator where fileURL.pathExtension == "swift" {
-                files.append(fileURL)
+            for file in swiftFiles(repo: repo, dir: dir) {
+                let lines = file.lines
+                var strongLineIndices: [Int] = []
+                for (index, line) in lines.enumerated() {
+                    for marker in strongGatingMarkers where line.contains(marker) {
+                        strongHits.append("\(file.relativePath):\(index + 1): \(line.trimmingCharacters(in: .whitespaces))")
+                        strongLineIndices.append(index)
+                        break
+                    }
+                }
+                for (index, line) in lines.enumerated() where line.contains(environmentMarker) {
+                    let coveredByAStrongHit = strongLineIndices.contains { abs($0 - index) <= nearbyLineWindow }
+                    if !coveredByAStrongHit {
+                        environmentReadCount += 1
+                    }
+                }
             }
-            for fileURL in files.sorted(by: { $0.path < $1.path }) {
-                guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
-                let relativePath = fileURL.path.hasPrefix(repo.path)
-                    ? String(fileURL.path.dropFirst(repo.path.count + 1))
-                    : fileURL.path
-                for (index, line) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
-                    for marker in conditionalGatingMarkers where line.contains(marker) {
+        }
+        return (strongHits, environmentReadCount)
+    }
+
+    /// Walks every `.swift` file under each declared NON-TEST target
+    /// directory (library and executable targets -- optimizable code) for
+    /// `strongGatingMarkers`. This is what catches a custom `ConditionTrait`
+    /// defined in in-scope source and referenced by name from a frozen test,
+    /// where the literal marker never appears in the test file at all.
+    private static func scanSourceDirsForConditionalGating(repo: URL, sourceDirs: [String]) -> [String] {
+        var hits: [String] = []
+        for dir in sourceDirs.sorted() {
+            for file in swiftFiles(repo: repo, dir: dir) {
+                for (index, line) in file.lines.enumerated() {
+                    for marker in strongGatingMarkers where line.contains(marker) {
                         let trimmed = line.trimmingCharacters(in: .whitespaces)
-                        hits.append("\(relativePath):\(index + 1): \(trimmed)")
+                        hits.append("\(file.relativePath):\(index + 1): \(trimmed) [non-test source, not a frozen file]")
                         break
                     }
                 }
             }
         }
         return hits
+    }
+
+    private struct SwiftFile {
+        let relativePath: String
+        let lines: [String]
+    }
+
+    /// Every `.swift` file under `repo/dir`, each pre-split into lines once
+    /// (shared by both scans above rather than re-reading the same file
+    /// twice when a target happens to be scanned from two call sites).
+    private static func swiftFiles(repo: URL, dir: String) -> [SwiftFile] {
+        let dirURL = repo.appendingPathComponent(dir)
+        guard let enumerator = FileManager.default.enumerator(
+            at: dirURL, includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles])
+        else { return [] }
+        var fileURLs: [URL] = []
+        for case let fileURL as URL in enumerator where fileURL.pathExtension == "swift" {
+            fileURLs.append(fileURL)
+        }
+        return fileURLs.sorted(by: { $0.path < $1.path }).compactMap { fileURL in
+            guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { return nil }
+            let relativePath = fileURL.path.hasPrefix(repo.path)
+                ? String(fileURL.path.dropFirst(repo.path.count + 1))
+                : fileURL.path
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            return SwiftFile(relativePath: relativePath, lines: lines)
+        }
     }
 
     /// Actually builds, BY NAME, the two executables `eval` needs before it
@@ -623,7 +754,16 @@ public enum DoctorChecks {
     /// Runs in `repo` itself, not a copy: a doctor run for a repository is a
     /// statement about THAT repository's own `.build`, matching what `swift
     /// build` run by hand would do.
+    ///
+    /// Prints an announcement to STDERR the instant before this blocks on the
+    /// real build (measured elsewhere in this task at 24-33s) -- every other
+    /// check above completes in milliseconds, and without this a healthy
+    /// machine's `doctor` run goes completely silent for half a minute right
+    /// after those, which is indistinguishable from a hang. The message is
+    /// written synchronously here, before `EvalRunner.buildMeasurementProducts`
+    /// is called, so it always appears before the pause, never after it.
     private static func probeMeasurementBuild(repo: URL, config: Config) -> (succeeded: Bool, detail: String) {
+        announceBuildStarting(repo: repo, benchmarkTarget: config.benchmarkTarget)
         do {
             let failure = try EvalRunner.buildMeasurementProducts(
                 swift: swiftBinary, in: repo, benchmarkTarget: config.benchmarkTarget,
@@ -634,5 +774,22 @@ public enum DoctorChecks {
         } catch {
             return (false, "\(error)")
         }
+    }
+
+    /// The exact text a human sees on STDERR before the ~20-30s build pause.
+    /// Names the command, the cost, the filesystem side effect, and the way
+    /// out (`--skip-build`), all up front -- so it reads as "this is doing
+    /// something, on purpose" rather than a stall. Written directly with
+    /// `FileHandle.standardError`, matching this project's existing
+    /// convention (`BaselineRunner.warn`), not buffered behind the report
+    /// `DoctorCommand` prints only after `all(repo:)` returns.
+    private static func announceBuildStarting(repo: URL, benchmarkTarget: String) {
+        FileHandle.standardError.write(Data("""
+            doctor: building the benchmark target and BenchmarkTool for real \
+            (swift build -c release --product \(benchmarkTarget) and --product BenchmarkTool) -- \
+            this writes .build/ in \(repo.path) and can take on the order of 20-30s. \
+            Pass --skip-build for an instant (but incomplete) report.
+
+            """.utf8))
     }
 }

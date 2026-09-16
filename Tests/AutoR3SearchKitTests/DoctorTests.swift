@@ -82,12 +82,29 @@ import Foundation
     #expect(unknown.detail.contains("git"))
 }
 
-@Test func conditionalTestGatingIsOkWhenEmptyAndWarnsWithHits() {
-    #expect(DoctorChecks.conditionalTestGating(hits: []).level == .ok)
-    let f = DoctorChecks.conditionalTestGating(hits: ["Tests/Foo/BarTests.swift:12: @Test(.enabled(if: flag))"])
-    #expect(f.level == .warn)
-    #expect(f.detail.contains("heuristic".uppercased()) || f.detail.contains("HEURISTIC"))
-    #expect(f.detail.contains("BarTests.swift:12"))
+@Test func conditionalTestGatingIsOkWhenCleanWarnsOnStrongHitsAndStaysInformationalOnBareEnvironmentReads() {
+    // Clean: still names the blind spot no scan can catch.
+    let clean = DoctorChecks.conditionalTestGating(strongHits: [], environmentReadCount: 0)
+    #expect(clean.level == .ok)
+    #expect(clean.detail.contains("blind spot"))
+    #expect(clean.detail.contains("guard"))
+
+    // A strong hit (`.enabled(if:`, `XCTSkip`, `ConditionTrait`, ...) is a real warning.
+    let strong = DoctorChecks.conditionalTestGating(
+        strongHits: ["Tests/Foo/BarTests.swift:12: @Test(.enabled(if: flag))"], environmentReadCount: 0)
+    #expect(strong.level == .warn)
+    #expect(strong.detail.contains("HEURISTIC"))
+    #expect(strong.detail.contains("BarTests.swift:12"))
+    #expect(strong.detail.contains("blind spot"))
+
+    // A BARE environment read with no nearby skip construct is ordinary (CI
+    // detection, feature flags) -- Finding 2 from the review requires this to
+    // stay informational, not train people to ignore every real warning.
+    let weak = DoctorChecks.conditionalTestGating(strongHits: [], environmentReadCount: 3)
+    #expect(weak.level == .ok)
+    #expect(weak.detail.contains("3"))
+    #expect(weak.detail.contains("Ordinary"))
+    #expect(weak.detail.contains("blind spot"))
 }
 
 @Test func packageConfigurationNeverWarns() {
@@ -151,4 +168,79 @@ import Foundation
     #expect(findings.contains { $0.title == "Configuration" && $0.level == .ok && $0.detail.contains("found") })
     #expect(findings.contains { $0.title == "Expected measurement length" })
     _ = try git.head() // fixture really is a usable git repo
+}
+
+// Finding 3 (review, fix round 1): `--skip-build` must actually skip the real
+// build, reporting so as an `.ok` line, not silently doing it anyway.
+
+@Test func skipBuildFlagReportsSkippedAndDoesNotBuild() throws {
+    let (dir, _) = try makeGitFixture()
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let findings = DoctorChecks.all(repo: dir, skipBuild: true)
+    let build = findings.first { $0.title == "Benchmark build" }
+    #expect(build?.level == .ok)
+    #expect(build?.detail.contains("Skipped") == true)
+    #expect(build?.detail.contains("--skip-build") == true)
+
+    let productPath = dir.appendingPathComponent(".build/release/Bench").path
+    #expect(!FileManager.default.fileExists(atPath: productPath), "--skip-build must not actually build")
+}
+
+// Finding 1 (review, fix round 1): a `ConditionTrait` defined in non-test
+// source is exactly the evasion the heuristic previously missed -- the
+// literal `.enabled(if:` marker never appears in the test file at all, only
+// in a `Trait` extension living in optimizable code.
+
+@Test func conditionTraitDefinedInSourceIsCaughtEvenThoughTheTestFileNeverMentionsIt() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try FileManager.default.createDirectory(at: dir.appendingPathComponent("Sources/Lib"),
+                                            withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: dir.appendingPathComponent("Tests/LibTests"),
+                                            withIntermediateDirectories: true)
+    try """
+        import Foundation
+        import Testing
+
+        public func f() -> Int { 1 }
+
+        extension Trait {
+            static var skipWhenSlow: ConditionTrait {
+                .enabled(if: ProcessInfo.processInfo.environment["FAST"] == nil)
+            }
+        }
+        """.write(to: dir.appendingPathComponent("Sources/Lib/Lib.swift"), atomically: true, encoding: .utf8)
+    try """
+        import Testing
+        @testable import Lib
+
+        @Test(.skipWhenSlow) func fReturnsOne() {
+            #expect(f() == 1)
+        }
+        """.write(to: dir.appendingPathComponent("Tests/LibTests/LibTests.swift"),
+                  atomically: true, encoding: .utf8)
+    try """
+        // swift-tools-version: 6.0
+        import PackageDescription
+        let package = Package(
+            name: "fixture",
+            targets: [
+                .target(name: "Lib"),
+                .testTarget(name: "LibTests", dependencies: ["Lib"]),
+            ]
+        )
+        """.write(to: dir.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+
+    let r = try Subprocess.run(URL(fileURLWithPath: "/bin/sh"), ["-c", """
+        git init -q . && git config user.name Test && git config user.email t@example.com \
+        && git add -A && git commit -q -m one
+        """], cwd: dir, env: nil, timeout: 60)
+    #expect(r.exitCode == 0)
+
+    let findings = DoctorChecks.all(repo: dir)
+    let gating = findings.first { $0.title == "Conditionally-gated tests" }
+    #expect(gating?.level == .warn)
+    #expect(gating?.detail.contains("Lib.swift") == true, "the marker lives in Sources, not the test file")
+    #expect(gating?.detail.contains("non-test source") == true)
 }
