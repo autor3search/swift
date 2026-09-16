@@ -60,17 +60,35 @@ public struct Git: Sendable {
         (try? run(["rev-parse", "--verify", name])) != nil
     }
 
+    /// `-z` disables `core.quotePath`'s C-style octal-escaping of non-ASCII
+    /// filenames (a plain `--name-only` would return `"caf\303\251.swift"`,
+    /// a 16-character quoted literal, for `café.swift` — not a path Task
+    /// 17's scope gate could ever match against the real filesystem) and
+    /// emits raw, unescaped UTF-8 bytes with each path NUL-terminated
+    /// instead of newline-separated. `--no-renames` disables rename
+    /// detection so a rename reports as an explicit deletion of the old
+    /// path plus an addition of the new one, rather than only the new path
+    /// — rename-detection defaults are git-version and config dependent, so
+    /// leaving them on would also make this non-deterministic across
+    /// machines.
     public func changedPaths(since commit: String) throws -> [String] {
-        let output = try run(["diff", "--name-only", commit, "HEAD"])
-        return output.isEmpty ? [] : output.split(separator: "\n").map(String.init).sorted()
+        let output = try run(["diff", "-z", "--no-renames", "--name-only", commit, "HEAD"])
+        return output.isEmpty
+            ? []
+            : output.split(separator: "\u{0}", omittingEmptySubsequences: true).map(String.init).sorted()
     }
 
+    /// Returns the exact bytes of `path` as it existed at `commit`. Uses
+    /// `Subprocess.runData`, not `run`, so binary content or a file saved in
+    /// a non-UTF-8 encoding round-trips exactly — `run`'s `String` decoding
+    /// silently repairs invalid byte sequences to U+FFFD, which would
+    /// corrupt the blob before this function ever saw it.
     public func fileContents(_ path: String, at commit: String) throws -> Data {
-        let result = try Subprocess.run(Git.gitBinary, ["show", "\(commit):\(path)"], cwd: repo, env: nil, timeout: 60)
+        let result = try Subprocess.runData(Git.gitBinary, ["show", "\(commit):\(path)"], cwd: repo, env: nil, timeout: 60)
         guard result.exitCode == 0 else {
             throw GitError.command("show \(commit):\(path)", result.exitCode, result.stderr)
         }
-        return Data(result.stdout.utf8)
+        return result.stdout
     }
 
     /// For `version`: the commit of a checkout build. `nil` if HEAD cannot be

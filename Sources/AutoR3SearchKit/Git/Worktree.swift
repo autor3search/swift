@@ -23,8 +23,20 @@ public enum Worktree {
     /// Called after every KEEP. The measurement point moves; the frozen
     /// point (the scope gate's comparison base) never does — that
     /// distinction lives in `BaselineRecord`, not here.
+    ///
+    /// `checkout --force` discards tracked modifications but leaves
+    /// untracked files behind, and `verify` (below) folds cleanliness into
+    /// its verdict — so any untracked residue left over from a previous run
+    /// would make `verify` fail forever, even at the correct commit.
+    /// `clean -fd` removes that residue. Deliberately `-fd`, NOT `-fdx`:
+    /// `-x` also deletes files covered by `.gitignore`, and Task 16 keeps a
+    /// warmed `.build` directory (ignored, not tracked) inside this pinned
+    /// worktree specifically so eval doesn't pay a cold Swift build on
+    /// every measurement. `-fd` clears untracked-but-not-ignored residue
+    /// and leaves ignored build output — the warm cache — alone.
     public static func repoint(git: Git, at url: URL, to commit: String) throws {
         try git.run(["checkout", "--detach", "--force", commit], cwd: url)
+        try git.run(["clean", "-fd"], cwd: url)
     }
 
     /// Whether the worktree is exactly `expectedCommit` AND untouched: the

@@ -25,6 +25,32 @@ public struct ProcessResult: Sendable {
     }
 }
 
+/// The outcome of one child process run, with stdout returned as raw bytes
+/// instead of a UTF-8-repaired `String`.
+///
+/// `ProcessResult.stdout` goes through `String(decoding:as:)`, which
+/// silently replaces any invalid byte sequence with U+FFFD — fine for text
+/// output a caller only inspects, wrong for a caller that must round-trip
+/// exact bytes (e.g. `Git.fileContents`, reading an arbitrary blob that may
+/// be binary or saved in a non-UTF-8 encoding). `stderr` is still decoded as
+/// `String` here: it is always a diagnostic message, never data a caller
+/// round-trips.
+public struct ProcessDataResult: Sendable {
+    public let exitCode: Int32
+    public let stdout: Data
+    public let stderr: String
+    public let timedOut: Bool
+    public let outputTruncated: Bool
+
+    public init(exitCode: Int32, stdout: Data, stderr: String, timedOut: Bool, outputTruncated: Bool) {
+        self.exitCode = exitCode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timedOut = timedOut
+        self.outputTruncated = outputTruncated
+    }
+}
+
 public enum SubprocessError: Error, CustomStringConvertible {
     case launchFailed(String)
 
@@ -54,6 +80,59 @@ public enum Subprocess {
         timeout: TimeInterval,
         outputCapBytes: Int = 4 << 20
     ) throws -> ProcessResult {
+        let raw = try runRaw(executable, args, cwd: cwd, env: env, timeout: timeout, outputCapBytes: outputCapBytes)
+        return ProcessResult(
+            exitCode: raw.exitCode,
+            stdout: String(decoding: raw.stdout, as: UTF8.self),
+            stderr: String(decoding: raw.stderr, as: UTF8.self),
+            timedOut: raw.timedOut,
+            outputTruncated: raw.outputTruncated
+        )
+    }
+
+    /// Like `run`, but returns stdout as the raw `Data` the child wrote,
+    /// undecoded. See `ProcessDataResult` for why this exists alongside
+    /// `run` rather than replacing it — `run`'s signature and behavior are
+    /// unchanged, and eleven existing call sites keep working exactly as
+    /// before.
+    public static func runData(
+        _ executable: URL,
+        _ args: [String],
+        cwd: URL,
+        env: [String: String]? = nil,
+        timeout: TimeInterval,
+        outputCapBytes: Int = 4 << 20
+    ) throws -> ProcessDataResult {
+        let raw = try runRaw(executable, args, cwd: cwd, env: env, timeout: timeout, outputCapBytes: outputCapBytes)
+        return ProcessDataResult(
+            exitCode: raw.exitCode,
+            stdout: raw.stdout,
+            stderr: String(decoding: raw.stderr, as: UTF8.self),
+            timedOut: raw.timedOut,
+            outputTruncated: raw.outputTruncated
+        )
+    }
+
+    /// Shared plumbing behind `run` and `runData`: spawn, drain both pipes
+    /// concurrently, wait (with a tree kill at `timeout`), and hand back
+    /// both streams as raw bytes. `run` and `runData` differ only in how
+    /// they decode `stdout` afterward.
+    private struct RawResult {
+        let exitCode: Int32
+        let stdout: Data
+        let stderr: Data
+        let timedOut: Bool
+        let outputTruncated: Bool
+    }
+
+    private static func runRaw(
+        _ executable: URL,
+        _ args: [String],
+        cwd: URL,
+        env: [String: String]?,
+        timeout: TimeInterval,
+        outputCapBytes: Int
+    ) throws -> RawResult {
         let child: SpawnedChild
         do {
             child = try POSIXSpawn.spawn(executable: executable, args: args, cwd: cwd, env: env)
@@ -120,10 +199,10 @@ public enum Subprocess {
         close(child.stderrFD)
 
         let snapshot = buffers.snapshot()
-        return ProcessResult(
+        return RawResult(
             exitCode: reaped ? exitCode(from: status) : -1,
-            stdout: String(decoding: snapshot.out, as: UTF8.self),
-            stderr: String(decoding: snapshot.err, as: UTF8.self),
+            stdout: snapshot.out,
+            stderr: snapshot.err,
             timedOut: timedOut,
             outputTruncated: snapshot.truncated
         )
