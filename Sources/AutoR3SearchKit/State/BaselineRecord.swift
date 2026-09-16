@@ -19,6 +19,28 @@ public struct BaselineRecord: Codable, Equatable, Sendable {
     public var packageResolvedSHA256: String
     public var toolVersion: String
 
+    /// EVERY manifest-or-manifest-equivalent file in the repository at
+    /// `frozenCommit`, relative path -> SHA-256 of its bytes. "Manifest" here
+    /// is exactly `ScopeGate.isManifestPath` -- one definition, shared with
+    /// the scope gate, so the two can never drift apart.
+    ///
+    /// `packageSwiftSHA256` and `packageResolvedSHA256` cover only the ROOT
+    /// manifests. `ScopeGate` catches a NESTED one (`Sub/Package.swift`), a
+    /// version-specific one (`Package@swift-6.0.swift`) and anything under
+    /// `.swiftpm/` -- but only BY PATH, and `git update-index
+    /// --assume-unchanged` defeats every path-based check. So without this,
+    /// the `-Ounchecked` bypass closed for the root manifest stayed wide open
+    /// for a nested one, and the project's claim that manifest changes are
+    /// "rejected outright regardless of scope" was true only at the root.
+    ///
+    /// OPTIONAL, and deliberately not defaulted to `[:]` at the point of use.
+    /// A record written before this field existed decodes as `nil`, and `nil`
+    /// means "this baseline has no inventory", which `eval` REFUSES -- it does
+    /// not mean "the inventory is empty", which would silently restore the
+    /// hole for exactly the runs that predate the fix. See
+    /// `EvalRunner.manifestIntegrityFailure`.
+    public var manifestSHA256: [String: String]?
+
     public init(
         tag: String,
         frozenCommit: String,
@@ -26,8 +48,10 @@ public struct BaselineRecord: Codable, Equatable, Sendable {
         configSHA256: String,
         packageSwiftSHA256: String,
         packageResolvedSHA256: String,
-        toolVersion: String
+        toolVersion: String,
+        manifestSHA256: [String: String]? = nil
     ) {
+        self.manifestSHA256 = manifestSHA256
         self.tag = tag
         self.frozenCommit = frozenCommit
         self.measurementCommit = measurementCommit

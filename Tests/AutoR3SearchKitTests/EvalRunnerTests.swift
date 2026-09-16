@@ -448,6 +448,212 @@ private final class CountingSource: MetricSource, @unchecked Sendable {
     #expect(v.reason == "manifest_change_rejected", "got \(v.reason ?? "nil")")
 }
 
+// =========================================================================
+// MARK: - Gate 2a, part 2: EVERY manifest, not just the two at the root
+// =========================================================================
+
+/// Adds a nested package manifest to `repo` and commits it, returning its
+/// relative path. `Sub/` is not under any target's path, so SwiftPM ignores it
+/// for build purposes -- but `ScopeGate.isManifestPath` recognises it, SwiftPM
+/// would honour it if `Sub` were ever referenced, and it is exactly the file
+/// the root-only hash check could not see.
+private func addNestedManifest(_ repo: URL, body: String) throws -> String {
+    try FileManager.default.createDirectory(
+        at: repo.appendingPathComponent("Sub"), withIntermediateDirectories: true)
+    try body.write(to: repo.appendingPathComponent("Sub/Package.swift"),
+                   atomically: true, encoding: .utf8)
+    let r = try Subprocess.run(URL(fileURLWithPath: "/bin/sh"),
+                               ["-c", "git add -- Sub && git commit -q -m nested"],
+                               cwd: repo, env: nil, timeout: 60)
+    #expect(r.exitCode == 0, "\(r.stderr)")
+    return "Sub/Package.swift"
+}
+
+/// THE NESTED BYPASS, with `--skip-worktree` rather than `--assume-unchanged`.
+///
+/// Two things at once, both of which were holes after round 2:
+///
+/// 1. Gate 2a hashed only the ROOT manifests. `ScopeGate.isManifestPath`
+///    catches `Sub/Package.swift` BY PATH -- and defeating path accounting is
+///    the entire attack -- so a repository with a nested package still had the
+///    `-Ounchecked` route open, and the project's "rejected outright
+///    regardless of scope" claim was true only at the root.
+/// 2. `--skip-worktree` was asserted in prose and never run. Same mechanism as
+///    `--assume-unchanged`, but untested is untested.
+///
+/// The git-level premise is asserted first, so this cannot pass for the wrong
+/// reason if a future git stops honouring the flag.
+@Test func skipWorktreeNestedManifestBypassIsRejectedByHash() throws {
+    let (repo, _) = try makeGitFixture()
+    let env = isolatedStateEnv()
+    defer { cleanUpFixture(repo: repo, env: env) }
+    let sh = URL(fileURLWithPath: "/bin/sh")
+
+    // The nested manifest must exist at frozenCommit, so baseline inventories it.
+    let nested = try addNestedManifest(repo, body: """
+        // swift-tools-version: 6.0
+        import PackageDescription
+        let package = Package(name: "Sub", targets: [.target(name: "Sub")])
+        """)
+    let record = try BaselineRunner.run(repo: repo, tag: "t", env: env)
+    #expect(record.manifestSHA256?[nested] != nil,
+            "baseline must have inventoried the nested manifest; got \(record.manifestSHA256 ?? [:])")
+
+    // Hide it from git with the OTHER index flag, then rewrite it unsafely.
+    let hide = try Subprocess.run(sh, ["-c", "git update-index --skip-worktree -- \(nested)"],
+                                  cwd: repo, env: nil, timeout: 60)
+    #expect(hide.exitCode == 0, "\(hide.stderr)")
+    try """
+        // swift-tools-version: 6.0
+        import PackageDescription
+        let package = Package(
+            name: "Sub",
+            targets: [.target(name: "Sub", swiftSettings: [.unsafeFlags(["-Ounchecked"])])]
+        )
+        """.write(to: repo.appendingPathComponent(nested), atomically: true, encoding: .utf8)
+
+    try makeInScopeCommit(repo, "innocent looking")
+
+    // THE PREMISE: --skip-worktree really does blind both path-based gates.
+    let status = try Subprocess.run(sh, ["-c", "git status --porcelain"],
+                                    cwd: repo, env: nil, timeout: 60)
+    #expect(status.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, """
+        --skip-worktree did not hide the edit, so gate 2b would have caught this anyway and this \
+        test proves nothing about gate 2a: \(status.stdout)
+        """)
+    let changed = try Git(repo: repo).changedPaths(since: record.frozenCommit)
+    #expect(!changed.contains(nested), """
+        --skip-worktree did not hide the edit from the commit diff, so gate 1 would have caught \
+        this anyway: \(changed)
+        """)
+    #expect(try String(contentsOf: repo.appendingPathComponent(nested), encoding: .utf8)
+                .contains("-Ounchecked"),
+            "the tampered nested manifest must actually be the one on disk")
+
+    let v = try EvalRunner.run(repo: repo, env: env, source: NeverCalledSource(), now: Date.init)
+    #expect(v.kind == .fail)
+    #expect(v.reason == "manifest_change_rejected", "got \(v.reason ?? "nil")")
+}
+
+/// A manifest that APPEARS is worth as much to an attacker as one that is
+/// edited: no recorded hash can mismatch for a file that had no hash. SwiftPM
+/// honours a nested manifest that was not there before, and `.gitignore`ing it
+/// keeps it out of `git status` entirely.
+@Test func aManifestAppearingWhereBaselineRecordedNoneIsRejected() throws {
+    let (repo, _) = try makeGitFixture()
+    let env = isolatedStateEnv()
+    defer { cleanUpFixture(repo: repo, env: env) }
+    let sh = URL(fileURLWithPath: "/bin/sh")
+
+    // Ignore Sub/ BEFORE the freeze, so its arrival leaves a clean tree and
+    // does not put .gitignore (which is out of scope) into the commit diff.
+    let gitignore = repo.appendingPathComponent(".gitignore")
+    try (try String(contentsOf: gitignore, encoding: .utf8) + "Sub/\n")
+        .write(to: gitignore, atomically: true, encoding: .utf8)
+    let commit = try Subprocess.run(sh, ["-c", "git add -- .gitignore && git commit -q -m ignore"],
+                                    cwd: repo, env: nil, timeout: 60)
+    #expect(commit.exitCode == 0, "\(commit.stderr)")
+
+    let record = try BaselineRunner.run(repo: repo, tag: "t", env: env)
+    #expect(record.manifestSHA256?["Sub/Package.swift"] == nil,
+            "the fixture must start with no nested manifest")
+
+    try FileManager.default.createDirectory(
+        at: repo.appendingPathComponent("Sub"), withIntermediateDirectories: true)
+    try """
+        // swift-tools-version: 6.0
+        import PackageDescription
+        let package = Package(name: "Sub", targets: [.target(name: "Sub")])
+        """.write(to: repo.appendingPathComponent("Sub/Package.swift"),
+                  atomically: true, encoding: .utf8)
+    try makeInScopeCommit(repo, "innocent looking")
+
+    let status = try Subprocess.run(sh, ["-c", "git status --porcelain"],
+                                    cwd: repo, env: nil, timeout: 60)
+    #expect(status.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            "the ignored nested manifest must be invisible to gate 2b: \(status.stdout)")
+
+    let v = try EvalRunner.run(repo: repo, env: env, source: NeverCalledSource(), now: Date.init)
+    #expect(v.kind == .fail)
+    #expect(v.reason == "manifest_change_rejected", "got \(v.reason ?? "nil")")
+}
+
+/// MIGRATION. A record written before the inventory existed decodes with
+/// `manifestSHA256 == nil`. That run is unprotected against every nested-
+/// manifest route above, so it is REFUSED -- "no record of its manifests" must
+/// not be read as "no manifests to check", which is the empty-inventory
+/// mistake in a new costume.
+@Test func aBaselineWithNoManifestInventoryIsRefusedRatherThanWavedThrough() throws {
+    let (repo, _) = try makeGitFixture()
+    let env = isolatedStateEnv()
+    defer { cleanUpFixture(repo: repo, env: env) }
+    let record = try BaselineRunner.run(repo: repo, tag: "t", env: env)
+
+    var stale = record
+    stale.manifestSHA256 = nil
+    #expect(EvalRunner.manifestInventoryFailure(repo: repo, record: stale)?.reason
+                == "baseline_predates_manifest_inventory")
+    // An EMPTY inventory is a different thing and must not be confused with a
+    // missing one: it means "baseline looked and found none", which is only
+    // ever true for a package with no manifests at all -- and any appearance
+    // is then still caught.
+    var empty = record
+    empty.manifestSHA256 = [:]
+    #expect(empty.manifestSHA256 != nil)
+    #expect(EvalRunner.manifestInventoryFailure(repo: repo, record: empty)?.reason
+                == "manifest_change_rejected",
+            "an empty inventory must still flag the root Package.swift as having appeared")
+}
+
+/// A `BaselineRecord` written before this field existed has no
+/// `manifestSHA256` key at all. It must still DECODE -- refusing to read the
+/// record would turn a recoverable "re-baseline" into an unreadable run
+/// directory -- and must decode as `nil`, not as an empty dictionary.
+@Test func anOlderBaselineRecordStillDecodesWithANilInventory() throws {
+    let json = Data("""
+        {"tag":"t","frozenCommit":"a","measurementCommit":"a","configSHA256":"c",
+         "packageSwiftSHA256":"p","packageResolvedSHA256":"r","toolVersion":"0.1.0"}
+        """.utf8)
+    let decoded = try JSONDecoder().decode(BaselineRecord.self, from: json)
+    #expect(decoded.manifestSHA256 == nil)
+}
+
+/// The inventory must see what `swift build` sees and nothing else. `.build`
+/// holds every dependency's checkout, each with its own `Package.swift`;
+/// inventorying those would make every eval a rejection the moment SwiftPM
+/// touched its cache.
+@Test func manifestInventoryFindsNestedManifestsAndSkipsBuildAndGit() throws {
+    let (repo, _) = try makeGitFixture()
+    defer { try? FileManager.default.removeItem(at: repo) }
+    do {
+        _ = try addNestedManifest(repo, body: "// swift-tools-version: 6.0\n")
+        try FileManager.default.createDirectory(
+            at: repo.appendingPathComponent(".build/checkouts/dep"), withIntermediateDirectories: true)
+        try "// a dependency's own manifest\n".write(
+            to: repo.appendingPathComponent(".build/checkouts/dep/Package.swift"),
+            atomically: true, encoding: .utf8)
+        try FileManager.default.createDirectory(
+            at: repo.appendingPathComponent(".swiftpm/configuration"), withIntermediateDirectories: true)
+        try "{}\n".write(to: repo.appendingPathComponent(".swiftpm/configuration/mirrors.json"),
+                         atomically: true, encoding: .utf8)
+        try "// version specific\n".write(
+            to: repo.appendingPathComponent("Package@swift-6.0.swift"),
+            atomically: true, encoding: .utf8)
+
+        let inventory = try BaselineRunner.manifestInventory(repo: repo)
+        #expect(inventory["Package.swift"] != nil)
+        #expect(inventory["Sub/Package.swift"] != nil, "a nested manifest must be inventoried")
+        #expect(inventory["Package@swift-6.0.swift"] != nil,
+                "SwiftPM substitutes this for Package.swift when it matches the toolchain")
+        #expect(inventory[".swiftpm/configuration/mirrors.json"] != nil,
+                "mirrors.json can redirect a dependency to an entirely different source")
+        #expect(inventory[".build/checkouts/dep/Package.swift"] == nil,
+                "dependencies' own manifests must not be inventoried")
+        // Ordinary source that merely looks manifest-ish stays editable.
+        #expect(inventory["Sources/Lib/Lib.swift"] == nil)
+    }
+}
+
 /// The other direction, and the reason the gate is safe to add: an untouched
 /// manifest must pass it. Called directly rather than through a whole `eval` so
 /// this stays a pure assertion about the gate itself.

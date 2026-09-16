@@ -94,6 +94,11 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
     /// silent-success failure this project has been bitten by repeatedly.
     case dependencyPinUndetermined(String)
 
+    /// The manifest inventory could not be built. Fatal for the same reason
+    /// `packageDescribeFailed` is: a baseline that records an EMPTY inventory
+    /// because the scan could not run protects nothing, and reports success.
+    case manifestInventoryFailed(String)
+
     public var description: String {
         switch self {
         case .dirtyTree:
@@ -185,6 +190,17 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
             a check that never ran. Fix whatever stopped the resolve -- network, credentials for \
             a private dependency, an unreachable dependency URL, a broken manifest -- and retry.
             """
+        case .manifestInventoryFailed(let why):
+            return """
+            refusing to establish a baseline: could not inventory this repository's manifests \
+            (\(why)).
+
+            baseline records the hash of every Package.swift, Package.resolved, version-specific \
+            manifest and .swiftpm file in the tree, and eval compares the bytes on disk against \
+            it -- that is what stops a nested manifest being rewritten behind git's back. \
+            Recording an empty inventory because the scan could not run would protect nothing and \
+            still report success.
+            """
         }
     }
 }
@@ -214,6 +230,56 @@ public enum BaselineRunner {
         }
         let data = try Data(contentsOf: url)
         return SHA256.hash(data: data).compactMap { String(format: "%02x", $0) }.joined()
+    }
+
+    /// EVERY manifest-or-manifest-equivalent file under `repo`, as a relative
+    /// path -> SHA-256 map. `baseline` records this; gate 2a compares against
+    /// it. See `BaselineRecord.manifestSHA256` for why it exists.
+    ///
+    /// "Manifest" is `ScopeGate.isManifestPath` and nothing else. Reusing that
+    /// one predicate is the point: an inventory built from its own private
+    /// idea of what a manifest is would drift from the scope gate the first
+    /// time either changed, and the gap between the two would be a bypass
+    /// nobody was looking at.
+    ///
+    /// SCANNED FROM DISK, not from `git ls-tree`. This is what makes the
+    /// APPEARANCE check work without false positives. A manifest-equivalent
+    /// file that is present but GITIGNORED -- an Xcode-written `.swiftpm/`,
+    /// say -- is invisible to git, so a git-derived inventory would not record
+    /// it and the first `eval` would report it as newly appeared on a
+    /// repository where nothing had changed. Disk sees exactly what `swift
+    /// build` sees, which is the surface that actually matters. `baseline` has
+    /// already verified the tree is clean by the time this runs, so disk and
+    /// `frozenCommit` agree on everything git can see.
+    ///
+    /// `.git` and `.build` are skipped. `.build` is not optional politeness:
+    /// it holds every dependency's checkout, each with its own
+    /// `Package.swift`, so scanning it would inventory hundreds of files that
+    /// SwiftPM rewrites at will and turn every eval into a rejection.
+    static func manifestInventory(repo: URL) throws -> [String: String] {
+        let root = repo.standardizedFileURL
+        guard let walker = FileManager.default.enumerator(
+            at: root, includingPropertiesForKeys: [.isDirectoryKey], options: []
+        ) else {
+            throw BaselineError.manifestInventoryFailed("could not enumerate \(root.path)")
+        }
+
+        var inventory: [String: String] = [:]
+        for case let item as URL in walker {
+            let name = item.lastPathComponent
+            let isDirectory = (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            if isDirectory, name == ".git" || name == ".build" {
+                walker.skipDescendants()
+                continue
+            }
+            guard !isDirectory else { continue }
+            let full = item.standardizedFileURL.path
+            guard full.hasPrefix(root.path + "/") else { continue }
+            let relative = String(full.dropFirst(root.path.count + 1))
+            guard ScopeGate.isManifestPath(relative) else { continue }
+            inventory[relative] = try sha256File(item)
+        }
+        return inventory
     }
 
     /// What goes into `BaselineRecord.packageResolvedSHA256`: either the
@@ -392,6 +458,11 @@ public enum BaselineRunner {
         // the bytes as they were when the tree was verified clean.
         let configSHA256 = try sha256File(repo.appendingPathComponent(".autor3search/config.yaml"))
         let packageSwiftSHA256 = try sha256File(repo.appendingPathComponent("Package.swift"))
+        // The manifest inventory belongs here for the same two reasons: a
+        // failure leaves nothing behind, and the hashes are the bytes from the
+        // moment the tree was verified clean rather than whatever the warm
+        // build left lying around.
+        let manifestSHA256 = try manifestInventory(repo: repo)
 
         // Captured BEFORE touching the branch: creating or checking out the
         // run branch must never change which commit gets frozen.
@@ -509,7 +580,8 @@ public enum BaselineRunner {
             configSHA256: configSHA256,
             packageSwiftSHA256: packageSwiftSHA256,
             packageResolvedSHA256: packageResolvedPin,
-            toolVersion: BuildInfo.version)
+            toolVersion: BuildInfo.version,
+            manifestSHA256: manifestSHA256)
         try record.save(to: recordURL)
         return record
     }

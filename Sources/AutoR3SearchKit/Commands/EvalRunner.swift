@@ -166,6 +166,96 @@ public enum EvalRunner {
         return nil
     }
 
+    /// Gate 2a, second half: EVERY manifest in the tree, not just the two at
+    /// the root.
+    ///
+    /// The root-only check above closes the `--assume-unchanged` bypass for
+    /// `Package.swift` and `Package.resolved` and leaves it wide open for
+    /// `Sub/Package.swift`, `Package@swift-6.0.swift` and `.swiftpm/`.
+    /// `ScopeGate.isManifestPath` does catch all three -- but BY PATH, and
+    /// hiding a file from git's path accounting is precisely what the attack
+    /// does. So `baseline` records the hash of every one of them and this
+    /// compares the bytes on disk.
+    ///
+    /// Three failure shapes, all `manifest_change_rejected`:
+    ///
+    /// - **Changed or removed.** A recorded path whose bytes no longer hash to
+    ///   what was recorded, a missing file included (`try?` -> `nil`, which
+    ///   never equals a hash).
+    /// - **APPEARED.** A manifest on disk that baseline did not record. A new
+    ///   `Sub/Package.swift` is worth exactly as much to an attacker as an
+    ///   edited one -- SwiftPM will honour it, and no recorded hash can
+    ///   mismatch for a file that had no hash.
+    /// - **No inventory at all.** A `BaselineRecord` written before this field
+    ///   existed. That run is unprotected against every one of the above, so
+    ///   it is refused rather than waved through on an empty inventory: "there
+    ///   is no record" must not read as "there is nothing to check". The
+    ///   operator re-runs `baseline` under a new tag, which is the same
+    ///   migration answer this project gave for the empty-data dependency pin.
+    static func manifestInventoryFailure(repo: URL, record: BaselineRecord) -> GateFailure? {
+        guard let recorded = record.manifestSHA256 else {
+            return GateFailure(reason: "baseline_predates_manifest_inventory", detail: """
+                this baseline record has no manifest inventory, because it was written by a \
+                version of autor3search-swift from before that existed. Without one, a manifest \
+                anywhere but the repository root -- Sub/Package.swift, Package@swift-6.0.swift, \
+                anything under .swiftpm/ -- can be rewritten behind git's back (`git update-index \
+                --assume-unchanged`) and neither the scope gate nor the dirty-tree gate sees it, \
+                while swift build compiles it. -Ounchecked alone wins a measurement with bounds \
+                checking off.
+
+                eval refuses rather than continue with no inventory: "this run has no record of \
+                its manifests" must not be read as "this run has no manifests to check". Re-run \
+                `autor3search-swift baseline` under a NEW tag to establish one. Results from this \
+                run were measured without that protection and should not be mixed with the new \
+                run's.
+                """)
+        }
+
+        let live: [String: String]
+        do {
+            live = try BaselineRunner.manifestInventory(repo: repo)
+        } catch {
+            return GateFailure(reason: "manifest_change_rejected", detail: """
+                could not inventory this repository's manifests to compare them against what \
+                baseline recorded: \(error). Failing closed -- a check that cannot run is not a \
+                check that passed.
+                """)
+        }
+
+        // Sorted so the message is deterministic across runs; a rejection an
+        // operator cannot diff against yesterday's is much harder to act on.
+        let changed = recorded.keys.filter { live[$0] != recorded[$0] }.sorted()
+        let appeared = live.keys.filter { recorded[$0] == nil }.sorted()
+        guard !changed.isEmpty || !appeared.isEmpty else { return nil }
+
+        var lines: [String] = []
+        for path in changed {
+            let liveHash = live[path].map { "sha256 \($0)" } ?? "the file is gone"
+            lines.append("  changed:  \(path) (\(liveHash), baseline recorded \(recorded[path]!))")
+        }
+        for path in appeared {
+            lines.append("  appeared: \(path) (baseline recorded no such file)")
+        }
+
+        return GateFailure(reason: "manifest_change_rejected", detail: """
+            the package manifests on disk no longer match what baseline recorded:
+
+            \(lines.joined(separator: "\n"))
+
+            Every one of these decides how the candidate is COMPILED or which dependencies it is \
+            compiled against. A manifest that APPEARED counts: SwiftPM honours a nested \
+            Sub/Package.swift, substitutes Package@swift-<version>.swift for Package.swift when it \
+            matches the toolchain, and reads .swiftpm/configuration/mirrors.json to decide where a \
+            dependency comes from -- so adding one is as good as editing one.
+
+            This is checked by HASH against the bytes on disk, not by which paths git reports as \
+            changed, because `git update-index --assume-unchanged` (or `--skip-worktree`) hides an \
+            edit from both the scope gate and the dirty-tree gate while swift build still reads \
+            the edited file. Restore these files to what baseline recorded, or start a new run \
+            with a new baseline if the change is intended.
+            """)
+    }
+
     /// Runs one experiment end to end and returns its verdict.
     ///
     /// Throws only on a genuine harness failure (the executable turns that
@@ -384,6 +474,14 @@ public enum EvalRunner {
         // "rejected outright", and this is that same rule enforced through
         // the door the path check cannot see.
         if let failure = manifestIntegrityFailure(repo: repo, record: record) {
+            return fail(failure)
+        }
+        // ...and the same check for every manifest that is not at the root:
+        // nested packages, version-specific manifests, `.swiftpm/`. The root
+        // pair keeps its own check above purely for the better diagnosis it
+        // can give; this is what makes the spec's "regardless of scope" claim
+        // true anywhere other than the repository root.
+        if let failure = manifestInventoryFailure(repo: repo, record: record) {
             return fail(failure)
         }
 
