@@ -82,13 +82,27 @@ public enum StopRunner {
     /// used so a process that turns out not to be the intended eval still
     /// has the chance to handle or ignore it.
     ///
-    /// LIMITATION, ALSO STATED PLAINLY: this signals only the top-level
-    /// `eval` process. It does not and cannot kill any build or benchmark
-    /// subprocess that eval already spawned -- those run in their OWN
-    /// process group by design (`ProcessTree`'s `POSIXProcessTree`, used for
-    /// timeout handling), and nothing here reaches into it. A forced stop
-    /// can leave an orphaned measurement process running; `StopCommand`
-    /// prints this caveat every time a signal is actually sent.
+    /// WHAT ACTUALLY HAPPENS TO THE IN-FLIGHT CHILD, STATED PLAINLY: `eval`
+    /// traps SIGTERM (and SIGINT) and, before exiting, kills the in-flight
+    /// child's whole process GROUP -- see `SignalTrap` -- including
+    /// grandchildren that stay in it. A `swift build`, `swift test` or
+    /// `BenchmarkTool` running at the moment of the signal is killed with
+    /// it, not merely orphaned; this was previously a real gap (mistake #4
+    /// from this project's founding constraints, arriving through the stop
+    /// path) and is now closed, with mutation evidence in `docs/run-log.md`.
+    /// This signal call itself only reaches the top-level `eval` process --
+    /// it is `eval`'s own installed handler, not this function, that reaches
+    /// the child.
+    ///
+    /// ONE RESIDUAL HOLE, ALSO STATED PLAINLY, AND NOT SPECIFIC TO
+    /// `--force`: a descendant that puts itself into a NEW process group at
+    /// spawn escapes `kill(-pgid)` by construction. SwiftPM's
+    /// `swiftpm-testing-helper` does exactly this -- observed already in its
+    /// own group before any kill could reach it -- and the identical hole
+    /// exists on the timeout path, which kills the same way. It is a
+    /// property of the group-kill mechanism itself, not of forcing a stop.
+    /// `StopCommand` states both of the above -- what is now killed, and
+    /// this one residual hole -- every time a signal is actually sent.
     ///
     /// If the claim is not currently held, or its holder is a different
     /// host, or its pid cannot be parsed, this does NOT pretend to have

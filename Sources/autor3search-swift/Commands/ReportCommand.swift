@@ -70,8 +70,17 @@ struct ReportCommand: ParsableCommand {
                   KEPT commits that introduced unsafe constructs (frozen tests verify behaviour, \
                 but cannot catch undefined behaviour -- review these):
                 """)
+            // `ReportSummary.unsafeCommits` is `[Int]` (experiment numbers) at the
+            // fixed library interface -- the SHA a human actually needs to check
+            // out and read is not part of that shape. Join against the already-
+            // loaded rows here, in the command layer, rather than printing a bare
+            // number that sends a human back to results.tsv by hand to find the
+            // very commit this report just told them to review.
+            var commitByExperiment: [Int: String] = [:]
+            for r in loaded.rows { commitByExperiment[r.experiment] = r.commit }
             for experiment in summary.unsafeCommits {
-                print("    experiment \(experiment)")
+                let commit = commitByExperiment[experiment] ?? "unknown (row not found in results.tsv)"
+                print("    experiment \(experiment)  commit \(commit)")
             }
         }
     }

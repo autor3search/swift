@@ -22,7 +22,7 @@ struct StopCommand: ParsableCommand {
     @Flag(name: .long, help: """
         Also make a best-effort attempt to abandon the experiment already in flight, by \
         signaling the eval process holding this run's claim (same host only; see the printed \
-        note on what this does not do).
+        note on what is, and is not, killed as a result).
         """)
     var force = false
 
@@ -42,11 +42,14 @@ struct StopCommand: ParsableCommand {
             switch outcome.forceResult {
             case .signaled(let pid):
                 print("""
-                    a live eval (pid \(pid), this host) was signaled (SIGTERM) to abandon its \
-                    in-flight experiment now. NOTE: this does not and cannot kill any build or \
-                    benchmark subprocess that eval already spawned -- those run in a separate \
-                    process group by design, and nothing here reaches into it. Check for \
-                    orphaned processes if that matters to you.
+                    a live eval (pid \(pid), this host) was signaled (SIGTERM). eval traps that \
+                    signal and, before exiting, kills the in-flight child's process group, \
+                    including grandchildren that stay in it -- a swift build, swift test or \
+                    BenchmarkTool running at this moment is killed with it. NOTE: a descendant \
+                    that puts itself into a NEW process group at spawn escapes that kill by \
+                    construction (SwiftPM's swiftpm-testing-helper does exactly this) and can \
+                    survive -- the same limitation the timeout path already has, not something \
+                    specific to --force. Check for that if it matters to you.
                     """)
             case .noEvalInFlight:
                 print("""
