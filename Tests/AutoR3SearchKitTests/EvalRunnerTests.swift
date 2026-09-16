@@ -106,6 +106,77 @@ private final class CommitAwareSource: MetricSource, @unchecked Sendable {
 
 // MARK: - The run claim
 
+// WHY THE TWO HELPERS BELOW EXIST, AND WHY A BARE `#expect(!RunClaim.isHeld(...))`
+// IMMEDIATELY AFTER A RELEASE IS NOT A CORRECT ASSERTION IN *THIS* PROCESS.
+//
+// This was a real, recurring flake:
+//
+//     ✘ aSecondEvalRefusesWhileAnotherHoldsTheRunClaim()
+//       EvalRunnerTests.swift:127:5: Expectation failed: !RunClaim.isHeld(at: claimURL)
+//
+// The claim is an advisory `flock` held against the OPEN FILE DESCRIPTION, and
+// the kernel drops it when the LAST descriptor referring to that description is
+// closed. `fork` duplicates the whole descriptor table, so a child born while
+// this test holds its claim shares the very same open file description --
+// including its lock. `O_CLOEXEC` closes the copy, but `O_CLOEXEC` acts at
+// EXEC, not at FORK, so for the width of one fork-to-exec window the lock has
+// TWO holders and the original holder's own `close` does not drop it.
+//
+// swift-testing runs the whole suite in ONE process, in parallel, and most of
+// the other tests in it spawn `git`, `swift build` and `swift package describe`
+// through `POSIXSpawn`. Every one of those spawns briefly duplicates THIS
+// test's claim descriptor, no matter how well isolated the test's repository
+// path and `AUTOR3SEARCH_SWIFT_STATE_HOME` are: the descriptor is inherited by
+// fd number, not by path. So a claim this test has genuinely released can keep
+// reading as held for about a millisecond, and the assertion above fails.
+//
+// Measured, in this suite, with a 1500-iteration acquire/release loop and N
+// background threads doing nothing but `Subprocess.run(git, ["--version"])`
+// (docs/run-log.md carries the full output):
+//
+//     spawners=0  stillHeldAfterRelease=0   reacquireThrew=0   mechanismBreaks=0
+//     spawners=1  stillHeldAfterRelease=8   reacquireThrew=4   mechanismBreaks=0
+//     spawners=3  stillHeldAfterRelease=36  reacquireThrew=21  mechanismBreaks=0
+//     spawners=6  stillHeldAfterRelease=54  reacquireThrew=45  mechanismBreaks=0
+//
+// `mechanismBreaks` -- two acquires granted at once -- was ZERO in all 6000
+// iterations. That is the part that matters: the window is strictly
+// CONSERVATIVE. It can make a free claim look busy for a millisecond; it can
+// never let two evals measure at the same time, which is the only thing the
+// claim exists to prevent. The mechanism is sound; the assertion was not.
+//
+// The helpers therefore wait, briefly, instead of sampling once. They do NOT
+// weaken what is being asserted: a claim that is never released stays held
+// forever, so a genuinely broken `release()` still fails the test -- it just
+// takes `budget` seconds to say so. (Mutation-checked: with the `release()`
+// body in `RunClaim` commented out, the test below fails.)
+
+/// Whether `url`'s claim reads as free within `budget`.
+private func claimBecomesFree(_ url: URL, within budget: TimeInterval = 5) -> Bool {
+    let deadline = Date().addingTimeInterval(budget)
+    while true {
+        if !RunClaim.isHeld(at: url) { return true }
+        if Date() >= deadline { return false }
+        Thread.sleep(forTimeInterval: 0.002)
+    }
+}
+
+/// Takes the claim, retrying ONLY `alreadyHeld` and only for `budget`.
+///
+/// Any other error is rethrown at once: this exists to absorb the fork-to-exec
+/// window described above, not to paper over a claim that cannot be opened.
+private func acquireClaim(_ url: URL, within budget: TimeInterval = 5) throws -> RunClaim {
+    let deadline = Date().addingTimeInterval(budget)
+    while true {
+        do {
+            return try RunClaim.acquire(at: url)
+        } catch RunClaimError.alreadyHeld {
+            if Date() >= deadline { throw RunClaimError.alreadyHeld(path: url.path, holder: "") }
+            Thread.sleep(forTimeInterval: 0.002)
+        }
+    }
+}
+
 @Test func aSecondEvalRefusesWhileAnotherHoldsTheRunClaim() throws {
     let (repo, _) = try makeGitFixture()
     let env = isolatedStateEnv()
@@ -124,9 +195,9 @@ private final class CommitAwareSource: MetricSource, @unchecked Sendable {
     #expect(v.reason == "run_already_in_progress")
 
     held.release()
-    #expect(!RunClaim.isHeld(at: claimURL), "releasing must actually free the claim")
+    #expect(claimBecomesFree(claimURL), "releasing must actually free the claim")
     // And the claim is takeable again, so a refusal is not a permanent state.
-    let second = try RunClaim.acquire(at: claimURL)
+    let second = try acquireClaim(claimURL)
     second.release()
 }
 
@@ -143,7 +214,7 @@ private final class CommitAwareSource: MetricSource, @unchecked Sendable {
     #expect(throws: (any Error).self) {
         _ = try EvalRunner.run(repo: repo, env: env, source: NeverCalledSource(), now: Date.init)
     }
-    #expect(!RunClaim.isHeld(at: claimURL),
+    #expect(claimBecomesFree(claimURL),
             "a throw from inside the gate chain must still release the run claim")
 }
 
@@ -182,7 +253,7 @@ private final class CountingSource: MetricSource, @unchecked Sendable {
     #expect(source.worktrees.dropFirst().first == repo.standardizedFileURL.path,
             "the second warm-up must be the candidate side")
 
-    #expect(!RunClaim.isHeld(at: try home.runClaimURL(tag: "t")),
+    #expect(claimBecomesFree(try home.runClaimURL(tag: "t")),
             "a normal run must release its claim")
 
     // And the run was logged.

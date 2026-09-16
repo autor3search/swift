@@ -41,6 +41,25 @@
 // therefore leaks nothing: the file remains, the LOCK does not, and
 // `isHeld` reports the truth without consulting a pid at all.
 //
+// SECOND LIMITATION, MEASURED RATHER THAN ASSUMED: the `O_CLOEXEC` below acts
+// at EXEC, not at FORK. `fork` copies the whole descriptor table, so between a
+// child's fork and its exec the claim's open file description -- and therefore
+// its lock -- has two holders, and the original holder's `close` does not drop
+// it. A claim released in that instant can keep reading as held for roughly a
+// millisecond. Measured here at 0/1500 acquire-release cycles with nothing else
+// spawning and 54/1500 with six threads spawning `git` continuously, in the
+// same process; see docs/run-log.md.
+//
+// This window is strictly CONSERVATIVE and is left as it is on purpose. In
+// 6000 measured cycles the lock was never granted twice at once: the window can
+// only make a free claim look busy (an `eval` that refuses a run it could have
+// taken, and re-runs), never let two evals measure together. Closing it would
+// mean abandoning `flock` for POSIX record locks, which are NOT inherited
+// across fork -- but which are also per-PROCESS, so two evals in one process
+// would stop conflicting at all, and the same-process refusal this whole file
+// exists to guarantee would silently become a no-op. The fail-safe window is
+// the better trade.
+//
 // LIMITATION, STATED HERE AND NOT ONLY IN A REPORT: `flock` is ADVISORY and is
 // not reliable over NFS or SMB. If `AUTOR3SEARCH_SWIFT_STATE_HOME` points at a
 // network mount -- the one place an operator is most likely to put shared
