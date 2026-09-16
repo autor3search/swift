@@ -40,6 +40,14 @@
 // unconditionally when the process dies, however it dies. A killed eval
 // therefore leaks nothing: the file remains, the LOCK does not, and
 // `isHeld` reports the truth without consulting a pid at all.
+//
+// LIMITATION, STATED HERE AND NOT ONLY IN A REPORT: `flock` is ADVISORY and is
+// not reliable over NFS or SMB. If `AUTOR3SEARCH_SWIFT_STATE_HOME` points at a
+// network mount -- the one place an operator is most likely to put shared
+// state, and the one place two machines could genuinely race -- the kernel may
+// grant the lock to two processes at once and this protection silently does
+// nothing. Keep the state home on a local filesystem. The default (the OS cache
+// directory) already is one; an override is the only way to get this wrong.
 import Foundation
 
 #if canImport(Darwin)

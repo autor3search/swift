@@ -217,17 +217,64 @@ private final class CountingSource: MetricSource, @unchecked Sendable {
     #expect(noisy.count == 2)
 }
 
+// MARK: - The working tree must be clean
+
+@Test func aDirtyWorkingTreeIsRefusedBeforeAnythingIsMeasured() throws {
+    // Gate 1 diffs COMMITS; gates 5, 6 and 8 build and measure the WORKING TREE. An
+    // uncommitted, out-of-scope edit would be compiled into the candidate binary and
+    // measured while no gate ever looked at it -- and because the pinned worktree is a
+    // checkout of a commit, it would manufacture a fresh "win" on every later eval,
+    // credited to commits that do not contain it.
+    let (repo, _) = try makeGitFixture()
+    let env = isolatedStateEnv()
+    defer { cleanUpFixture(repo: repo, env: env) }
+    _ = try BaselineRunner.run(repo: repo, tag: "t", env: env)
+
+    // Out of scope (scope is Sources/**), and deliberately NOT committed, so the scope
+    // gate has nothing to look at.
+    try "helper data the benchmark reads\n".write(
+        to: repo.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+
+    // NeverCalledSource records an issue if it is ever sampled.
+    let v = try EvalRunner.run(repo: repo, env: env, source: NeverCalledSource(), now: Date.init)
+    #expect(v.kind == .fail)
+    #expect(v.reason == "dirty_working_tree")
+    #expect(v.warnings.first?.contains("a.txt") == true,
+            "the refusal must name what is dirty, so the operator can act on it")
+
+    // Committing it makes it visible to the scope gate, which then judges it on its
+    // merits -- out of scope, and refused for that reason instead.
+    _ = try Subprocess.run(URL(fileURLWithPath: "/bin/sh"),
+                           ["-c", "git add -A && git commit -q -m helper"],
+                           cwd: repo, env: nil, timeout: 60)
+    let committed = try EvalRunner.run(repo: repo, env: env, source: NeverCalledSource(), now: Date.init)
+    #expect(committed.reason == "out_of_scope")
+}
+
 // MARK: - A refused restore
 
 @Test func aRefusedRestoreIsFatalNeverRetriedAndRecordedAsTainted() throws {
     let (repo, _) = try makeGitFixture()
     let env = isolatedStateEnv()
     defer { cleanUpFixture(repo: repo, env: env) }
+
+    // Widen scope to "**" BEFORE baseline, so the scope gate does not reject the
+    // committed symlink first and the run actually reaches gate 3. The config is
+    // committed before baseline hashes it, so gate 2 is satisfied too.
+    let configURL = repo.appendingPathComponent(".autor3search/config.yaml")
+    var text = try String(contentsOf: configURL, encoding: .utf8)
+    text = text.replacingOccurrences(of: "  - Sources/**", with: "  - '**'")
+    try text.write(to: configURL, atomically: true, encoding: .utf8)
+    _ = try Subprocess.run(URL(fileURLWithPath: "/bin/sh"),
+                           ["-c", "git add -A && git commit -q -m scope"],
+                           cwd: repo, env: nil, timeout: 60)
+
     _ = try BaselineRunner.run(repo: repo, tag: "t", env: env)
     let home = try StateHome(repo: repo, env: env)
 
     // Plant a symlink where a frozen file belongs: the unattended-arbitrary-
-    // file-overwrite attack `FrozenSnapshot.restore` refuses.
+    // file-overwrite attack `FrozenSnapshot.restore` refuses. Committed, so the
+    // tree is clean and gate 2b is not what answers.
     let decoy = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent("decoy-\(UUID().uuidString).swift")
     try "// decoy\n".write(to: decoy, atomically: true, encoding: .utf8)
@@ -235,6 +282,9 @@ private final class CountingSource: MetricSource, @unchecked Sendable {
     let frozen = repo.appendingPathComponent("Tests/LibTests/LibTests.swift")
     try FileManager.default.removeItem(at: frozen)
     try FileManager.default.createSymbolicLink(at: frozen, withDestinationURL: decoy)
+    _ = try Subprocess.run(URL(fileURLWithPath: "/bin/sh"),
+                           ["-c", "git add -A && git commit -q -m link"],
+                           cwd: repo, env: nil, timeout: 60)
 
     // NeverCalledSource: a refusal stops the run before anything is measured.
     let v = try EvalRunner.run(repo: repo, env: env, source: NeverCalledSource(), now: Date.init)

@@ -18,11 +18,17 @@
 //   1. `record.measurementCommit = kept` moves the number the next eval's
 //      worktree-integrity gate checks against.
 //   2. `Worktree.repoint` moves the pinned worktree's checkout, and the
-//      per-eval baseline-side `swift build` below rebuilds that checkout's
-//      binaries. Advancing only the number would leave the worktree still
-//      producing the ORIGINAL commit's binary -- the same stale-baseline bug
-//      one layer down, where `baseline.json` looks correct and every
-//      measurement is still against the run's starting point.
+//      per-eval baseline-side build below rebuilds that checkout's binaries --
+//      specifically `swift build -c release --product <benchmarkTarget>` and
+//      `--product BenchmarkTool`, BY NAME. A bare `swift build -c release` is
+//      not sufficient: it exits 0 while leaving a dependency's executable
+//      product (`BenchmarkTool`) absent, so the binaries gate 8 launches would
+//      not be refreshed, or in the candidate's case would not exist at all.
+//      See `buildMeasurementProducts` for the measurement. Advancing only the
+//      number would leave the worktree still producing the ORIGINAL commit's
+//      binary -- the same stale-baseline bug one layer down, where
+//      `baseline.json` looks correct and every measurement is still against
+//      the run's starting point.
 //
 // STDOUT. Nothing in this file writes to stdout, ever. `--json` is the agent's
 // only channel and must carry exactly one object; the executable target is the
@@ -272,6 +278,50 @@ public enum EvalRunner {
                 """))
         }
 
+        // ---- Gate 2b: the working tree must be clean ----
+        //
+        // THE COASTING BUG THROUGH ANOTHER DOOR. Gate 1 diffs COMMITS
+        // (`frozenCommit..HEAD`), but gates 5, 6 and 8 build and measure the
+        // WORKING TREE. An uncommitted, out-of-scope edit -- a benchmark helper
+        // target, a fixture-data file, anything outside the frozen manifest and
+        // outside `scope` -- is therefore compiled into the candidate binary,
+        // measured, and seen by no gate at all.
+        //
+        // The consequence is worse than one bad measurement. The pinned
+        // worktree is a checkout of a COMMIT, so the edit exists only on the
+        // candidate side and produces a fresh "win" on EVERY subsequent eval,
+        // which `results.tsv` and `baseline.json` then attribute to commits
+        // that do not contain it. That is exactly the failure this file exists
+        // to prevent, reached by a route none of the other gates watch.
+        // `baseline` already refuses a dirty tree for the analogous reason.
+        //
+        // PLACEMENT. The brief asked for this ahead of gate 1. It sits here
+        // instead, between gate 2 and gate 3, for one concrete reason: the
+        // frozen test `configEditIsRejectedByHashMismatch` edits
+        // `.autor3search/config.yaml` WITHOUT committing it and requires the
+        // answer `config_hash_mismatch`, which a dirty-tree check ahead of
+        // gate 2 would pre-empt with a less informative refusal. Nothing is
+        // lost: gates 1 and 2 are pure reads, so this still runs before the
+        // first byte is written (gate 3) and long before the first byte is
+        // built (gate 5) or measured (gate 8). Checking BEFORE the restore also
+        // avoids a false positive -- restore deliberately rewrites frozen files
+        // and would itself dirty the tree in a configuration whose `scope`
+        // covers the frozen directories.
+        if try !git.isClean() {
+            let status = (try? git.run(["status", "--porcelain"])) ?? ""
+            return fail(GateFailure(reason: "dirty_working_tree", detail: """
+                the working tree has uncommitted changes, and eval refuses to measure one. The \
+                scope gate inspects COMMITS (frozenCommit..HEAD) while the build, test and \
+                measurement steps compile the WORKING TREE, so an uncommitted edit would be \
+                measured but never gated -- and because the pinned baseline worktree is a \
+                checkout of a commit, such an edit exists only on the candidate side and would \
+                manufacture a fresh "win" on every later experiment, credited to commits that do \
+                not contain it. Commit the change (so the scope gate can judge it) or discard it. \
+                git status --porcelain:
+                \(String(status.prefix(4000)))
+                """))
+        }
+
         // ---- Gates 3 and 4: restore frozen files, reject new ones ----
         //
         // The manifest is LOADED from what baseline persisted -- never
@@ -331,6 +381,22 @@ public enum EvalRunner {
             return fail(GateFailure(reason: "build_failed",
                                     detail: String(build.stderr.suffix(4000))))
         }
+        // A BARE `swift build` is NOT enough to put the two executables gate 8
+        // launches on disk. Measured against a package that depends on
+        // ordo-one/benchmark: after deleting both binaries, `swift build -c
+        // release` exits 0 and leaves the benchmark target present but
+        // `BenchmarkTool` ABSENT -- a bare build covers the root package's own
+        // products and targets, and a dependency's executable product is not in
+        // that set. `BenchmarkToolSource` then cannot launch
+        // `<repo>/.build/release/BenchmarkTool` and gate 8 crashes on the first
+        // real repository. Fail-closed (it can never produce a wrong KEEP) but
+        // the tool would simply not work, so both products are built by name.
+        if let failure = try buildMeasurementProducts(
+            swift: swift, in: repo, benchmarkTarget: config.benchmarkTarget, timeout: timeout,
+            reasonPrefix: "benchmark_build",
+            where: "the candidate repository at \(repo.path)") {
+            return fail(failure)
+        }
 
         let tests = try Subprocess.run(swift, ["test"], cwd: repo, timeout: timeout)
         if tests.timedOut {
@@ -385,6 +451,18 @@ public enum EvalRunner {
                 \(record.measurementCommit)) no longer builds, so there is nothing to measure \
                 the candidate against: \(String(baselineBuild.stderr.suffix(4000)))
                 """))
+        }
+        // Same reason as on the candidate side, and mirroring
+        // `BaselineRunner.warmBuild`: the bare build above does not produce a
+        // dependency's executable product, so `BenchmarkTool` would be missing
+        // from this worktree's `.build` too -- and after a KEEP re-points the
+        // worktree, the benchmark target's binary there is the PREVIOUS commit's
+        // until it is rebuilt by name.
+        if let failure = try buildMeasurementProducts(
+            swift: swift, in: worktree, benchmarkTarget: config.benchmarkTarget, timeout: timeout,
+            reasonPrefix: "baseline_benchmark_build",
+            where: "the pinned measurement worktree at \(worktree.path) (commit \(record.measurementCommit))") {
+            return fail(failure)
         }
         // SwiftPM can leave files outside `.build` behind (a freshly written
         // `Package.resolved` for a package with a source-control dependency),
@@ -462,6 +540,57 @@ public enum EvalRunner {
         }
 
         return verdict
+    }
+
+    // MARK: - Building what gate 8 actually launches
+
+    /// Builds, BY NAME, the two executables `BenchmarkToolSource` invokes from
+    /// `<directory>/.build/release/`: the configured benchmark target and
+    /// `BenchmarkTool` itself.
+    ///
+    /// Measured, against a package depending on `ordo-one/benchmark`:
+    ///
+    /// ```
+    /// $ rm .build/release/BenchmarkTool .build/release/Bench
+    /// $ swift build -c release                        # exit 0
+    ///   Bench present, BenchmarkTool ABSENT
+    /// $ swift build -c release --product BenchmarkTool # exit 0
+    ///   BenchmarkTool present
+    /// ```
+    ///
+    /// `BenchmarkTool` is a product of the *dependency*, and a bare build
+    /// builds the root package's own products and targets. Relying on the bare
+    /// build alone leaves gate 8 with nothing to launch.
+    ///
+    /// Returns the gate failure to report, or nil when both products are on
+    /// disk. `timedOut` is branched on before the exit code, for the same
+    /// reason as everywhere else in this file: a signalled child reports
+    /// `128 + signal`, so no specific code identifies a kill.
+    static func buildMeasurementProducts(
+        swift: URL, in directory: URL, benchmarkTarget: String, timeout: TimeInterval,
+        reasonPrefix: String, where description: String
+    ) throws -> GateFailure? {
+        for product in [benchmarkTarget, "BenchmarkTool"] {
+            let result = try Subprocess.run(
+                swift, ["build", "-c", "release", "--product", product],
+                cwd: directory, timeout: timeout)
+            if result.timedOut {
+                return GateFailure(reason: "\(reasonPrefix)_timed_out", detail: """
+                    building product \(product) in \(description) did not finish within \
+                    timeout_seconds (\(Int(timeout))s) and its process tree was killed.
+                    """)
+            }
+            guard result.exitCode == 0 else {
+                return GateFailure(reason: "\(reasonPrefix)_failed", detail: """
+                    product \(product) could not be built in \(description), so there is nothing \
+                    for the measurement step to launch. Gate 8 runs \
+                    <...>/.build/release/BenchmarkTool against <...>/.build/release/\
+                    \(benchmarkTarget), and a plain `swift build` does not produce a \
+                    dependency's executable product. \(String(result.stderr.suffix(4000)))
+                    """)
+            }
+        }
+        return nil
     }
 
     // MARK: - Warm-up

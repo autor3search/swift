@@ -357,6 +357,26 @@ private func describeJSON(targets: [(name: String, path: String, type: String, p
     }
 }
 
+@Test func gitignoreCoversEveryFileTheHarnessWritesIntoTheRepository() throws {
+    // Not cosmetic, and not only .build/. `eval` appends to results.tsv on every
+    // experiment, so from the second experiment onward it is an untracked file in the
+    // repository; an agent committing with `git add -A` sweeps it into its commit, and
+    // eval's own scope gate -- which diffs the commit against frozenCommit -- then
+    // rejects that commit as out_of_scope for a file eval itself wrote. Every experiment
+    // after the first would fail. spec.md 9 lists both results.tsv and run.log as
+    // gitignored by init.
+    let dir = tempDir()
+    try withTempDirectories(dir) {
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try InitRunner.ensureGitignoreCoversBuildOutput(repo: dir)
+        let text = try String(contentsOf: dir.appendingPathComponent(".gitignore"), encoding: .utf8)
+        let lines = text.split(separator: "\n").map(String.init)
+        #expect(lines.contains(".build/"))
+        #expect(lines.contains("results.tsv"), "eval writes results.tsv into the repository under test")
+        #expect(lines.contains("run.log"), "run.log is the other in-repository harness output")
+    }
+}
+
 @Test func gitignoreIsIdempotentAcrossRepeatedCalls() throws {
     let dir = tempDir()
     try withTempDirectories(dir) {

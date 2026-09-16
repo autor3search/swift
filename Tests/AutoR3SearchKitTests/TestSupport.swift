@@ -19,9 +19,23 @@ import Testing
 /// the repo root, and without this entry a second `BaselineRunner.run` against the same
 /// fixture (as `refusesAReusedTag` performs) would trip `dirtyTree` instead of
 /// `tagInUse` -- the test would still pass, but for the wrong reason.
+///
+/// The package also declares two trivial EXECUTABLE products, `Bench` (the name
+/// `.autor3search/config.yaml` below gives as `benchmark_target`) and `BenchmarkTool`.
+/// They exist because `eval` builds both by name -- `swift build -c release --product
+/// <benchmarkTarget>` and `--product BenchmarkTool` -- before gate 8, since a bare
+/// `swift build` exits 0 while leaving a dependency's executable product absent. Without
+/// them every full-chain test would stop at `benchmark_build_failed`. They are never
+/// executed by the tests (measurement is injected through `MetricSource`); what matters
+/// is only that the two product names resolve and build. Neither carries a `Benchmark`
+/// product dependency, so `frozenDirectories` is still exactly `["Tests/LibTests"]`.
 func makeGitFixture() throws -> (URL, Git) {
     let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: dir.appendingPathComponent("Sources/Lib"),
+                                            withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: dir.appendingPathComponent("Sources/Bench"),
+                                            withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: dir.appendingPathComponent("Sources/BenchmarkTool"),
                                             withIntermediateDirectories: true)
     try FileManager.default.createDirectory(at: dir.appendingPathComponent("Tests/LibTests"),
                                             withIntermediateDirectories: true)
@@ -29,6 +43,10 @@ func makeGitFixture() throws -> (URL, Git) {
                                             withIntermediateDirectories: true)
     try "public func f() -> Int { 1 }".write(to: dir.appendingPathComponent("Sources/Lib/Lib.swift"),
                                              atomically: true, encoding: .utf8)
+    try "print(\"bench\")\n".write(to: dir.appendingPathComponent("Sources/Bench/main.swift"),
+                                   atomically: true, encoding: .utf8)
+    try "print(\"tool\")\n".write(to: dir.appendingPathComponent("Sources/BenchmarkTool/main.swift"),
+                                  atomically: true, encoding: .utf8)
     try """
     import Testing
     @testable import Lib
@@ -44,8 +62,14 @@ func makeGitFixture() throws -> (URL, Git) {
 
     let package = Package(
         name: "fixture",
+        products: [
+            .executable(name: "Bench", targets: ["Bench"]),
+            .executable(name: "BenchmarkTool", targets: ["BenchmarkTool"]),
+        ],
         targets: [
             .target(name: "Lib"),
+            .executableTarget(name: "Bench"),
+            .executableTarget(name: "BenchmarkTool"),
             .testTarget(name: "LibTests", dependencies: ["Lib"]),
         ]
     )
