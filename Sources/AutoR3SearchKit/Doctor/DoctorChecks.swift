@@ -666,9 +666,14 @@ public enum DoctorChecks {
     /// `environmentReadCount` UNLESS a strong-marker line sits within
     /// `nearbyLineWindow` lines of it in the same file (then it is treated as
     /// already covered by that strong hit, not counted again separately).
-    /// Deliberately a plain substring scan, not an AST walk or even
-    /// comment/string stripping -- see `conditionalTestGating`'s doc comment
-    /// on why this is a heuristic, not a guarantee.
+    /// Matching itself runs against `file.matchLines` (comments and string
+    /// literals blanked -- see `SwiftFile`), so a marker mentioned only in
+    /// prose or a string cannot produce a hit; a marker inside a comment
+    /// cannot disable a test, so filtering it out loses no real signal, only
+    /// noise (this is the fix-round-2 response to the review's "cry wolf"
+    /// finding: before it, this scan flagged its own doc comments). The
+    /// DISPLAYED snippet still comes from `file.rawLines`, so a genuine hit
+    /// still reads as real, unmangled source.
     private static func scanTestDirsForConditionalGating(
         repo: URL, testDirs: [String]
     ) -> (strongHits: [String], environmentReadCount: Int) {
@@ -676,16 +681,16 @@ public enum DoctorChecks {
         var environmentReadCount = 0
         for dir in testDirs.sorted() {
             for file in swiftFiles(repo: repo, dir: dir) {
-                let lines = file.lines
                 var strongLineIndices: [Int] = []
-                for (index, line) in lines.enumerated() {
-                    for marker in strongGatingMarkers where line.contains(marker) {
-                        strongHits.append("\(file.relativePath):\(index + 1): \(line.trimmingCharacters(in: .whitespaces))")
+                for (index, matchLine) in file.matchLines.enumerated() {
+                    for marker in strongGatingMarkers where matchLine.contains(marker) {
+                        let shown = file.rawLines[index].trimmingCharacters(in: .whitespaces)
+                        strongHits.append("\(file.relativePath):\(index + 1): \(shown)")
                         strongLineIndices.append(index)
                         break
                     }
                 }
-                for (index, line) in lines.enumerated() where line.contains(environmentMarker) {
+                for (index, matchLine) in file.matchLines.enumerated() where matchLine.contains(environmentMarker) {
                     let coveredByAStrongHit = strongLineIndices.contains { abs($0 - index) <= nearbyLineWindow }
                     if !coveredByAStrongHit {
                         environmentReadCount += 1
@@ -701,14 +706,18 @@ public enum DoctorChecks {
     /// `strongGatingMarkers`. This is what catches a custom `ConditionTrait`
     /// defined in in-scope source and referenced by name from a frozen test,
     /// where the literal marker never appears in the test file at all.
+    /// Matches against `file.matchLines` for the same reason as the test-dir
+    /// scan above -- this is the directory most likely to carry doc comments
+    /// ABOUT the markers this check itself looks for (as `DoctorChecks.swift`
+    /// demonstrates), so skipping comment/string content here matters most.
     private static func scanSourceDirsForConditionalGating(repo: URL, sourceDirs: [String]) -> [String] {
         var hits: [String] = []
         for dir in sourceDirs.sorted() {
             for file in swiftFiles(repo: repo, dir: dir) {
-                for (index, line) in file.lines.enumerated() {
-                    for marker in strongGatingMarkers where line.contains(marker) {
-                        let trimmed = line.trimmingCharacters(in: .whitespaces)
-                        hits.append("\(file.relativePath):\(index + 1): \(trimmed) [non-test source, not a frozen file]")
+                for (index, matchLine) in file.matchLines.enumerated() {
+                    for marker in strongGatingMarkers where matchLine.contains(marker) {
+                        let shown = file.rawLines[index].trimmingCharacters(in: .whitespaces)
+                        hits.append("\(file.relativePath):\(index + 1): \(shown) [non-test source, not a frozen file]")
                         break
                     }
                 }
@@ -717,9 +726,20 @@ public enum DoctorChecks {
         return hits
     }
 
+    /// `rawLines` is exactly the file's own text, one entry per line, used
+    /// only for what gets DISPLAYED to a human. `matchLines` is the same
+    /// file's text with every comment and string-literal's contents blanked
+    /// to spaces (via `UnsafeDetector.stripCommentsAndStrings`, reused
+    /// as-is rather than re-implemented -- it already exists, is already
+    /// tested against nested block comments, raw/multiline strings, and
+    /// line-count preservation, and solves precisely this class of problem
+    /// for a different check in this same module), used only for MATCHING.
+    /// The two arrays are always the same length and index-aligned, because
+    /// `stripCommentsAndStrings` preserves line structure by construction.
     private struct SwiftFile {
         let relativePath: String
-        let lines: [String]
+        let rawLines: [String]
+        let matchLines: [String]
     }
 
     /// Every `.swift` file under `repo/dir`, each pre-split into lines once
@@ -740,8 +760,20 @@ public enum DoctorChecks {
             let relativePath = fileURL.path.hasPrefix(repo.path)
                 ? String(fileURL.path.dropFirst(repo.path.count + 1))
                 : fileURL.path
-            let lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
-            return SwiftFile(relativePath: relativePath, lines: lines)
+            let rawLines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            let stripped = UnsafeDetector.stripCommentsAndStrings(text)
+            let matchLines = stripped.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            // Defensive, not expected to ever trip: `stripCommentsAndStrings`
+            // preserves line count by construction (bound by
+            // `stripCommentsAndStringsPreservesLineCount` in
+            // `UnsafeDetectorTests`). If it ever didn't, matching against a
+            // misaligned array would be silently wrong, which is worse than
+            // falling back to matching on the raw, unstripped lines for this
+            // one file -- i.e. the pre-fix-round-2 behaviour, not a crash.
+            guard matchLines.count == rawLines.count else {
+                return SwiftFile(relativePath: relativePath, rawLines: rawLines, matchLines: rawLines)
+            }
+            return SwiftFile(relativePath: relativePath, rawLines: rawLines, matchLines: matchLines)
         }
     }
 

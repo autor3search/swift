@@ -244,3 +244,62 @@ import Foundation
     #expect(gating?.detail.contains("Lib.swift") == true, "the marker lives in Sources, not the test file")
     #expect(gating?.detail.contains("non-test source") == true)
 }
+
+// Finding (review, fix round 2): a marker mentioned only in a `///`/`//`
+// comment must not produce a hit -- this exact pattern flagged
+// `DoctorChecks.swift`'s own doc comments (17 hits against this repository,
+// 15 of them this file's prose about the markers it scans for) before this
+// fix. A marker inside a comment cannot disable a test, so filtering it
+// loses no real signal, only noise. The same marker in real code must still
+// be caught -- both bound in one fixture so the test would fail without the
+// comment filter (comment-only hit leaking through) AND would fail if the
+// filter over-reached and also ate real code (no hit at all).
+
+@Test func commentOnlyMarkerProducesNoHitButTheSameMarkerInRealCodeStillDoes() throws {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    try FileManager.default.createDirectory(at: dir.appendingPathComponent("Sources/Lib"),
+                                            withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: dir.appendingPathComponent("Tests/LibTests"),
+                                            withIntermediateDirectories: true)
+    // Comment-only mention of the marker: must NOT produce a hit.
+    try """
+        /// This file documents .enabled(if:) but never actually uses it.
+        public func f() -> Int { 1 }
+        """.write(to: dir.appendingPathComponent("Sources/Lib/Lib.swift"), atomically: true, encoding: .utf8)
+    // The same marker, in real code: must still produce a hit.
+    try """
+        import Testing
+        @testable import Lib
+
+        @Test(.enabled(if: true)) func fReturnsOne() {
+            #expect(f() == 1)
+        }
+        """.write(to: dir.appendingPathComponent("Tests/LibTests/LibTests.swift"),
+                  atomically: true, encoding: .utf8)
+    try """
+        // swift-tools-version: 6.0
+        import PackageDescription
+        let package = Package(
+            name: "fixture",
+            targets: [
+                .target(name: "Lib"),
+                .testTarget(name: "LibTests", dependencies: ["Lib"]),
+            ]
+        )
+        """.write(to: dir.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+
+    let r = try Subprocess.run(URL(fileURLWithPath: "/bin/sh"), ["-c", """
+        git init -q . && git config user.name Test && git config user.email t@example.com \
+        && git add -A && git commit -q -m one
+        """], cwd: dir, env: nil, timeout: 60)
+    #expect(r.exitCode == 0)
+
+    let findings = DoctorChecks.all(repo: dir)
+    let gating = findings.first { $0.title == "Conditionally-gated tests" }
+    #expect(gating?.level == .warn)
+    #expect(gating?.detail.contains("Tests/LibTests/LibTests.swift") == true,
+             "the real-code marker must still be caught")
+    #expect(gating?.detail.contains("Sources/Lib/Lib.swift") == false,
+             "a marker mentioned only in a comment must not be flagged")
+}
