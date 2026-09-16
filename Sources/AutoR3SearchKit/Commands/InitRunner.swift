@@ -513,19 +513,32 @@ public enum InitRunner {
         return config
     }
 
-    /// Idempotently ensures `.gitignore` covers `.build/` — the directory `swift
-    /// build`/`swift package benchmark` populate inside the repository under test
-    /// while this tool measures it. Keyed on a marker comment rather than a raw
+    /// Idempotently ensures `.gitignore` covers every file this tool writes
+    /// inside the repository under test. Keyed on a marker comment rather than a raw
     /// substring match, so a re-run of `init` (with `--force`) never appends a
     /// duplicate block, whether `.gitignore` did not exist, already existed without
     /// this entry, or already has it from a previous `init`.
+    ///
+    /// Three entries, and the last two are not cosmetic (spec.md 9: "The only
+    /// harness outputs inside the repository are `results.tsv` ... and `run.log`
+    /// ..., both gitignored by `init`"):
+    ///
+    /// - `.build/` — what `swift build` populates while this tool measures.
+    /// - `results.tsv` — `eval` appends a row to this on every experiment, so from
+    ///   the second experiment onward it is an untracked file sitting in the
+    ///   repository. An agent that commits with `git add -A` would sweep it into
+    ///   its commit, and `eval`'s scope gate — which compares the commit against
+    ///   `frozenCommit` — would then reject that commit as `out_of_scope` for a
+    ///   file the harness itself wrote. Ignoring it keeps the harness's own log out
+    ///   of the diff it judges.
+    /// - `run.log` — the same argument, for subprocess transcripts.
     private static let gitignoreMarker = "# autor3search-swift"
 
     /// Not `private`: exercised directly by `InitRunnerTests` so idempotence can be
     /// verified without a full, toolchain-and-possibly-network-dependent `run()`.
     static func ensureGitignoreCoversBuildOutput(repo: URL) throws {
         let url = repo.appendingPathComponent(".gitignore")
-        let block = "\(gitignoreMarker)\n.build/\n"
+        let block = "\(gitignoreMarker)\n.build/\nresults.tsv\nrun.log\n"
         guard FileManager.default.fileExists(atPath: url.path) else {
             try block.write(to: url, atomically: true, encoding: .utf8)
             return
