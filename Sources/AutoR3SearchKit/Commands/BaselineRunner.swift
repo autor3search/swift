@@ -99,6 +99,12 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
     /// because the scan could not run protects nothing, and reports success.
     case manifestInventoryFailed(String)
 
+    /// The out-of-scope tree inventory could not be built. Fatal for exactly
+    /// the same reason `manifestInventoryFailed` is: a baseline that records
+    /// an EMPTY inventory because the walk could not run protects nothing and
+    /// reports success.
+    case treeInventoryFailed(String)
+
     public var description: String {
         switch self {
         case .dirtyTree:
@@ -201,6 +207,17 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
             Recording an empty inventory because the scan could not run would protect nothing and \
             still report success.
             """
+        case .treeInventoryFailed(let why):
+            return """
+            refusing to establish a baseline: could not inventory the files outside this \
+            repository's configured scope (\(why)).
+
+            baseline records the SHA-256 of every file the agent is not allowed to change, and \
+            eval walks the disk and compares -- that is what stops an out-of-scope benchmark \
+            helper being edited behind git's back with `git update-index --assume-unchanged`. \
+            Recording an empty inventory because the walk could not run would protect nothing and \
+            still report success.
+            """
         }
     }
 }
@@ -278,6 +295,176 @@ public enum BaselineRunner {
             let relative = String(full.dropFirst(root.path.count + 1))
             guard ScopeGate.isManifestPath(relative) else { continue }
             inventory[relative] = try sha256File(item)
+        }
+        return inventory
+    }
+
+    // =====================================================================
+    // MARK: - The out-of-scope tree inventory
+    // =====================================================================
+
+    /// The paths `autor3search-swift` itself writes into the repository under
+    /// test and tells `init` to gitignore. They are the harness's own output,
+    /// not the agent's work, so they are excluded from the on-disk inventory
+    /// (their bytes change on every eval by design) and they are the ONLY
+    /// present-but-ignored paths `eval`'s dirty-tree gate tolerates.
+    ///
+    /// This is an ALLOWLIST, spelled out here once and consumed by both
+    /// `treeInventory` and `EvalRunner`'s gate 2b, and it deliberately
+    /// duplicates nothing from `.gitignore`: the ignore file is written by
+    /// `init` into the repository, which means the agent can edit it. An
+    /// allowlist derived from `.gitignore` would let the agent extend its own
+    /// exemptions, which is precisely the bypass being closed.
+    static let harnessOutputFiles: [String] = ["results.tsv", "run.log"]
+
+    /// As `harnessOutputFiles`, for the two directories. Matched as "this
+    /// directory and everything under it".
+    static let harnessOutputDirectories: [String] = [".build", ".autor3search/profiles"]
+
+    /// Directories never walked, and never inventoried: git's own object
+    /// store, and SwiftPM's build directory.
+    ///
+    /// `.build` is not politeness. It holds every dependency's checkout and
+    /// every intermediate SwiftPM rewrites at will, so inventorying it would
+    /// turn every eval into a rejection -- and hashing a warm build directory
+    /// is hundreds of megabytes of I/O per eval.
+    static let neverWalkedDirectories: Set<String> = [".git", ".build"]
+
+    /// Whether `relative` is one of the harness's own outputs.
+    ///
+    /// CASE-SENSITIVE, on every platform, and that is the safe direction on a
+    /// case-insensitive filesystem. macOS's default APFS is
+    /// case-insensitive-but-PRESERVING, so the enumerator always reports the
+    /// real on-disk spelling: if `.build` already exists, a write to `.BUILD/x`
+    /// lands in it and comes back spelled `.build/x`, which matches. What a
+    /// case-INSENSITIVE comparison would add is the ability to create a
+    /// genuinely new directory whose name differs from an allowlisted one only
+    /// by case and have it silently exempted -- an over-match, in a check whose
+    /// every over-match is a hole. Under-matching only ever produces a loud
+    /// refusal naming the path.
+    ///
+    /// A trailing slash is tolerated because `git status --ignored` collapses a
+    /// wholly-ignored directory into a single `dir/` record.
+    static func isHarnessOutput(_ relative: String) -> Bool {
+        var path = relative
+        while path.hasSuffix("/") { path.removeLast() }
+        if harnessOutputFiles.contains(path) { return true }
+        return harnessOutputDirectories.contains { path == $0 || path.hasPrefix($0 + "/") }
+    }
+
+    /// What `treeInventory` records for one directory entry.
+    ///
+    /// Only a REGULAR file is hashed. A symbolic link records its destination
+    /// instead of the bytes it points at, and anything else (a fifo, a socket,
+    /// a device node) records its type. Two reasons, both load-bearing:
+    ///
+    /// - Reading THROUGH a link would let the recorded value describe a file
+    ///   outside the repository, so swapping the link's target would change
+    ///   what is compiled without changing the recorded value. Recording the
+    ///   destination makes the swap itself the change.
+    /// - `Data(contentsOf:)` on a fifo blocks forever. An unattended overnight
+    ///   harness that can be hung by `mkfifo` is a denial of service with a
+    ///   one-line setup.
+    static func treeEntryDigest(_ url: URL) throws -> String {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else {
+            throw BaselineError.missingFileForHash(url.path)
+        }
+        switch info.st_mode & S_IFMT {
+        case S_IFREG:
+            return try sha256File(url)
+        case S_IFLNK:
+            let destination = (try? FileManager.default.destinationOfSymbolicLink(atPath: url.path))
+                ?? "<unreadable>"
+            return "symlink:" + destination
+        default:
+            return "special:\(info.st_mode & S_IFMT)"
+        }
+    }
+
+    /// EVERY file in the repository that `scope` does NOT cover, as a relative
+    /// path -> digest map. `baseline` records this; `eval`'s gate 2c walks the
+    /// disk again and compares.
+    ///
+    /// THE HOLE THIS CLOSES. Gate 1 enforces `scope` purely through GIT's path
+    /// accounting -- `git diff --name-only frozenCommit HEAD` -- and the agent
+    /// owns git's view of its own repository:
+    ///
+    ///     git update-index --assume-unchanged Benchmarks/Bench/Bench.swift
+    ///     <edit it: repeatCount 1750 -> 1>
+    ///     <commit an innocent in-scope source change>
+    ///
+    /// git then reports neither a changed path (gate 1 sees only the in-scope
+    /// file) nor a dirty tree (gate 2b sees nothing), while `swift build`
+    /// compiles the edited helper. Measured against the demo package, that one
+    /// edit produced `eval rc=0, ratio 0.000742`. The project's own README
+    /// claimed "`scope` closes the benchmark-helper hole"; it did not, because
+    /// `scope` was only ever enforced against paths git chose to report.
+    ///
+    /// The existing manifest inventory closes the same door for MANIFESTS
+    /// only. This is the general form: anything outside `scope` is compared by
+    /// its bytes on disk, which no index flag, ignore rule or `.git/info/exclude`
+    /// can talk out of noticing.
+    ///
+    /// It also closes the CASE-VARIANT MANIFEST. `ScopeGate.isManifestPath`
+    /// matches case-sensitively -- correct for git-reported paths, and
+    /// deliberately so -- but APFS is case-insensitive, so a file committed as
+    /// `PACKAGE@SWIFT-6.4.SWIFT` is opened by SwiftPM when it looks for
+    /// `Package@swift-6.4.swift`. `isManifestPath` does not match that
+    /// spelling, so the manifest inventory never records it; this inventory
+    /// does not care what it is called, and reports it as an EXTRA file.
+    ///
+    /// EXCLUSIONS, and why each is safe:
+    ///
+    /// - `.git/` and `.build/` (`neverWalkedDirectories`): git's own store,
+    ///   and SwiftPM's, neither of which is source.
+    /// - `results.tsv`, `run.log`, `.autor3search/profiles/`: the harness's own
+    ///   output, which changes on every eval by design.
+    /// - Anything `scope` matches: in-scope content is what the agent is
+    ///   *supposed* to change. Gate 1 judges those by path and gate 2b requires
+    ///   them to be committed.
+    ///
+    /// SCOPE MATCHING IS CASE-SENSITIVE, via `ScopeGate.matches`, the same one
+    /// predicate gate 1 uses -- so "in scope" has exactly one definition here.
+    /// On a case-insensitive filesystem that is again the safe direction: the
+    /// enumerator reports the real on-disk spelling, so a path that folds onto
+    /// an existing in-scope directory arrives already spelled the in-scope way,
+    /// while a genuinely new `SOURCES/` next to no `Sources/` fails to match
+    /// and is inventoried rather than exempted.
+    ///
+    /// Path comparison between the recorded map and the live one is ordinary
+    /// Swift `String` equality, which compares by canonical equivalence -- an
+    /// NFC and an NFD spelling of the same filename are the same key. That is
+    /// the behaviour `ScopeGate` and `FrozenSnapshot.manifest` already rely on;
+    /// canonical equivalence never folds two DIFFERENT filenames together, so
+    /// it cannot over-match.
+    static func treeInventory(repo: URL, scope: [String]) throws -> [String: String] {
+        let root = repo.standardizedFileURL
+        guard let walker = FileManager.default.enumerator(
+            at: root, includingPropertiesForKeys: [.isDirectoryKey], options: []
+        ) else {
+            throw BaselineError.treeInventoryFailed("could not enumerate \(root.path)")
+        }
+
+        var inventory: [String: String] = [:]
+        for case let item as URL in walker {
+            let name = item.lastPathComponent
+            // `.isDirectoryKey` follows links, so a SYMLINK to a directory
+            // would report true and be skipped silently. lstat first.
+            var info = stat()
+            let statted = lstat(item.path, &info) == 0
+            let isRealDirectory = statted && (info.st_mode & S_IFMT) == S_IFDIR
+            if isRealDirectory, neverWalkedDirectories.contains(name) {
+                walker.skipDescendants()
+                continue
+            }
+            guard !isRealDirectory else { continue }
+            let full = item.standardizedFileURL.path
+            guard full.hasPrefix(root.path + "/") else { continue }
+            let relative = String(full.dropFirst(root.path.count + 1))
+            guard !isHarnessOutput(relative) else { continue }
+            guard !scope.contains(where: { ScopeGate.matches(relative, glob: $0) }) else { continue }
+            inventory[relative] = try treeEntryDigest(item)
         }
         return inventory
     }
@@ -463,6 +650,23 @@ public enum BaselineRunner {
         // moment the tree was verified clean rather than whatever the warm
         // build left lying around.
         let manifestSHA256 = try manifestInventory(repo: repo)
+        // ...and the general form of the same idea: every file OUTSIDE
+        // `scope`, hashed from disk. See `treeInventory`.
+        //
+        // `scope` is read from the live config here because that config's own
+        // bytes are pinned by `configSHA256` two lines above, and `eval`
+        // verifies that hash (gate 2) BEFORE it uses `scope` for this
+        // comparison (gate 2c). So the scope this inventory is taken at and
+        // the scope it is checked at are provably the same list.
+        //
+        // A config that cannot be parsed yields an EMPTY scope, which
+        // inventories the whole tree -- the fail-closed direction. `baseline`
+        // does not refuse here on that account: `eval` rejects an unparseable
+        // config outright (`config_unreadable`), so the run cannot proceed on
+        // one either way, and turning a config typo into a `baseline` crash
+        // with a message about inventories would be the less useful diagnosis.
+        let scope = (try? Config.load(repo.appendingPathComponent(".autor3search/config.yaml")))?.scope ?? []
+        let treeSHA256 = try treeInventory(repo: repo, scope: scope)
 
         // Captured BEFORE touching the branch: creating or checking out the
         // run branch must never change which commit gets frozen.
@@ -581,7 +785,8 @@ public enum BaselineRunner {
             packageSwiftSHA256: packageSwiftSHA256,
             packageResolvedSHA256: packageResolvedPin,
             toolVersion: BuildInfo.version,
-            manifestSHA256: manifestSHA256)
+            manifestSHA256: manifestSHA256,
+            treeSHA256: treeSHA256)
         try record.save(to: recordURL)
         return record
     }

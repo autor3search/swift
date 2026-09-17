@@ -41,6 +41,33 @@ public struct BaselineRecord: Codable, Equatable, Sendable {
     /// `EvalRunner.manifestIntegrityFailure`.
     public var manifestSHA256: [String: String]?
 
+    /// EVERY file in the repository that the config's `scope` does NOT cover,
+    /// relative path -> SHA-256 of its bytes (or, for a symbolic link, its
+    /// destination; see `BaselineRunner.treeEntryDigest`). `.git/`, `.build/`
+    /// and the harness's own outputs are excluded.
+    ///
+    /// WHY IT IS NOT ENOUGH TO ENFORCE `scope` THROUGH GIT. Gate 1 asks `git
+    /// diff --name-only frozenCommit HEAD` which paths changed, and gate 2b
+    /// asks `git status` whether anything is uncommitted. Both answers come
+    /// out of git, and the agent owns git's view of its own repository: `git
+    /// update-index --assume-unchanged <an out-of-scope helper>` removes the
+    /// file from both answers while `swift build` keeps compiling it.
+    /// Demonstrated on the demo package by setting a benchmark helper's
+    /// `repeatCount` from 1750 to 1: `eval rc=0, ratio 0.000742`, with no gate
+    /// raising a word. `manifestSHA256` closed that door for MANIFESTS; this
+    /// is the general form, and it is also what catches a manifest under a
+    /// case-variant spelling (`PACKAGE@SWIFT-6.4.SWIFT`) that
+    /// `ScopeGate.isManifestPath` -- deliberately case-sensitive -- does not
+    /// recognise, but a case-insensitive APFS hands to SwiftPM anyway.
+    ///
+    /// OPTIONAL for the same reason `manifestSHA256` is, with the same ruling:
+    /// a record written before this field existed decodes as `nil`, and `nil`
+    /// means "this baseline has no inventory", which `eval` REFUSES
+    /// (`baseline_predates_tree_inventory`). It must never be read as "the
+    /// inventory is empty", which would silently restore the hole for exactly
+    /// the runs that predate the fix.
+    public var treeSHA256: [String: String]?
+
     public init(
         tag: String,
         frozenCommit: String,
@@ -49,9 +76,11 @@ public struct BaselineRecord: Codable, Equatable, Sendable {
         packageSwiftSHA256: String,
         packageResolvedSHA256: String,
         toolVersion: String,
-        manifestSHA256: [String: String]? = nil
+        manifestSHA256: [String: String]? = nil,
+        treeSHA256: [String: String]? = nil
     ) {
         self.manifestSHA256 = manifestSHA256
+        self.treeSHA256 = treeSHA256
         self.tag = tag
         self.frozenCommit = frozenCommit
         self.measurementCommit = measurementCommit

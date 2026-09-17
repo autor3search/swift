@@ -61,6 +61,110 @@ public struct Git: Sendable {
         try run(["status", "--porcelain"]).isEmpty
     }
 
+    /// One line of `git status --porcelain`.
+    ///
+    /// `code` is the raw two-character XY field, kept verbatim rather than
+    /// decoded into an enum: the only distinction any caller here needs is
+    /// "is this `!!`", and reproducing git's full status algebra would be a
+    /// second, subtly different definition of the same thing.
+    public struct StatusEntry: Sendable, Equatable {
+        /// The two-character XY status field, e.g. `" M"`, `"??"`, `"!!"`.
+        public let code: String
+
+        /// Repository-relative path, byte-exact and unquoted (see `status`).
+        ///
+        /// A TRAILING SLASH IS SIGNIFICANT and is preserved. `git status
+        /// --ignored` (traditional mode, the default) collapses a directory
+        /// every one of whose entries is ignored into a single record for the
+        /// directory -- `!! .build/` rather than one line per object file.
+        /// Callers must therefore match a trailing-slash path as "this
+        /// directory and everything in it", not as a file name.
+        public let path: String
+
+        /// For a rename or copy (`R`/`C`), the path it came from. git emits
+        /// that as a SECOND NUL-terminated record with no status prefix of
+        /// its own, so a parser that does not know to consume it reads the
+        /// old path as a malformed entry.
+        public let originalPath: String?
+
+        /// `!!` -- present on disk, and hidden from an ordinary `git status`
+        /// by `.gitignore`, `.git/info/exclude`, a global excludes file or
+        /// `core.excludesFile`. All four are ignore sources; none of them is
+        /// visible in `git status --porcelain` without `--ignored`.
+        public var isIgnored: Bool { code == "!!" }
+    }
+
+    /// `git status --porcelain`, parsed, optionally INCLUDING ignored files.
+    ///
+    /// WHY `--ignored` EXISTS AS AN OPTION HERE. `git status --porcelain`
+    /// omits ignored files entirely, and that omission was a live bypass of
+    /// the dirty-tree gate. The agent under measurement controls the ignore
+    /// rules: it can commit an in-scope `Sources/Demo/.gitignore` naming
+    /// `*.gen.swift` (in scope, not a manifest, so the scope gate passes),
+    /// or write `.git/info/exclude`, which is not a repository file at all
+    /// and cannot be committed, reviewed or gated by path. Either way it can
+    /// then plant a source file that `git status --porcelain` reports as
+    /// nothing while `swift build` compiles it. Because the pinned
+    /// measurement worktree is a checkout of a COMMIT, the planted file
+    /// exists only on the candidate side, so it manufactures a win on EVERY
+    /// later eval, credited to commits that do not contain it -- and neither
+    /// `git add -A` nor `git reset --hard` disturbs it.
+    ///
+    /// Uses `runData` with `-z` for exactly the reasons `changedPaths`
+    /// documents: `-z` turns off `core.quotePath`'s octal escaping so a
+    /// non-ASCII filename arrives as real UTF-8 bytes rather than a quoted
+    /// literal, and splitting the raw bytes means `run`'s whole-output
+    /// trimming never eats a leading space from a real filename. A truncated
+    /// capture throws rather than silently dropping records -- dropping one
+    /// here would drop the refusal it was supposed to cause.
+    ///
+    /// `--ignored` is left at git's default TRADITIONAL mode on purpose, not
+    /// `--ignored=matching`: traditional collapses a wholly-ignored directory
+    /// to one record, so `.build/` is a single line instead of the several
+    /// thousand `--ignored=matching` would emit for a warm build -- which
+    /// would be slower and would risk tripping the truncation guard above on
+    /// every single eval.
+    public func status(includingIgnored: Bool = false) throws -> [StatusEntry] {
+        var args = ["status", "--porcelain", "-z"]
+        if includingIgnored { args.append("--ignored") }
+        let result = try Subprocess.runData(Git.gitBinary, args, cwd: repo, env: nil, timeout: 120)
+        guard result.exitCode == 0 else {
+            throw GitError.command(args.joined(separator: " "), result.exitCode, result.stderr)
+        }
+        guard !result.outputTruncated else {
+            throw GitError.truncated(args.joined(separator: " "))
+        }
+        let records = result.stdout
+            .split(separator: 0x00, omittingEmptySubsequences: true)
+            .map { String(decoding: $0, as: UTF8.self) }
+
+        var entries: [StatusEntry] = []
+        var index = 0
+        while index < records.count {
+            let record = records[index]
+            index += 1
+            // "XY PATH": two status characters, one space, then the path.
+            // Anything shorter cannot be a record and is skipped rather than
+            // force-unwrapped into a crash.
+            guard record.count > 3 else { continue }
+            let code = String(record.prefix(2))
+            let path = String(record.dropFirst(3))
+            var original: String?
+            if code.first == "R" || code.first == "C" || code.dropFirst().first == "R"
+                || code.dropFirst().first == "C" {
+                // Verified against git 2.x: `git mv a.txt c.txt` emits
+                // "R  c.txt\0a.txt\0" -- the NEW path in the status record,
+                // the ORIGINAL as a bare follow-on record.
+                if index < records.count {
+                    original = records[index]
+                    index += 1
+                }
+            }
+            entries.append(StatusEntry(code: code, path: path, originalPath: original))
+        }
+        return entries
+    }
+
     public func createBranch(_ name: String) throws {
         try run(["checkout", "-q", "-b", name])
     }

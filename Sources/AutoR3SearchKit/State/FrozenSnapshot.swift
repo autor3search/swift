@@ -61,6 +61,25 @@ public enum FrozenError: Error, CustomStringConvertible, Equatable {
     /// authority; disagreeing with it is an error, not a preference.
     case directoriesMismatch(recorded: [String], requested: [String])
 
+    /// The copy of a frozen file IN THE STORE does not hash to what the
+    /// manifest recorded for it.
+    ///
+    /// The store lives outside the repository, which keeps it away from an
+    /// agent that only edits the repository -- but it is same-user,
+    /// `0755`/`0644`, and the agent has a shell. `restore` used to copy the
+    /// store's bytes into the repository without ever comparing them to the
+    /// `manifest[rel]` SHA-256 it was already carrying, so one `sed -i` on the
+    /// stored benchmark made `eval` INSTALL the attacker's benchmark over the
+    /// repository and then measure it: `rc=0, ratio 0.00247`. The manifest is
+    /// the record of what was frozen; the store is only a cache of the bytes,
+    /// and a cache that disagrees with the record is not to be trusted over it.
+    case storeContentMismatch(String, expected: String, actual: String)
+
+    /// A file in the store is a symbolic link. The snapshot refuses to freeze
+    /// one, so it cannot have been written by `snapshot`; following it would
+    /// read bytes from wherever it points.
+    case symlinkInStore(String)
+
     public var description: String {
         switch self {
         case .symlinkAtSnapshot(let p):
@@ -93,6 +112,21 @@ public enum FrozenError: Error, CustomStringConvertible, Equatable {
             \(recorded.joined(separator: ", ")). Scanning a different set would compare \
             the repository against a scope it was never frozen at, and files in any \
             dropped directory would never be reported as new.
+            """
+        case .storeContentMismatch(let p, let expected, let actual):
+            return """
+            refusing to restore \(p): the copy in the frozen store does not match the hash the \
+            baseline manifest recorded for it (sha256 \(actual), manifest says \(expected)). The \
+            store is outside the repository but it is not out of reach -- it is same-user and \
+            writable, and the agent has a shell. Writing those bytes back would INSTALL a \
+            tampered test or benchmark over the repository and then measure it. Nothing was \
+            restored. Investigate the store; re-establish the baseline under a new tag.
+            """
+        case .symlinkInStore(let p):
+            return """
+            refusing to restore \(p): its copy in the frozen store is a symbolic link. snapshot \
+            refuses to freeze a link, so this was not written by baseline -- reading through it \
+            would take the bytes from wherever it now points.
             """
         }
     }
@@ -331,9 +365,46 @@ public struct FrozenSnapshot: Sendable, Codable, Equatable {
     /// restore is idempotent, so the next attempt after the operator has
     /// investigated starts clean.
     public func restore(repo: URL, from store: URL) throws {
+        // ---- PASS 1: verify the store, write nothing ----
+        //
+        // THE STORE IS NOT TRUSTED. It lives outside the repository, which is
+        // what keeps an agent that only edits the repository away from it --
+        // but it is same-user, 0755/0644, and the agent has a shell. Until
+        // this pass existed, `restore` copied the store's bytes into the
+        // repository without ever comparing them to the `manifest[rel]`
+        // SHA-256 it was already carrying, so one `sed -i` on the stored
+        // benchmark made `eval` install the attacker's benchmark and then
+        // measure it (rc=0, ratio 0.00247, and the repository afterwards
+        // contained the attacker's file). The manifest is the record of what
+        // was frozen; the store is a cache of the bytes.
+        //
+        // A SEPARATE PASS, not a check folded into the write loop, so that a
+        // tampered file discovered halfway through cannot leave the first half
+        // of the frozen set already written back. Either the whole restore is
+        // trustworthy or nothing is written. The verified bytes are held here
+        // rather than re-read below, because re-reading would reopen exactly
+        // the check-then-use window this closes.
+        var verified: [(rel: String, data: Data)] = []
         for path in manifest.keys.sorted() {
             let rel = try FrozenSnapshot.checked(relative: path)
-            let data = try Data(contentsOf: store.appendingPathComponent(rel))
+            let src = store.appendingPathComponent(rel)
+            guard !FrozenSnapshot.isSymlink(src) else {
+                throw FrozenError.symlinkInStore(rel)
+            }
+            let data = try Data(contentsOf: src)
+            let actual = FrozenSnapshot.sha256(data)
+            // `manifest[path]`, not `manifest[rel]`: `checked` trims trailing
+            // slashes, and the manifest is keyed by the untrimmed spelling it
+            // was written with.
+            guard let expected = manifest[path], actual == expected else {
+                throw FrozenError.storeContentMismatch(
+                    rel, expected: manifest[path] ?? "<nothing>", actual: actual)
+            }
+            verified.append((rel: rel, data: data))
+        }
+
+        // ---- PASS 2: write ----
+        for (rel, data) in verified {
             let dst = repo.appendingPathComponent(rel)
 
             // Before creating anything: `createDirectory` happily follows a
