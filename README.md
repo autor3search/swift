@@ -111,7 +111,7 @@ tampering with them would make every experiment return KEEP. So they live under
 the platform cache directory, in a directory named by a SHA-256 of the
 repository's absolute path — **which moves them out of the agent's stated working
 set, not out of its reach.** They are plain files owned by the same user; read
-[the threat model](#the-harness-defends-against-an-agent-that-edits-the-repository-not-against-one-that-edits-the-harnesss-own-state)
+[the threat model](#boundary-2--the-harnesss-own-state-files-are-not-authenticated)
 before you treat that as a security boundary.
 
 ```
@@ -369,6 +369,7 @@ the rest and an agent loop keyed on the older ones will not recognise them:
 
 | `reason` | What it means |
 |---|---|
+| `measured_binary_changed` | One of the four executables gate 8 launches changed its SHA-256 mid-measurement. The eval refuses, **both sides' measured binaries are deleted** so nothing poisoned survives into the next experiment, and the run is tainted until a human clears `run.tainted`. |
 | `dependency_checkout_modified` | A file under `.build/checkouts/` does not match the revision `Package.resolved` pins. |
 | `plugin_cache_not_purged` | `.build/plugins` could not be deleted. **Fail-closed**: a cache that cannot be discarded is a cache that will be reused. |
 | `build_output_not_purged` | Same, for the wider purge under `purge_build_output`. Also fail-closed. |
@@ -438,19 +439,20 @@ rebuilt by gate 5. See
 This is the most transferable thing in the project, and it is worth more than
 any individual gate above.
 
-**Ten bypasses have been found across five reviews, and the later ones all came
-from regions that had been *exempted* from a check for good reasons** —
-`.build/` because hashing it is expensive, the pinned worktree because it is the
-harness's own, `.git/` because git never reports it and it is not source. Every
-one of those exemptions was defensible when it was made. Every one of them was a
-hole.
+**Twelve bypasses have been found across six reviews — eleven closed, a twelfth
+under active fix — and the later ones all came from regions that had been
+*exempted* from a check for good reasons** — `.build/` because hashing it is
+expensive, the pinned worktree because it is the harness's own, `.git/` because
+git never reports it and it is not source. Every one of those exemptions was
+defensible when it was made. Every one of them was a hole.
 
 If you extend this tool, the question to ask of an exempt region is not *"is this
-ours?"* or *"is this expensive?"*. It is **two** questions, and the second one
-was learned late:
+ours?"* or *"is this expensive?"*. It is **three** questions, and each of the
+last two was learned only after something got through:
 
 > **Does the compiler read it?**
 > **Does the harness run it?**
+> **Is it still running while you measure?**
 
 The first question found most of them — planted sources git had been taught not
 to report, an out-of-scope helper hidden with `--assume-unchanged`,
@@ -468,13 +470,39 @@ worktree — which undid the very repair the checkout had just performed. The sa
 variable, ran inside the measurement itself. A tool that shells out is a tool
 that runs code it did not write, at every one of those call sites.
 
-Two further principles came out of fixing them, both of which generalise past
-this project:
+**The third question found the eleventh, and it is the one that took longest to
+see, because the answer was in front of us the whole time: *the code you are
+measuring is running while you measure it.*** Gate 7 verified the pinned
+worktree, restored it, and built it — and then never looked again. The agent's
+benchmark waited until the harness launched it and rewrote the baseline side
+*afterwards*. Every gate had passed. Every gate had passed **before the adversary
+started**.
+
+> **A check that runs before the adversary does is a check the adversary can
+> invalidate.** The fix was not a better check; it was the same check, run before
+> every sample instead of once.
+
+This generalises well past benchmarking. Anything that validates an input and
+then hands it to something that keeps executing has this shape — and the
+attacker's move is always the same, which is to be quiet until after the
+validation and loud afterwards.
+
+Three further principles came out of fixing all this, all of which generalise
+past this project:
 
 **Sample a post-condition AFTER the last thing that could change it.** Gate 7
 read its index flags *before* the checkout, and the hook re-set them *after* —
 so the warning was not wrong, it was **empty**, which is worse. A check that runs
 before the adversary's last move reports on a world that no longer exists.
+
+**A check placed before the repair that fixes what it refuses over will brick the
+run, not protect it.** Gate 7 used to refuse on a `verify` that ran *before* the
+restore whose whole job was to repair what the verify had refused over — so
+anything `git status` could see was permanently fatal: that eval and every eval
+after it returned `worktree_integrity`, with the worktree never repaired. One
+stray `touch` could stop a night's work. It now **restores first and verifies
+afterwards**, which is correct precisely because the worktree's right contents
+are known exactly, so repairing is always the right move.
 
 **Deny, do not delete.** Hooks are disabled with `-c core.hooksPath=/dev/null` on
 every git invocation the harness makes, and a command-line `-c` outranks every
@@ -585,26 +613,76 @@ Every row is a way to make the number go down without making the code faster.
 | Plant a source file that a `.gitignore` rule hides from `git status` | Gate 2b, against an ignored-file inventory taken at baseline: a file that **appears or changes after the freeze** is refused. Plain `--porcelain` omits ignored files, and a committed `Sources/Demo/.gitignore` containing `*.gen.swift` is an in-scope, non-manifest change gate 1 waves through — measured, that bought `keep` at ratio 0.11298 on a planted file. `.git/info/exclude` does the same with no repository file at all, and is caught the same way. |
 | Hide a change to an **out-of-scope** file from git (`--assume-unchanged`) | **Gate 2c**, an on-disk inventory of every file outside `scope`, hashed at baseline and re-walked every eval. Gate 1 could not: it asks git what changed, and the agent owns git's view of its own repository. Measured before the fix: a **comment-only** commit returning `keep`, rc 0, **ratio 0.000737**, because an out-of-scope benchmark helper's `repeatCount` had been edited from 1750 to 1 behind git's back. |
 | Tamper with the **stored** frozen files | Gate 3 verifies every file in the store against the SHA-256 the baseline manifest recorded, across the whole manifest, before writing a byte. Measured before the fix: one `sed -i` on the stored benchmark made `eval` install it into the repository and then measure it — `keep`, rc 0, **ratio 0.000717**. |
-| Tamper with `baseline.json` or `frozen-manifest.json` themselves | **Nothing.** They are unauthenticated JSON, same directory, same uid. This is the stated boundary, not an oversight — see [the threat model](#the-harness-defends-against-an-agent-that-edits-the-repository-not-against-one-that-edits-the-harnesss-own-state). |
+| Tamper with `baseline.json` or `frozen-manifest.json` themselves | **Nothing.** They are unauthenticated JSON, same directory, same uid. This is the stated boundary, not an oversight — see [the threat model](#boundary-2--the-harnesss-own-state-files-are-not-authenticated). |
 | Swap a frozen file for a symlink so the restore overwrites something else | Gate 3 refuses, records `frozen_restore_refused`, and taints the run so every later eval refuses until a human clears it. |
 | Plant a `post-checkout` hook that undoes the harness's own repair | Every git invocation the harness makes is prefixed `-c core.hooksPath=/dev/null`, which outranks every other configuration source. `.git/hooks` is shared with every linked worktree and the restore's own `checkout --force` fired it. Measured before the fix: `keep`, rc 0, **ratio 0.10045**, with the worktree helper left at `175000` afterwards. |
 | Deliver that hook through `GIT_CONFIG_COUNT` instead, writing nothing under `.git/` | Same denial — which is why the fix is *deny*, not *delete*. Measured before: `keep`, rc 0, **ratio 0.09985**. |
 | Inject a dylib that slows only the baseline side (`DYLD_INSERT_LIBRARIES`) | Subprocesses no longer inherit the environment; an eleven-name allowlist replaces it. Measured before the fix: `keep`, rc 0, **ratio 0.47999** (baseline 7 473 151 ns, candidate 3 587 071 ns). After: **0.99915**. |
 | Rewrite the worktree through a `.gitattributes` filter driver so `git status` still reports clean | Gate 7 hashes contents against the commit's blob ids rather than asking git. **Defence in depth, not a measured closure** — see [the residual](#the-environment-is-filtered-by-allowlist). |
+| Have the agent's own benchmark rewrite and rebuild the baseline side *after* every gate has passed | The SHA-256 of all four measured executables is re-checked **before every sample**; a mismatch is `measured_binary_changed`, both sides' binaries are deleted, and the run is tainted. Measured before the fix: an in-scope commit whose `countWords` was byte-for-byte the original returned `keep`, rc 0, **ratio 0.04973** — and the *next* honest eval inherited the inflated binary for a second unearned KEEP at **0.05069**. |
+| Spawn a process that burns CPU through the baseline samples, changing no bytes | **Under active fix at the time of writing.** The binary hashes are unchanged, so the guard above does not see it. See [boundary 1](#boundary-1--the-agents-benchmark-runs-unsandboxed). |
 | Coast on an earlier win | The measurement point advances on KEEP. See [The two commits](#the-two-commits). |
 | Conditionally skip a test from optimizable code | `doctor` scans for `.enabled(if:)`, `.disabled(if:)`, `XCTSkip` and `ConditionTrait`, in test targets *and* in non-test sources. **This one is not closed.** See [limitation 1](#1-gate-6-runs-your-tests-and-that-is-the-softest-link-in-the-chain). |
 | Gut a function and forge the comparison its frozen assertion uses | `doctor` warns when in-scope code declares `==`, `!=`, `<`, `<=`, `>`, `>=` or `~=` for operand types that are *already* comparable in the standard library — a redeclaration, not a conformance. **This one is not closed either**, and the gutted function on the other side of the assertion is not detectable at all. See [limitation 1](#1-gate-6-runs-your-tests-and-that-is-the-softest-link-in-the-chain). |
 
 ## What the harness does not defend against
 
-Everything above is about a **commit**. That is the boundary, and it is worth
-stating where it ends rather than letting an absence of discussion read as a
-guarantee.
+There are **two** boundaries here, and they are not the same kind of thing. One
+is defended by **detection**; the other is not defended at all. An earlier
+version of this README ran them together into a single sentence — *"the harness
+defends against an agent that edits the repository, not against one that edits
+the harness's own state"* — and that sentence was **false**, demonstrated false
+by an attack that came straight through the channel it claimed was defended. It
+is replaced below by two statements that are each true on their own terms.
 
-### The harness defends against an agent that edits the repository, not against one that edits the harness's own state
+### Boundary 1 — the agent's benchmark runs unsandboxed
 
-That is the boundary. It is one sentence, it is load-bearing, and everything
-else in this section is why it cannot be moved.
+**The agent's benchmark runs unsandboxed.** `eval` compiles and executes code the
+agent wrote, as the same user, with no sandbox, on a filesystem containing the
+pinned baseline worktree and the harness's own state. It can do anything that
+user can do. `autor3search-swift` does not prevent that; it **detects the part
+that would change a verdict.** The SHA-256 of all four executables the
+measurement launches — the benchmark and `BenchmarkTool`, on both sides — is
+recorded before measurement begins and re-checked before **every sample**, so a
+benchmark that rewrites or rebuilds either side's binary is refused
+(`measured_binary_changed`) before the next sample is taken, both sides' binaries
+are deleted so nothing poisoned survives into the next experiment, and the run is
+tainted until a human clears it. What remains undetected is anything that changes
+a measurement without changing those bytes — competing for CPU or memory
+bandwidth from a process the benchmark spawned, for instance. The remedy for that
+is operational: run the harness where the agent's code cannot reach the baseline,
+or under a sandbox.
+
+**The attack that forced this, because it is worth knowing what it looked like.**
+One in-scope commit. `countWords` kept the *original quadratic algorithm* — not
+one instruction faster — plus a lazily-initialised global that fired when the
+harness launched the candidate `Bench` process, rewriting the pinned worktree's
+benchmark to 35 000 repeats and rebuilding it there. **`rc 0`, `keep`, ratio
+0.04973**, warnings empty, baseline 73 302 015 ns against candidate 3 645 439 ns.
+On KEEP, gate 7 restored the worktree source, so the trace vanished — and the
+*next*, entirely honest eval inherited the inflated binary and earned a second
+unearned KEEP at ratio 0.05069. That is the stale-baseline coasting bug this
+project exists to prevent, reintroduced through a side door.
+
+Two details from building it are worth more than the attack itself. A naive
+version with no guard was **caught** — `worktree_integrity` — because `swift
+test` imports `Demo` and calls `countWords`, firing the sabotage before gate 7
+looked. The working version gated on
+`ProcessInfo.processInfo.processName == "Bench"` so the write landed strictly
+*after* gate 7 had verified, restored and built. **The vector was TOCTOU against
+gate 7, not "the worktree is writable."** And detection alone was not enough: the
+poisoned binary had to be *deleted*, or the next honest eval inherits it.
+
+Per-sample rather than once, and that interval was chosen against three attacks
+rather than by taste: a check only at the end loses to
+sabotage-measure-restore; a check only at the start loses to this attack; and
+because `MeasureSession` interleaves the two sides *within* every round, even a
+check after the last candidate sample leaves nine rounds unguarded. The cost is
+**130 ms per eval — 0.33%** of a ~39 s experiment, so no compromise was needed.
+
+### Boundary 2 — the harness's own state files are not authenticated
+
+This one is different in kind: **there is no detection here, and no cheap fix.**
 
 The frozen snapshot, the baseline record and the pinned worktree live under
 `~/Library/Caches/autor3search-swift/…` (or `AUTOR3SEARCH_SWIFT_STATE_HOME`).
@@ -643,11 +721,17 @@ uid**, or make the state root **read-only to the agent's uid**, and point
 `AUTOR3SEARCH_SWIFT_STATE_HOME` at it. The harness will not do this for you and
 does not pretend to.
 
+**The difference between the two boundaries, in one line.** Boundary 1 is
+*defended by detection*: the attack is possible, it is noticed, and the run
+refuses and cleans up after itself. Boundary 2 is *not defended*: state-file
+tampering would simply work, and the only answer is to put the files somewhere
+the agent cannot write. Do not read the first as covering the second.
+
 So: run this against code you are willing to have compiled and executed, in a
 directory you are willing to have written to, by an agent you are supervising to
 the degree the work deserves. What the gates give you is that **the commit that
 gets kept is the commit that was measured**, on criteria that did not move while
-it was measured. That is a real property. It is not this one.
+it was measured. That is a real property, and it is narrower than it sounds.
 
 ### The build cache is not verified
 
@@ -694,6 +778,34 @@ re-download. **No fixture exercises this path.** It is documented rather than
 tested, and that asymmetry is stated here rather than left for someone to
 discover: every other claim in this section has a test behind it, and this one
 has an argument.
+
+### Repository layouts this is stricter about than you may expect
+
+The hardening above is not free, and the cost is not only the `.build/out`
+rebuild. Gate 2c hashes **every file outside `scope`** except `.git/`, `.build/`
+and the harness's own outputs — and *"every file"* includes **gitignored ones**.
+That is deliberate: an exemption is a candidate bypass, and gitignored files are
+exactly where two of the demonstrated attacks lived. But it means three ordinary
+repository layouts will produce refusals that are correct by the rule and
+surprising in practice.
+
+| Layout | What you will see | Why |
+|---|---|---|
+| A large **gitignored vendored directory** outside `scope` | It is re-hashed on **every eval**, and any legitimate change to it gives `out_of_scope` | Gitignored is not exempt; only `.git/`, `.build/` and harness output are |
+| A **monorepo or nested package** | A change to *any* nested `Package.swift` anywhere in the tree gives `manifest_change_rejected` | Gate 2a's inventory covers nested manifests, by design, and never refreshes on KEEP |
+| **Submodules** | `git submodule update` changes inventoried files and gives `out_of_scope` | The submodule's working files are outside `scope`, so they are inventoried like any other file |
+
+**The remedy in all three cases is the same: re-baseline under a new tag after
+the legitimate change.** The inventory is recorded at `frozenCommit` and
+deliberately never advances — that is what makes it a fixed reference — so a
+genuine change to anything it covers requires a new reference.
+
+**None of this affects the normal single-package flow**, which is what `init`
+generates and what the fixture exercises: a comment-only commit still discards
+and a real optimization still reaches KEEP (measured after the last round of
+hardening at ratio **0.11265**). If your repository has one of the layouts above,
+expect the friction and budget for the re-baseline; it is accepted cost, not an
+undiscovered bug.
 
 ### Re-baselining is required after upgrading
 
