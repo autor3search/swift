@@ -439,8 +439,8 @@ rebuilt by gate 5. See
 This is the most transferable thing in the project, and it is worth more than
 any individual gate above.
 
-**Twelve bypasses have been found across six reviews — eleven closed, a twelfth
-under active fix — and the later ones all came from regions that had been
+**Thirteen bypasses have been found across six reviews — twelve closed, one
+named and unmeasured — and the later ones all came from regions that had been
 *exempted* from a check for good reasons** — `.build/` because hashing it is
 expensive, the pinned worktree because it is the harness's own, `.git/` because
 git never reports it and it is not source. Every one of those exemptions was
@@ -503,6 +503,18 @@ after it returned `worktree_integrity`, with the worktree never repaired. One
 stray `touch` could stop a night's work. It now **restores first and verifies
 afterwards**, which is correct precisely because the worktree's right contents
 are known exactly, so repairing is always the right move.
+
+**A fallback that has never run is not a fallback.** The session-isolation spawn
+carries a fallback for libcs that reject the flag. It was placed at the
+`posix_spawn` call — and glibc validates the flag mask inside
+`posix_spawnattr_setflags` and returns `EINVAL` *there*, before `posix_spawn` is
+ever reached. So on the one libc the fallback existed for, it could never have
+run; the refusal became a thrown error instead. Darwin defers the check to the
+spawn, so the same code took a different door on each platform. It now triggers
+on **any** failure rather than on one errno, because keying on `EINVAL` fires on
+one libc and not the other. This was found by *running* Linux, not by reading the
+code — which is the same lesson as the paragraph above, arriving from the
+opposite direction.
 
 **Deny, do not delete.** Hooks are disabled with `-c core.hooksPath=/dev/null` on
 every git invocation the harness makes, and a command-line `-c` outranks every
@@ -620,7 +632,9 @@ Every row is a way to make the number go down without making the code faster.
 | Inject a dylib that slows only the baseline side (`DYLD_INSERT_LIBRARIES`) | Subprocesses no longer inherit the environment; an eleven-name allowlist replaces it. Measured before the fix: `keep`, rc 0, **ratio 0.47999** (baseline 7 473 151 ns, candidate 3 587 071 ns). After: **0.99915**. |
 | Rewrite the worktree through a `.gitattributes` filter driver so `git status` still reports clean | Gate 7 hashes contents against the commit's blob ids rather than asking git. **Defence in depth, not a measured closure** — see [the residual](#the-environment-is-filtered-by-allowlist). |
 | Have the agent's own benchmark rewrite and rebuild the baseline side *after* every gate has passed | The SHA-256 of all four measured executables is re-checked **before every sample**; a mismatch is `measured_binary_changed`, both sides' binaries are deleted, and the run is tainted. Measured before the fix: an in-scope commit whose `countWords` was byte-for-byte the original returned `keep`, rc 0, **ratio 0.04973** — and the *next* honest eval inherited the inflated binary for a second unearned KEEP at **0.05069**. |
-| Spawn a process that burns CPU through the baseline samples, changing no bytes | **Under active fix at the time of writing.** The binary hashes are unchanged, so the guard above does not see it. See [boundary 1](#boundary-1--the-agents-benchmark-runs-unsandboxed). |
+| Spawn a process that burns CPU through the baseline samples, changing no bytes | Every spawned child gets **its own session** (`POSIX_SPAWN_SETSID`), and each subprocess run ends by sweeping that session — a process cannot leave a session with `setpgid`, which is how the first version of this was escaped. Measured before: **3/3 KEEP**, ratios 0.54935 / 0.56069 / 0.56485, twelve processes still alive each time. After: **3/3 discard**, 1.02742 / 1.02021 / 1.02803, **0 alive**. |
+| …but have the benchmark call `setsid()` for itself first | **Not closed.** A process that creates its own session is not in the one being swept. See [the residual](#boundary-1--the-agents-benchmark-runs-unsandboxed). |
+| Run the machine hot during the candidate's own sample so the baseline sample that follows is throttled | **Not closed, and not measured.** Nothing is spawned, written, or changed; the state is left in the silicon. See [the thirteenth](#boundary-1--the-agents-benchmark-runs-unsandboxed). |
 | Coast on an earlier win | The measurement point advances on KEEP. See [The two commits](#the-two-commits). |
 | Conditionally skip a test from optimizable code | `doctor` scans for `.enabled(if:)`, `.disabled(if:)`, `XCTSkip` and `ConditionTrait`, in test targets *and* in non-test sources. **This one is not closed.** See [limitation 1](#1-gate-6-runs-your-tests-and-that-is-the-softest-link-in-the-chain). |
 | Gut a function and forge the comparison its frozen assertion uses | `doctor` warns when in-scope code declares `==`, `!=`, `<`, `<=`, `>`, `>=` or `~=` for operand types that are *already* comparable in the standard library — a redeclaration, not a conformance. **This one is not closed either**, and the gutted function on the other side of the assertion is not detectable at all. See [limitation 1](#1-gate-6-runs-your-tests-and-that-is-the-softest-link-in-the-chain). |
@@ -648,10 +662,54 @@ benchmark that rewrites or rebuilds either side's binary is refused
 (`measured_binary_changed`) before the next sample is taken, both sides' binaries
 are deleted so nothing poisoned survives into the next experiment, and the run is
 tainted until a human clears it. What remains undetected is anything that changes
-a measurement without changing those bytes — competing for CPU or memory
-bandwidth from a process the benchmark spawned, for instance. The remedy for that
-is operational: run the harness where the agent's code cannot reach the baseline,
-or under a sandbox.
+a measurement without changing those bytes. The remedy for that is operational:
+run the harness where the agent's code cannot reach the baseline, or under a
+sandbox.
+
+**Processes that outlive their sample are handled; one form of them is not.**
+A benchmark that spawns a CPU burner leaves it competing with the *baseline*
+sample that follows, and no byte changes, so the hash guard cannot see it. Every
+spawned child therefore gets **its own session** (`POSIX_SPAWN_SETSID`), and each
+subprocess run ends by sweeping that session — not merely its process group,
+because a process leaves a group with one `setpgid` and Foundation's `Process`
+does exactly that for every child it spawns, which is how the first version of
+this was escaped. Measured before the fix, three runs of each form: the
+`Process`-spawned burners returned **3/3 KEEP** — ratios 0.54935, 0.56069,
+0.56485 — with **twelve processes still alive** after each eval. After: **3/3
+discard** at 1.02742, 1.02021, 1.02803, **0 alive**, and a second honest eval
+clean every time.
+
+> One line about how that was nearly mis-recorded. An earlier round measured the
+> same escape as landing only **1 in 3**, and wrote it down that way. That was
+> noise from building concurrently with the measurement; run clean it is **3/3**.
+> The correction *raises* the severity — the escape was reliable, not occasional
+> — and it is the reason this README reports three runs of each form rather than
+> one. **A single run is not a measurement.**
+
+> **STILL OPEN: an explicit `setsid()` call by the benchmark escapes the sweep.**
+> The sweep kills the session the harness created for that child; a process that
+> calls `setsid()` for itself is in a *different* session and is not in the set
+> being swept. This is a deliberate, unusual call rather than the default API —
+> which is precisely why closing the default-API form mattered, since that was
+> the version anyone would write by accident or by reaching for `Process` — but
+> it is **not closed**, and nothing above should be read as implying otherwise.
+
+**THE THIRTEENTH, named and unmeasured: thermal and frequency skew.** A candidate
+benchmark can run the machine hot during its own sample, or hold a wide SIMD/AMX
+loop, so that the *baseline* sample which follows executes at a throttled clock.
+On Apple silicon the reverse is plausible too — parking work so the scheduler
+moves the following sample onto E-cores. It spawns nothing, writes nothing,
+changes no bytes, and needs no process to survive: **the state it leaves is in
+the silicon, not the process table**, so neither the session sweep nor the
+per-sample binary hash can see it, and neither could any extension of them.
+
+**Nobody has established whether the effect is large enough to flip a verdict.**
+It is named here because a reader deserves to know it exists, not because it has
+been quantified — no measurement of it appears in this project's run log, and
+this README will not imply one. The defences are operational: idle-gap pacing
+between samples, or a dedicated machine. Interleaving already cancels *slow*
+drift across a run (see [Why a rank test](#why-a-rank-test)); it does not cancel
+a skew deliberately timed to land on one side.
 
 **The attack that forced this, because it is worth knowing what it looked like.**
 One in-scope commit. `countWords` kept the *original quadratic algorithm* — not
@@ -1369,14 +1427,46 @@ are yours to read.
 
 ### 11. Platform and environment
 
-**macOS** is the developed and measured platform: 250/250 tests pass, and every
-timing in this README was taken there.
+**macOS** is the developed and measured platform: `swift test` is **rc=0, 326 of
+326**, and every timing in this README was taken there.
 
-**Linux is correctness-verified only, in a container.** `swift:6.1`, `linux/arm64`
-(aarch64), Swift 6.1.3, kernel 6.12.76-linuxkit, glibc 2.39. `swift build` rc=0,
-`swift build --build-tests` rc=0, `swift test` **245 of 252**. All 7 failures are
-the same `Package.resolved` cross-platform lockfile refusal described below, and
-none is anything else.
+**The Linux suite has never been green, and this README is not going to round
+that to "Linux works".** The honest statement is three separate claims:
+
+1. **Linux builds and runs.** `swift:6.1`, `linux/arm64` (aarch64), Swift 6.1.3,
+   kernel 6.12.76-linuxkit, glibc 2.39. `swift build -c release` is rc=0.
+2. **The harness's own platform behaviour is verified there**, and that is the
+   part that most needed it — process groups, session isolation and the sweep,
+   subprocess handling, the signal trap, the state home, and the sampler.
+3. **The full suite returns `rc=1`.** On the current tree: **328 tests, 8
+   issues.** An operator who runs it will see a red result, and they have to
+   separate **two different causes** to make sense of it:
+
+| Cause | Count | What it is |
+|---|---|---|
+| `IntegrationTests` lockfile refusals | **7** | All the same message — `refusing to configure this repository: swift package resolve rewrote the tracked Package.resolved`. This is the cross-platform lockfile problem documented below, not a defect in the code under test: an earlier tree fails the identical seven with the identical message. |
+| `anAssumeUnchangedOutOfScopeEditIsRefusedAndNeverMeasured` | **1** | **A genuine flake.** It passes 3/3 when run in isolation in the same container. Several tests call `BaselineRunner.run` concurrently against a SwiftPM cache shared under `HOME`, and the container makes that collision likelier. Pre-existing test-isolation fragility, amplified — but it is a real flake, and it is recorded as one rather than re-run until green. |
+
+So: **do not read `rc=1` on Linux as "the port is broken", and do not read it as
+"expected, ignore it" either.** Seven of those eight are a fixture problem with a
+known cause and a known workaround; the eighth is a flake in our own test
+isolation. Anything beyond those eight is new and worth reporting.
+
+> **HOW MUCH THE LINUX CLAIM IS WORTH — a method caveat, and it is uncomfortable.**
+> Two tests passed on macOS while **asserting nothing at all on Linux**, and had
+> done so since the day they were written. `exec -a` is a bashism that `dash`
+> does not support, so the process tagging they relied on silently did nothing in
+> the container. Worse, `pgrep -f` matches the *whole command line* of every
+> process — including the command line of the shell running `pgrep` — so with the
+> marker spelled inline the matcher **matched its own wrapper** and reported a
+> survivor that was nothing but the question being asked. Both were found only by
+> actually running them on Linux, not by reading them.
+>
+> The correct inference is not "those two are fixed now". It is: **assume other
+> macOS-only-verified tests may have the same problem.** Only five areas have
+> actually been exercised on Linux — `ProcessGroupTests`, `SubprocessTests`,
+> `SignalTrapTests`, `StateHomeTests`, `SamplerTests`. A green macOS suite is
+> evidence about macOS.
 
 **Not verified on Linux, and you should not assume it works:**
 
@@ -1455,9 +1545,12 @@ swift build -c release
 swift test
 ```
 
-The test suite is 250 tests on macOS and takes several minutes: a good part of it
-builds and measures the real fixture package with the real benchmark harness,
-because the things worth testing here are the ones that only fail for real.
+The test suite is **326 tests on macOS**, all passing, and takes several minutes:
+a good part of it builds and measures the real fixture package with the real
+benchmark harness, because the things worth testing here are the ones that only
+fail for real. On Linux it is **328 tests with 8 issues** — see
+[limitation 11](#11-platform-and-environment) for what those eight are and why
+neither "it's broken" nor "ignore it" is the right reading.
 
 ## Licence
 
