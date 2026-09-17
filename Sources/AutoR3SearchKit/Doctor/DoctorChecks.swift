@@ -304,13 +304,62 @@ public enum DoctorChecks {
     /// optimizable code -- is NOT detectable by any text scan and is named
     /// explicitly in every branch below, so a human who reads this output
     /// knows what it cannot see, rather than assuming it caught everything.
+    /// THE REAL BLIND SPOT, restated after a security review defeated gate 6
+    /// without disabling a single test.
+    ///
+    /// The text this replaces named a plain `guard ... else { return }` at the
+    /// top of a test body and told the reader to "review tests with
+    /// non-trivial early setup by hand". That advice pointed a reviewer at the
+    /// TEST, and in the demonstrated attack the test was UNTOUCHED: it ran,
+    /// its assertions executed, and it passed. The old wording therefore did
+    /// worse than miss the attack -- it sent the one person looking for it to
+    /// the one file that was innocent.
+    ///
+    /// The real class is broader and has nothing to do with skipping. A frozen
+    /// test constrains behaviour only as far as the code it calls is honest.
+    /// In-scope code can satisfy an assertion without preserving semantics:
+    ///
+    ///     public func countWords(_ s: String) -> [String: Int] { return [:] }
+    ///     public func == (lhs: [String: Int], rhs: [String: Int]) -> Bool { true }
+    ///
+    /// The function is gutted, the comparison the assertion uses is forged,
+    /// the concrete overload wins overload resolution over the synthesized
+    /// one, `swift test` exits 0, and `eval` reports a colossal win on code
+    /// that computes nothing. No skip construct appears anywhere, so the
+    /// gating scan above stays silent by construction -- correctly, it is not
+    /// what that scan is for. The `comparisonOperatorShadowing` check below is
+    /// what covers the second line; nothing covers the first.
+    static let frozenTestBlindSpot = """
+        Known blind spot: FROZEN TESTS CONSTRAIN BEHAVIOUR ONLY AS FAR AS THE CODE THEY CALL IS \
+        HONEST. In-scope code can satisfy an assertion without preserving semantics -- gut a \
+        function to return an empty value and forge the comparison the assertion uses (e.g. \
+        declare `func == (lhs: [String: Int], rhs: [String: Int]) -> Bool { true }` in optimizable \
+        source; the concrete overload wins overload resolution over the synthesized one). The test \
+        is never touched: it runs, it asserts, it passes. The "Comparison operators in optimizable \
+        code" check is aimed squarely at the forged-comparison half of that; the gutted function \
+        itself is not detectable by any text scan, and neither is a plain \
+        `guard ... else { return }` whose condition lives in optimizable code. When a KEEP reports \
+        an implausibly large win, read the DIFF, not the test.
+        """
+
+    /// The same statement, compressed to two sentences.
+    ///
+    /// `doctor` prints one paragraph per finding and two findings carry this
+    /// blind spot. Printing the full paragraph in both puts the SAME eleven
+    /// lines on screen twice in one report, and a report that repeats itself
+    /// is a report people skim -- the identical failure mode as warning on
+    /// everything, reached by a different route. So the check that OWNS this
+    /// limitation (`comparisonOperatorShadowing`) prints it in full, and the
+    /// neighbouring gating check prints the short form and points there.
+    static let frozenTestBlindSpotShort = """
+        Known blind spot: FROZEN TESTS CONSTRAIN BEHAVIOUR ONLY AS FAR AS THE CODE THEY CALL IS \
+        HONEST -- in-scope code can gut a function and forge the comparison an assertion uses, and \
+        the test then runs, asserts and passes unchanged. See the "Comparison operators in \
+        optimizable code" check for the full statement.
+        """
+
     public static func conditionalTestGating(strongHits: [String], environmentReadCount: Int) -> Finding {
-        let blindSpot = """
-            Known blind spot: a plain `guard ... else { return }` (or any other early return) at the \
-            top of a test, whose condition lives in optimizable code, disables that test using none \
-            of the constructs this check can see. No text scan can catch that -- review tests with \
-            non-trivial early setup by hand.
-            """
+        let blindSpot = Self.frozenTestBlindSpotShort
 
         guard !strongHits.isEmpty else {
             if environmentReadCount > 0 {
@@ -354,6 +403,91 @@ public enum DoctorChecks {
                 import` the code under optimization, so a condition living in in-scope code can switch \
                 a test off without ever touching a frozen file.
                 \(blindSpot)
+                """
+        )
+    }
+
+    // =====================================================================
+    // MARK: - Forged comparisons
+    // =====================================================================
+
+    /// The check that would have caught the gate-6 defeat described in
+    /// `frozenTestBlindSpot`, and the one place in this file where the
+    /// warn/inform line had to be drawn on purpose.
+    ///
+    /// WHY TWO TIERS RATHER THAN ONE. Declaring `==` in library code is
+    /// completely ordinary -- every hand-written `Equatable` conformance and
+    /// every `Comparable` type does it, and a repository with twenty of them
+    /// is a normal repository, not a suspicious one. Warning on all of them
+    /// would be the exact failure this file's own policy note names: "a doctor
+    /// that prints ten scary lines on a healthy machine trains people to stop
+    /// reading it." A check that fires on every healthy repo is not a check.
+    ///
+    /// But the forging attack is not an ordinary conformance, and the
+    /// difference is mechanical rather than a matter of taste: to make a
+    /// frozen assertion pass on a gutted function you must redeclare the
+    /// comparison for the type the ASSERTION uses, and that type is nearly
+    /// always a STANDARD-LIBRARY one (`[String: Int]`, `String`, `Int`,
+    /// `[Double]`). An operator declaration whose operands are entirely
+    /// standard-library types is not a conformance at all -- those types are
+    /// already `Equatable`/`Comparable`. It is a SHADOWING REDECLARATION, it
+    /// silently wins overload resolution at every call site in the module, and
+    /// there is no ordinary reason to write one.
+    ///
+    /// So:
+    ///
+    ///   - `shadowingHits` (operands all standard-library types) -> `.warn`.
+    ///     Rare in honest code, and the precise shape of the attack.
+    ///   - `ordinaryOperatorCount` (everything else -- an operator on the
+    ///     repository's own types) -> reported at `.ok`, as a COUNT with no
+    ///     file list, purely so a reader knows the scan ran and knows what it
+    ///     deliberately did not flag. Same treatment, and for the same reason,
+    ///     as `environmentReadCount` in `conditionalTestGating`.
+    ///
+    /// This is a HEURISTIC over text, like every other scan here. It cannot
+    /// see a forged comparison written as a method (`func isEqual(to:)`), an
+    /// operator assembled through a generic constraint, or -- the half nothing
+    /// covers -- the gutted function on the other side of the assertion.
+    public static func comparisonOperatorShadowing(
+        shadowingHits: [String], ordinaryOperatorCount: Int
+    ) -> Finding {
+        guard !shadowingHits.isEmpty else {
+            let noted = ordinaryOperatorCount > 0
+                ? """
+                  \(ordinaryOperatorCount) comparison-operator declaration(s) on the repository's \
+                  OWN types were found and deliberately NOT flagged: a hand-written `Equatable` or \
+                  `Comparable` conformance is ordinary, and warning on it would bury the case that \
+                  is not.
+                  """
+                : "No comparison-operator declarations were found in the package's non-test source."
+            return Finding(
+                level: .ok,
+                title: "Comparison operators in optimizable code",
+                detail: """
+                    No operator declaration in the package's non-test source redeclares a comparison \
+                    for standard-library operand types. \(noted)
+                    \(frozenTestBlindSpot)
+                    """
+            )
+        }
+        let shown = shadowingHits.prefix(20).joined(separator: "\n    ")
+        let more = shadowingHits.count > 20 ? "\n    ... and \(shadowingHits.count - 20) more" : ""
+        return Finding(
+            level: .warn,
+            title: "Comparison operators in optimizable code",
+            detail: """
+                \(shadowingHits.count) operator declaration(s) in OPTIMIZABLE (non-test) source \
+                redeclare a comparison whose operands are entirely standard-library types:
+                    \(shown)\(more)
+                Those types are already Equatable/Comparable, so this is not a conformance -- it is a \
+                redeclaration that wins overload resolution over the standard one at every call site \
+                in the module, INCLUDING inside the frozen tests, which `@testable import` this code. \
+                That is the mechanism by which a frozen test can pass while the behaviour it checks is \
+                gone: gut the function, forge the comparison the assertion uses, and the assertion \
+                still executes and still succeeds. Read these declarations before trusting an \
+                unattended run; if one is legitimate (a deliberate, documented shim), it is still \
+                worth keeping out of `scope`.
+                \(frozenTestBlindSpot)
                 """
         )
     }
@@ -632,12 +766,28 @@ public enum DoctorChecks {
             findings.append(conditionalTestGating(
                 strongHits: testScan.strongHits + sourceHits,
                 environmentReadCount: testScan.environmentReadCount))
+
+            // Forged comparisons. Shares `sourceDirs` and the same
+            // comment-and-string-stripped view of each file with the scan
+            // above; kept as a SEPARATE Finding rather than folded into it
+            // because the two are not the same failure and a reader who sees
+            // one warning should not have to guess which.
+            let operatorScan = scanSourceDirsForComparisonOperators(repo: repo, sourceDirs: sourceDirs)
+            findings.append(comparisonOperatorShadowing(
+                shadowingHits: operatorScan.shadowing,
+                ordinaryOperatorCount: operatorScan.ordinary))
         } else {
             findings.append(Finding(
                 level: .warn,
                 title: "Conditionally-gated tests",
                 detail: "Could not run `swift package describe` in \(repo.path) -- is this a readable " +
                     "Swift package? Skipping the scan for conditionally-gated tests."))
+            findings.append(Finding(
+                level: .warn,
+                title: "Comparison operators in optimizable code",
+                detail: "Could not run `swift package describe` in \(repo.path), so the package's " +
+                    "non-test source directories are unknown. Skipping the scan for redeclared " +
+                    "comparison operators."))
         }
 
         // --- The dependency pin ---
@@ -927,6 +1077,134 @@ public enum DoctorChecks {
             }
         }
         return hits
+    }
+
+    // =====================================================================
+    // MARK: - Scanning for forged comparisons
+    // =====================================================================
+
+    /// The operators a frozen assertion can actually be routed through.
+    /// `==` and `!=` are what `#expect(a == b)` and `XCTAssertEqual` reduce
+    /// to; `<`/`<=`/`>`/`>=` are what an ordering assertion reduces to; `~=`
+    /// is what `switch`/`case` and `XCTAssert(range ~= x)` reduce to, and it
+    /// is the least obvious of the set, which is exactly why it is here.
+    private static let comparisonOperators = ["==", "!=", "<=", ">=", "~=", "<", ">"]
+
+    /// Type names that are already `Equatable`/`Comparable` in the standard
+    /// library. An operator declaration whose operands come ENTIRELY from this
+    /// set cannot be a conformance -- it can only be a redeclaration that
+    /// shadows the standard one. `Self` is deliberately ABSENT: `static func
+    /// == (lhs: Self, rhs: Self)` is the textbook `Equatable` conformance and
+    /// must land in the ordinary tier, not the warning tier.
+    private static let standardLibraryComparableTypes: Set<String> = [
+        "String", "Substring", "Character", "Unicode", "Scalar",
+        "Int", "Int8", "Int16", "Int32", "Int64",
+        "UInt", "UInt8", "UInt16", "UInt32", "UInt64",
+        "Double", "Float", "Float16", "Float80", "CGFloat",
+        "Bool", "Array", "Dictionary", "Set", "Optional", "Range", "ClosedRange",
+        "Data", "Date", "URL", "UUID", "Decimal", "Never", "AnyHashable",
+    ]
+
+    /// Splits an operator declaration's parameter-list text into the bare type
+    /// identifiers it mentions, so `[String: Int]` yields `["String", "Int"]`
+    /// and `[MyRow]` yields `["MyRow"]`. Sugar (`[]`, `<>`, `?`, `!`,
+    /// `inout`, labels, `,`, `:`) is punctuation for this purpose: what
+    /// matters is only WHICH named types appear, because a declaration is
+    /// shadowing exactly when every one of them is already comparable in the
+    /// standard library.
+    static func typeIdentifiers(inParameterList text: String) -> [String] {
+        var current = ""
+        var tokens: [String] = []
+        for ch in text {
+            if ch.isLetter || ch.isNumber || ch == "_" {
+                current.append(ch)
+            } else if !current.isEmpty {
+                tokens.append(current)
+                current = ""
+            }
+        }
+        if !current.isEmpty { tokens.append(current) }
+        // Argument labels and parameter names are the odd tokens in
+        // `lhs: String, rhs: String`; rather than track position (which
+        // breaks on `_ x: T` and on omitted labels), drop the names that
+        // Swift's own operator conventions make universal, plus keywords.
+        let notTypes: Set<String> = ["lhs", "rhs", "left", "right", "a", "b", "x", "y",
+                                     "inout", "some", "any", "borrowing", "consuming", "_"]
+        return tokens.filter { !notTypes.contains($0) }
+    }
+
+    /// Whether `line` (already comment- and string-stripped) DECLARES one of
+    /// `comparisonOperators`, and if so whether its operands are entirely
+    /// standard-library types.
+    ///
+    /// The declaration form is `func <op> (` or `func <op>(`, optionally
+    /// preceded by `static`/`public`/`prefix`/etc, and optionally generic
+    /// (`func == <T>(`). Requiring an operator token IMMEDIATELY after `func`
+    /// is what keeps `func compare<T>(...)` out: a named function always has
+    /// an identifier there, never an operator.
+    ///
+    /// Returns `nil` when the line is not an operator declaration at all.
+    static func classifyOperatorDeclaration(_ line: String) -> (isShadowing: Bool, op: String)? {
+        guard let funcRange = line.range(of: "func") else { return nil }
+        // `func` must be a whole word, not the tail of `myfunc`.
+        if let before = line.index(funcRange.lowerBound, offsetBy: -1, limitedBy: line.startIndex),
+           before < funcRange.lowerBound {
+            let c = line[before]
+            if c.isLetter || c.isNumber || c == "_" { return nil }
+        }
+        var rest = line[funcRange.upperBound...].drop(while: { $0 == " " || $0 == "\t" })
+        // Longest-match first: `<=` must not be read as `<`.
+        guard let op = comparisonOperators.first(where: { rest.hasPrefix($0) }) else { return nil }
+        rest = rest.dropFirst(op.count).drop(while: { $0 == " " || $0 == "\t" })
+        // A generic operator: `func == <T: P>(lhs: T, rhs: T)`. Skip the
+        // generic clause to reach the parameter list.
+        if rest.hasPrefix("<"), let close = rest.firstIndex(of: ">") {
+            rest = rest[rest.index(after: close)...].drop(while: { $0 == " " || $0 == "\t" })
+        }
+        guard rest.hasPrefix("("), let close = rest.firstIndex(of: ")") else {
+            // No parameter list on this line (a multi-line signature). It IS
+            // an operator declaration, so report it -- in the ordinary tier,
+            // because the operands cannot be read and guessing "shadowing"
+            // here would manufacture exactly the false warning this check is
+            // designed to avoid.
+            return (false, op)
+        }
+        let params = String(rest[rest.index(after: rest.startIndex)..<close])
+        let types = typeIdentifiers(inParameterList: params)
+        guard !types.isEmpty else { return (false, op) }
+        return (types.allSatisfy { standardLibraryComparableTypes.contains($0) }, op)
+    }
+
+    /// Walks every `.swift` file under each declared NON-TEST target directory
+    /// looking for comparison-operator declarations. Non-test only, and
+    /// deliberately: a `==` in a FROZEN test directory is restored byte-for-byte
+    /// before gate 6 runs, so it cannot be the agent's doing. The whole point
+    /// of this check is code the agent is free to edit.
+    ///
+    /// Matches against `file.matchLines` for the same reason every other scan
+    /// in this file does -- this very source file documents the attack it looks
+    /// for, and a scan that flagged its own doc comment would be the cry-wolf
+    /// failure in its purest form. The DISPLAYED snippet comes from
+    /// `file.rawLines`.
+    private static func scanSourceDirsForComparisonOperators(
+        repo: URL, sourceDirs: [String]
+    ) -> (shadowing: [String], ordinary: Int) {
+        var shadowing: [String] = []
+        var ordinary = 0
+        for dir in sourceDirs.sorted() {
+            for file in swiftFiles(repo: repo, dir: dir) {
+                for (index, matchLine) in file.matchLines.enumerated() {
+                    guard let verdict = classifyOperatorDeclaration(matchLine) else { continue }
+                    if verdict.isShadowing {
+                        let shown = file.rawLines[index].trimmingCharacters(in: .whitespaces)
+                        shadowing.append("\(file.relativePath):\(index + 1): \(shown)")
+                    } else {
+                        ordinary += 1
+                    }
+                }
+            }
+        }
+        return (shadowing, ordinary)
     }
 
     /// `rawLines` is exactly the file's own text, one entry per line, used

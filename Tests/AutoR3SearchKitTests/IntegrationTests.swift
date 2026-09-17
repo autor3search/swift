@@ -50,7 +50,15 @@ struct IntegrationTests {
         DemoFixture.printVerdict("aRealOptimizationIsKept", v, wall: Date().timeIntervalSince(started))
 
         #expect(v.kind == .keep, "a genuine optimization was not kept: \(v.reason ?? "")")
-        #expect(v.score < 0.99)
+        // 0.97, not 0.99: this assertion's MEANING is "the win cleared the
+        // shipped effect floor", and the shipped `min_effect_pct` default
+        // moved 1.0 -> 3.0. Left at 0.99 it would have gone on passing while
+        // asserting something weaker than the rule the verdict above applied,
+        // which is the kind of test that quietly stops testing anything. The
+        // observed win here is ~0.12 (an 8.5x speed-up, run log Task 22), so
+        // neither threshold is close to binding -- the number is the policy,
+        // not the margin.
+        #expect(v.score < 0.97)
     }
 
     // MARK: - The property the whole project rests on

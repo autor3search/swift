@@ -512,11 +512,117 @@ public enum InitRunner {
         }
     }
 
+    // =====================================================================
+    // MARK: - The defaults, and why they are what they are
+    // =====================================================================
+    //
+    // These five constants ARE the KEEP rule for every repository that never
+    // edits `config.yaml`, which is most of them. They were changed after a
+    // measurement review found that the PREVIOUS defaults let a comment-only
+    // commit clear both KEEP criteria on the shipped fixture.
+    //
+    // The specific finding, which is the reason for everything below: `init`
+    // writes ONE benchmark for the fixture, so k = 1, so the
+    // "Bonferroni-corrected" threshold alpha/k is NUMERICALLY IDENTICAL to the
+    // uncorrected alpha. In the default configuration there is no correction
+    // at all. Rule 2 was therefore being asked to hold the line at a bare 0.05
+    // against two separately compiled binaries that are not exchangeable
+    // samples -- and the run log records it failing to: arm B's spurious KEEP
+    // (`ratio 0.98853, p 0.03546`, run-log Task 22) was a one-comment commit
+    // that cleared both rules at these old defaults.
+
+    /// Rounds per side. DELIBERATELY UNCHANGED at 10.
+    ///
+    /// Raising it is the intuitive response to a noisy verdict and it is the
+    /// WRONG one here, for a reason the run log measures rather than asserts
+    /// (Task 21, repeated in Task 22's arm design): the two sides are separate
+    /// builds in separate directories, so their difference is a BIASED
+    /// estimate, not noise about 1.0. More rounds per side make Mann-Whitney
+    /// BETTER at resolving a biased estimate -- p shrinks and a drifting no-op
+    /// reads MORE significant, not less. The reachability table does not force
+    /// a change either: k = 1 is reachable from count 4 upward at the old
+    /// alpha and from count 6 upward at the new one, both below 10.
     private static let defaultCount = 10
-    private static let defaultAlpha = 0.05
-    private static let defaultMinEffectPct = 1.0
-    private static let defaultMaxRegressPct = 5.0
+
+    /// 0.05 -> 0.005.
+    ///
+    /// This is nearly free and it is the cheapest factor of ten available.
+    /// COST: the exact two-sided p-value floor at `count: 10` is
+    /// `2 / C(20,10) = 2 / 184756 = 1.0825e-5` (bound by
+    /// `theReachabilityTableIsCorrectAtTheShippedDefaultAlpha` in
+    /// `InitRunnerTests`), so even after dividing by k the new alpha still
+    /// admits **461** simultaneous benchmarks before a KEEP becomes
+    /// unreachable -- `maxBenchmarksWithReachableKeep` floors, and
+    /// `0.005 / 1.0825e-5 = 461.89`, so 461, not the 462 a ceiling would give
+    /// and not the 4618 the old alpha gave. Nothing real is near either -- and a
+    /// real win saturates the floor anyway (the run log's own 8.5x KEEP does).
+    /// BENEFIT: every per-experiment false positive that reads between 0.005
+    /// and 0.05 now discards. The run log's three recorded near-misses all sit
+    /// in exactly that band -- arm B's spurious KEEP at p = 0.03546, and arm
+    /// A's trials 14 (p = 0.03546) and 61 (p = 0.02881), which were caught by
+    /// the effect floor alone and would now be caught twice.
+    private static let defaultAlpha = 0.005
+
+    /// 1.0 -> 3.0.
+    ///
+    /// The run log names this the load-bearing criterion: 2 of 100 arm-A
+    /// trials were significant at the corrected alpha AND faster, and were
+    /// stopped by NOTHING BUT this floor. A floor that the measurement noise
+    /// itself can cross is not a floor, and 1.0 was one: arm A's largest
+    /// excursion from 1.0 on identical code was 1.39% and arm B's was 3.215%
+    /// (run-log Task 22). 3.0 sits above the first with room and is the
+    /// smallest round number that does.
+    private static let defaultMinEffectPct = 3.0
+
+    /// 5.0 -> 3.0, chosen to be EQUAL to `defaultMinEffectPct`.
+    ///
+    /// At 1.0/5.0 the rule was indefensibly asymmetric: a change could regress
+    /// one benchmark by 4.9% -- significantly, measurably -- and still be
+    /// committed unattended on the strength of a 1.0% aggregate win. The
+    /// harness would have been trading 4.9% of harm for 1.0% of benefit and
+    /// calling it progress.
+    ///
+    /// Equality is the principle worth stating: NO SINGLE BENCHMARK MAY BE
+    /// HARMED BY MORE THAN THE AGGREGATE WIN THE CHANGE IS REQUIRED TO
+    /// DEMONSTRATE. Anything looser re-opens the trade above; anything tighter
+    /// is not supported by measurement -- 2.0 was the alternative considered
+    /// and rejected, because arm A's measured no-op excursion reaches 1.39%
+    /// and rule 3 fires at the UNCORRECTED alpha, so a 2.0 guard leaves only
+    /// 0.6 pp between ordinary build drift and an outright refusal. That
+    /// direction of error is not harmless: it spends the loop's night
+    /// DISCARDING real wins over drift nobody introduced.
+    private static let defaultMaxRegressPct = 3.0
+
     private static let defaultTimeoutSeconds = 600
+
+    /// The config `init` writes, given the three things it had to discover.
+    ///
+    /// Extracted from `runReportingCommit` for ONE reason: until this existed,
+    /// nothing in the test suite bound the shipped defaults, so the five
+    /// numbers that ARE the KEEP rule for every repository that never edits
+    /// `config.yaml` could be changed by anyone, in a one-character diff, with
+    /// a green suite. `theShippedDefaultsAreWhatTheReviewSettledOn` in
+    /// `InitRunnerTests` now fails if any of them moves, so moving one is a
+    /// deliberate act with a diff that says so -- which is the whole point of
+    /// freezing a policy in a constant rather than in a habit.
+    ///
+    /// Not `private`: the test reaches it through `@testable import`, and a
+    /// value this load-bearing being untestable was the defect.
+    static func defaultConfig(
+        scope: [String], benchmarkTarget: String, benchmarks: [String]
+    ) -> Config {
+        Config(
+            version: 1,
+            scope: scope,
+            benchmarkTarget: benchmarkTarget,
+            benchmarks: benchmarks,
+            count: defaultCount,
+            alpha: defaultAlpha,
+            minEffectPct: defaultMinEffectPct,
+            maxRegressPct: defaultMaxRegressPct,
+            timeoutSeconds: defaultTimeoutSeconds
+        )
+    }
 
     private static func todayTag(now: Date = Date()) -> String {
         let fmt = DateFormatter()
@@ -596,17 +702,8 @@ public enum InitRunner {
 
         let scope = deriveScope(from: description)
 
-        let config = Config(
-            version: 1,
-            scope: scope,
-            benchmarkTarget: chosenTarget.name,
-            benchmarks: names,
-            count: defaultCount,
-            alpha: defaultAlpha,
-            minEffectPct: defaultMinEffectPct,
-            maxRegressPct: defaultMaxRegressPct,
-            timeoutSeconds: defaultTimeoutSeconds
-        )
+        let config = defaultConfig(
+            scope: scope, benchmarkTarget: chosenTarget.name, benchmarks: names)
         // Belt-and-suspenders: if `scope` somehow came back empty (e.g. every
         // discovered target is a test or benchmark target), fail loudly here via the
         // same ConfigError the config would fail on at load time, rather than writing

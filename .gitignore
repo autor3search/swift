@@ -3,3 +3,10 @@
 *.dSYM/
 .DS_Store
 docs/
+
+# Scratch directory for the development harness that built this repository.
+# It was previously hidden only by an UNTRACKED `.superpowers/sdd/.gitignore`
+# containing `*` -- so nothing in version control actually prevented it from
+# shipping, and a fresh clone or a `git clean` would have made it visible again.
+# A rule that must hold has to be tracked.
+.superpowers/

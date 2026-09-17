@@ -87,7 +87,15 @@ import Foundation
     let clean = DoctorChecks.conditionalTestGating(strongHits: [], environmentReadCount: 0)
     #expect(clean.level == .ok)
     #expect(clean.detail.contains("blind spot"))
-    #expect(clean.detail.contains("guard"))
+    // WAS `clean.detail.contains("guard")`, CHANGED DELIBERATELY. The old
+    // blind-spot text named a `guard` at the top of a test body, and a
+    // security review then defeated gate 6 with the test body untouched: the
+    // real limit is that a frozen test constrains behaviour only as far as the
+    // code it calls is honest. Asserting on "guard" would now pin the harness
+    // to the wording that misdirected the reviewer, so it asserts on the
+    // corrected claim instead. `guard` is still mentioned, in the full text
+    // printed by `comparisonOperatorShadowing`.
+    #expect(clean.detail.contains("HONEST"))
 
     // A strong hit (`.enabled(if:`, `XCTSkip`, `ConditionTrait`, ...) is a real warning.
     let strong = DoctorChecks.conditionalTestGating(
@@ -424,4 +432,138 @@ import Foundation
         lockfileGitIgnored: false,
         recordedPins: ["sep16": String(repeating: "a", count: 64)])
     #expect(f.level == .ok)
+}
+
+// =====================================================================
+// MARK: - Forged comparisons
+// =====================================================================
+
+/// THE ATTACK, verbatim. A security review defeated gate 6 without disabling a
+/// single test: the frozen tests ran, their assertions executed, and they
+/// passed, because in-scope code gutted the function AND redeclared the
+/// comparison the assertion uses. `eval` then reported `rc=0` on a change that
+/// computes nothing.
+///
+/// The line below is the second half of that pair, exactly as it was written.
+/// It must be classified as SHADOWING -- `[String: Int]` is already Equatable,
+/// so this declaration is not a conformance, it is an override of one.
+@Test func theForgedComparisonFromTheSecurityReviewIsClassifiedAsShadowing() {
+    let forged = "public func == (lhs: [String: Int], rhs: [String: Int]) -> Bool { true }"
+    let verdict = DoctorChecks.classifyOperatorDeclaration(forged)
+    #expect(verdict?.isShadowing == true, "the exact declaration that defeated gate 6 was not flagged")
+    #expect(verdict?.op == "==")
+}
+
+/// THE CRY-WOLF SIDE, which matters just as much: an ordinary hand-written
+/// `Equatable` / `Comparable` conformance on the repository's own types must
+/// NOT warn. `doctor`'s own stated policy is that a check firing on every
+/// healthy repository trains people to stop reading all of them.
+@Test func ordinaryEquatableAndComparableConformancesAreNotFlaggedAsShadowing() {
+    let ordinary = [
+        "    static func == (lhs: Self, rhs: Self) -> Bool {",
+        "    public static func == (lhs: Token, rhs: Token) -> Bool {",
+        "    static func < (lhs: Version, rhs: Version) -> Bool {",
+        "public func == (lhs: [Row], rhs: [Row]) -> Bool {",
+        "func == <T: Identifiable>(lhs: Boxed<T>, rhs: Boxed<T>) -> Bool {",
+    ]
+    for line in ordinary {
+        let verdict = DoctorChecks.classifyOperatorDeclaration(line)
+        #expect(verdict != nil, "not recognised as an operator declaration at all: \(line)")
+        #expect(verdict?.isShadowing == false, "an ordinary conformance was flagged: \(line)")
+    }
+
+    // And nothing that is not an operator declaration may be classified as one.
+    for line in [
+        "    func compare<T>(_ a: T, _ b: T) -> Int {",
+        "    let equal = a == b",
+        "    if counts == expected { return }",
+        "    func lessThan(_ a: Int, _ b: Int) -> Bool { a < b }",
+        "myfunc == (lhs: Int, rhs: Int)",
+    ] {
+        #expect(DoctorChecks.classifyOperatorDeclaration(line) == nil,
+                "a non-declaration was read as an operator declaration: \(line)")
+    }
+}
+
+/// Every operator a frozen assertion can be routed through, on standard-library
+/// operands. `~=` is the one worth having a test for: it is what `switch`/`case`
+/// and a range assertion reduce to, and it is the least obvious member of the
+/// set.
+@Test func everyComparisonOperatorIsCoveredIncludingTheNonObviousOnes() {
+    let cases: [(String, String)] = [
+        ("func == (lhs: String, rhs: String) -> Bool { true }", "=="),
+        ("func != (lhs: String, rhs: String) -> Bool { false }", "!="),
+        ("func < (lhs: Int, rhs: Int) -> Bool { true }", "<"),
+        ("func <= (lhs: Int, rhs: Int) -> Bool { true }", "<="),
+        ("func > (lhs: Double, rhs: Double) -> Bool { false }", ">"),
+        ("func >= (lhs: Double, rhs: Double) -> Bool { false }", ">="),
+        ("func ~= (lhs: Range<Int>, rhs: Int) -> Bool { true }", "~="),
+    ]
+    for (line, expected) in cases {
+        let verdict = DoctorChecks.classifyOperatorDeclaration(line)
+        #expect(verdict?.op == expected, "wrong operator read from: \(line)")
+        #expect(verdict?.isShadowing == true, "not flagged as shadowing: \(line)")
+    }
+    // Longest-match: `<=` must never be read as `<`, or the reported operator
+    // would be a lie in the one place a human is being asked to look.
+    #expect(DoctorChecks.classifyOperatorDeclaration("func <= (lhs: Int, rhs: Int) -> Bool {")?.op == "<=")
+    #expect(DoctorChecks.classifyOperatorDeclaration("func >= (lhs: Int, rhs: Int) -> Bool {")?.op == ">=")
+}
+
+/// `[String: Int]` must yield `["String", "Int"]` and `[Row]` must yield
+/// `["Row"]` -- the sugar is punctuation, the named types are the signal.
+@Test func parameterTypeIdentifiersSeeThroughSugarAndDropParameterNames() {
+    #expect(DoctorChecks.typeIdentifiers(inParameterList: "lhs: [String: Int], rhs: [String: Int]")
+            == ["String", "Int", "String", "Int"])
+    #expect(DoctorChecks.typeIdentifiers(inParameterList: "lhs: [Row], rhs: [Row]") == ["Row", "Row"])
+    #expect(DoctorChecks.typeIdentifiers(inParameterList: "lhs: Self, rhs: Self") == ["Self", "Self"])
+    #expect(DoctorChecks.typeIdentifiers(inParameterList: "_ lhs: String?, _ rhs: String?")
+            == ["String", "String"])
+}
+
+/// The Finding itself: warn on shadowing, inform (never warn) on ordinary
+/// conformances, and name the REAL blind spot in both branches.
+@Test func comparisonOperatorFindingWarnsOnShadowingAndOnlyInformsOnOrdinaryConformances() {
+    let clean = DoctorChecks.comparisonOperatorShadowing(shadowingHits: [], ordinaryOperatorCount: 0)
+    #expect(clean.level == .ok)
+
+    // Twelve ordinary Equatable conformances is a NORMAL repository. If this
+    // ever becomes `.warn`, the check has started crying wolf and will be
+    // ignored on the day it matters.
+    let ordinary = DoctorChecks.comparisonOperatorShadowing(
+        shadowingHits: [], ordinaryOperatorCount: 12)
+    #expect(ordinary.level == .ok, "an ordinary Equatable conformance must never raise a warning")
+    #expect(ordinary.detail.contains("12"))
+
+    let shadowing = DoctorChecks.comparisonOperatorShadowing(
+        shadowingHits: ["Sources/Demo/Demo.swift:9: public func == (lhs: [String: Int], rhs: [String: Int]) -> Bool { true }"],
+        ordinaryOperatorCount: 0)
+    #expect(shadowing.level == .warn)
+    #expect(shadowing.detail.contains("Demo.swift:9"))
+    #expect(shadowing.detail.contains("overload resolution"))
+}
+
+/// THE CORRECTED BLIND-SPOT TEXT. The wording this replaces told a reviewer to
+/// "review tests with non-trivial early setup by hand" -- pointing at the test
+/// body, which in the demonstrated attack was UNTOUCHED. Every branch that
+/// prints a blind spot must now name the real class instead.
+@Test func theBlindSpotTextNamesGuttedCodeAndForgedComparisonsNotTheTestBody() {
+    let branches = [
+        DoctorChecks.conditionalTestGating(strongHits: [], environmentReadCount: 0),
+        DoctorChecks.conditionalTestGating(strongHits: [], environmentReadCount: 4),
+        DoctorChecks.conditionalTestGating(strongHits: ["Tests/T.swift:1: XCTSkip()"],
+                                           environmentReadCount: 0),
+        DoctorChecks.comparisonOperatorShadowing(shadowingHits: [], ordinaryOperatorCount: 0),
+        DoctorChecks.comparisonOperatorShadowing(
+            shadowingHits: ["Sources/Demo/Demo.swift:9: func == (lhs: Int, rhs: Int) -> Bool { true }"],
+            ordinaryOperatorCount: 0),
+    ]
+    for f in branches {
+        #expect(f.detail.contains("HONEST"),
+                "a blind-spot branch no longer states the real limit of a frozen test: \(f.title)")
+        #expect(f.detail.contains("forge"),
+                "a blind-spot branch does not name the forged comparison: \(f.title)")
+        #expect(!f.detail.contains("review tests with non-trivial early setup by hand"),
+                "the misdirecting wording came back in: \(f.title)")
+    }
 }

@@ -615,3 +615,96 @@ private func describeJSON(targets: [(name: String, path: String, type: String, p
         }
     }
 }
+
+// =====================================================================
+// MARK: - The shipped defaults
+// =====================================================================
+
+/// THE FIVE NUMBERS THAT ARE THE KEEP RULE.
+///
+/// For every repository that runs `init` and never opens `config.yaml` --
+/// which is the intended workflow and therefore most of them -- these are the
+/// entire acceptance policy. Until this test existed nothing in the suite
+/// bound them: `alpha` could go back to 0.05 in a one-character diff and the
+/// suite would stay green, which is exactly how the configuration that a
+/// comment-only commit cleared came to ship.
+///
+/// EACH VALUE, AND WHY IT IS THAT VALUE (the reasoning is on the constants in
+/// `InitRunner`; this is the binding):
+///
+///   - `alpha: 0.005`, not 0.05. `init` writes ONE benchmark for a
+///     single-benchmark package, so k = 1, so alpha/k == alpha and the
+///     "Bonferroni-corrected" threshold is not corrected at all in the default
+///     configuration. Cheap: the exact two-sided p-value floor at count 10 is
+///     1.0825e-5, so 0.005 still admits 461 simultaneous benchmarks before a
+///     KEEP becomes unreachable.
+///   - `min_effect_pct: 3.0`, not 1.0. The run log's Task 22 measured the
+///     effect floor as the criterion actually holding the false-KEEP rate
+///     down, and measured no-op excursions from ratio 1.0 reaching 1.39%
+///     (arm A) and 3.215% (arm B) on IDENTICAL code.
+///   - `max_regress_pct: 3.0`, not 5.0, and deliberately EQUAL to
+///     `min_effect_pct`: no single benchmark may be harmed by more than the
+///     aggregate win the change is required to demonstrate. At 1.0/5.0 a
+///     change could regress a benchmark 4.9% on the strength of a 1.0% win.
+///   - `count: 10`, UNCHANGED. Raising it makes a drifting no-op read MORE
+///     significant, not less -- the two sides are separate builds, so their
+///     difference is a biased estimate and more rounds resolve a bias better.
+///     Pinned here so that "raise count" is never reached for accidentally.
+///   - `timeout_seconds: 600`, unchanged.
+///
+/// If you are changing one of these, change it here too, and say why in the
+/// commit. That is the point.
+@Test func theShippedDefaultsAreWhatTheReviewSettledOn() throws {
+    let c = InitRunner.defaultConfig(
+        scope: ["Sources/Lib/**"], benchmarkTarget: "Bench", benchmarks: ["B"])
+    #expect(c.count == 10)
+    #expect(c.alpha == 0.005)
+    #expect(c.minEffectPct == 3.0)
+    #expect(c.maxRegressPct == 3.0)
+    #expect(c.timeoutSeconds == 600)
+    #expect(c.version == 1)
+
+    // The equality is the policy, not a coincidence of two literals.
+    #expect(c.maxRegressPct == c.minEffectPct,
+            "a change must not harm one benchmark by more than the aggregate win it must show")
+
+    // And the defaults must survive their own validator, including the
+    // reachability check that `validate()` cannot perform.
+    try c.validate()
+    #expect(c.keepReachabilityWarning() == nil,
+            "the shipped defaults must not warn that no KEEP is reachable")
+
+    // The README publishes the YAML `init` writes. Print the real bytes so
+    // that block is transcribed rather than composed.
+    print("[defaults] serialized config.yaml:\n\(try c.serialized())")
+}
+
+/// The alpha change is only defensible if it stays cheap, so the cost is
+/// measured here rather than asserted in prose. At the shipped `count: 10`
+/// the exact two-sided p-value floor is `2 / C(20,10)`, and the shipped alpha
+/// divided by it is how many benchmarks may be compared simultaneously before
+/// Bonferroni pushes alpha/k under that floor and every experiment discards
+/// however good the change is.
+@Test func theReachabilityTableIsCorrectAtTheShippedDefaultAlpha() {
+    let floor = MannWhitney.pValueFloor(roundsPerSide: 10)
+    #expect(abs(floor - 2.0 / 184756.0) < 1e-18)
+    #expect(abs(floor - 1.0825e-5) < 1e-9)
+
+    // The whole cost of the 10x tightening: 4618 benchmarks -> 461.
+    //
+    // 461, NOT 462. `0.005 / 1.0825e-5 = 461.89` and
+    // `maxBenchmarksWithReachableKeep` floors -- correctly, since 462 would
+    // put alpha/k BELOW the p-value floor. This assertion exists partly
+    // because the review's own write-up said 462; the tool's answer is what
+    // ships, so the tool's answer is what is written down.
+    #expect(MannWhitney.maxBenchmarksWithReachableKeep(roundsPerSide: 10, alpha: 0.005) == 461)
+    #expect(MannWhitney.maxBenchmarksWithReachableKeep(roundsPerSide: 10, alpha: 0.05) == 4618)
+
+    // Below the shipped count, alpha 0.005 does bite, and the hard `count >= 4`
+    // validator is NOT enough on its own -- which is why `countTooSmall`'s text
+    // now says so, and why `keepReachabilityWarning` is the check that catches
+    // it. `0` here means "not even one benchmark": no KEEP at all.
+    #expect(MannWhitney.maxBenchmarksWithReachableKeep(roundsPerSide: 4, alpha: 0.005) == 0)
+    #expect(MannWhitney.maxBenchmarksWithReachableKeep(roundsPerSide: 5, alpha: 0.005) == 0)
+    #expect(MannWhitney.maxBenchmarksWithReachableKeep(roundsPerSide: 6, alpha: 0.005) == 2)
+}

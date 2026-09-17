@@ -78,7 +78,7 @@ cp .build/release/autor3search-swift /usr/local/bin/
 
 Requires Swift 6.0 or newer (`swift-tools-version: 6.0`). Developed and measured
 on Swift 6.4 / macOS 26.6.2. See
-[limitation 9](#9-platform-and-environment) for what is verified where — Linux is
+[limitation 11](#11-platform-and-environment) for what is verified where — Linux is
 correctness-verified only, and no Linux timing exists.
 
 ## The idea
@@ -182,23 +182,63 @@ scope:
 benchmarks:
 - CountWords
 count: 10
-alpha: 5e-2
+alpha: 5e-3
 benchmark_target: Bench
-min_effect_pct: 1e+0
-max_regress_pct: 5e+0
+min_effect_pct: 3e+0
+max_regress_pct: 3e+0
 timeout_seconds: 600
 ```
 
 | Key | Default | Meaning |
 |---|---|---|
-| `scope` | derived | Glob list. A commit touching anything outside it is rejected before anything is built. |
+| `scope` | derived | Glob list. A commit touching anything outside it is rejected before anything is built. An entry is either a literal path, `<prefix>/**` (any depth **under** `<prefix>`), or `<prefix>/*` (exactly one component under it). `Sources/**` requires the trailing slash to match, so a path that is literally `Sources` does **not** match it — under-matching, deliberately. |
 | `benchmark_target` | derived | The one executable target that depends on the `Benchmark` product. |
 | `benchmarks` | derived | The benchmark names to measure. |
-| `count` | `10` | Rounds per side, interleaved B, C, B, C, … |
-| `alpha` | `0.05` | Significance level. |
-| `min_effect_pct` | `1.0` | A win must be at least this large. See [Scoring](#scoring) — this floor does more work than anything else in the rule. |
-| `max_regress_pct` | `5.0` | A benchmark regressing beyond this, significantly, is an outright refusal. |
+| `count` | `10` | Rounds per side, interleaved B, C, B, C, … Raising it is the intuitive response to a noisy verdict and the wrong one — see [limitation 6](#6-measurement-scale-changes-the-answer-so-state-the-scale). |
+| `alpha` | `0.005` | Significance level. |
+| `min_effect_pct` | `3.0` | A win must be at least this large. See [Scoring](#scoring) — this floor does more work than anything else in the rule. |
+| `max_regress_pct` | `3.0` | A benchmark regressing beyond this, significantly, is an outright refusal. Equal to `min_effect_pct` on purpose. |
 | `timeout_seconds` | `600` | Per build / test / measurement step. |
+
+### Why these defaults, and what they were before
+
+They changed after a measurement review, and the reasoning is worth having in
+front of you before you edit them.
+
+**`alpha` is `0.005`, not the conventional `0.05`.** For a single-benchmark
+package `init` writes `k = 1`, and at `k = 1` the Bonferroni-corrected threshold
+`alpha/k` is *numerically identical* to the uncorrected one — the "corrected"
+bar in the default configuration is not corrected at all. Asking a bare `0.05`
+to separate two *separately compiled binaries* is asking too much of it, and the
+run log records it failing: the one spurious KEEP measured in 100 trials of a
+comment-only commit came in at `p = 0.03546`, inside the band `0.005` rejects.
+The tightening is close to free. At `count: 10` the exact two-sided
+Mann-Whitney p-value floor is `2 / C(20,10) = 1.0825e-5`, so `alpha/k` still
+admits **461** simultaneous benchmarks before a KEEP becomes unreachable at all
+(it was 4618), and a real win saturates the floor regardless — the 8.5× KEEP
+below does.
+
+**`min_effect_pct` is `3.0`, not `1.0`.** This is the criterion actually holding
+the false-KEEP rate down — 2 of 100 trials on identical code were significant
+*and* faster and were stopped by nothing else. A floor the measurement noise can
+step over is not a floor, and `1.0` was one: on *identical code*, the measured
+excursion from ratio 1.0 reached **1.39%** at ~3.6 ms per iteration and **3.215%**
+at ~54 µs.
+
+**`max_regress_pct` is `3.0`, not `5.0`, and is equal to `min_effect_pct`
+deliberately.** At `1.0 / 5.0` the rule was indefensibly lopsided: a change could
+significantly regress one benchmark by 4.9% and still be committed unattended on
+the strength of a 1.0% aggregate win — 4.9% of harm traded for 1.0% of benefit,
+overnight, with nobody watching. Equality states the principle instead: **no
+single benchmark may be harmed by more than the aggregate win the change is
+required to demonstrate.** `2.0` was the alternative and was rejected on
+measurement: rule 3 fires at the *uncorrected* alpha, and no-op excursions reach
+1.39% at the shipped scale, so a `2.0` guard leaves 0.6 pp between ordinary
+build-to-build drift and an outright refusal — which spends the night
+discarding real wins over drift nobody introduced.
+
+**`count` stayed at `10`.** See [limitation 6](#6-measurement-scale-changes-the-answer-so-state-the-scale):
+raising it makes a drifting no-op read *more* significant, not less.
 
 Then check the machine, and freeze:
 
@@ -220,6 +260,8 @@ per check (it prints a paragraph of explanation under each):
 [OK]   Free disk space            626.3 GB free.
 [WARN] Working tree               The working tree has uncommitted changes. [...]
 [OK]   Conditionally-gated tests  No `.enabled(if:)`, `.disabled(if:)`, `XCTSkip`, or `ConditionTrait` usage found [...]
+[OK]   Comparison operators in optimizable code
+       No operator declaration in the package's non-test source redeclares a comparison for standard-library operand types. [...]
 [OK]   Dependency pin (Package.resolved)
 [OK]   Configuration              .autor3search/config.yaml found.
 [OK]   Expected measurement length
@@ -240,7 +282,9 @@ Baseline readme established
 `baseline` creates the run branch `autor3search-swift/<tag>`, copies every file
 in every declared test and benchmark target into the frozen snapshot, pins a
 detached worktree at the baseline commit, and warms that worktree's own build
-directory. It refuses a dirty tree and a reused tag.
+directory. It refuses a reused tag, and refuses a tree that
+`git status --porcelain` reports as dirty — which does **not** include files
+matched by a `.gitignore` rule.
 
 ## Watching and stopping
 
@@ -250,7 +294,7 @@ DISCARD:
 ```
 $ autor3search-swift status --tag readme
 Status for tag "readme"
-  run directory:       /Users/galb/Library/Caches/autor3search-swift/fbff97c237a80426/readme
+  run directory:       ~/Library/Caches/autor3search-swift/fbff97c237a80426/readme
   frozen commit:       0662f59e4394c728b359a4dd29f75c3e030f0fa4
   measurement commit:  3b1dbc9076435c4f43b1fdaa014a0910cc4f5876
   repo HEAD:           585e9c279e359834e4e4d1fe34d54ef5b07714a2 (branch autor3search-swift/readme)
@@ -319,11 +363,11 @@ built or measured — a `FAIL` from them costs seconds, not minutes.
 | 1 | **Scope.** Every path changed between `frozenCommit` and `HEAD` must match a `scope` glob. Any change to `Package.swift` or `Package.resolved` is rejected outright, regardless of scope. | `out_of_scope`, `manifest_change_rejected` |
 | 2 | **Config integrity.** SHA-256 of `.autor3search/config.yaml` must equal what `baseline` recorded. | `config_hash_mismatch` |
 | 2a | **Manifest integrity, by hash.** `Package.swift` and `Package.resolved` *as they are on disk*, plus every manifest in the recorded inventory (nested `Sub/Package.swift`, `Package@swift-6.0.swift`, anything under `.swiftpm/`), must hash to what `baseline` recorded — and a manifest *appearing* where baseline recorded none is itself a mismatch. | `manifest_change_rejected`, `baseline_predates_manifest_inventory` |
-| 2b | **Clean working tree.** `eval` builds and measures the *working tree*, while gate 1 inspects *commits*. An uncommitted edit would be measured but never gated. | `dirty_working_tree` |
+| 2b | **Clean working tree**, as `git status --porcelain` defines clean. `eval` builds and measures the *working tree*, while gate 1 inspects *commits*. An uncommitted edit would be measured but never gated. **`--porcelain` omits ignored files**, so a source file matched by a `.gitignore` rule is not reported, compiles, and is measured. | `dirty_working_tree` |
 | 3 | **Restore frozen files.** Every file in every frozen test and benchmark target is restored from the snapshot, byte for byte. | `frozen_restore_refused` |
 | 4 | **Reject new files** appearing in any frozen target directory. | `new_test_or_benchmark_file` |
 | 5 | **Release build.** `swift build -c release`, plus the benchmark target and `BenchmarkTool` by name. | `build_failed`, `build_timed_out` |
-| 6 | **Tests.** `swift test`. | `tests_failed`, `tests_timed_out` |
+| 6 | **Tests.** `swift test` — which builds and runs in **debug**, while everything measured is **release**. See [limitation 9](#9-gate-6-tests-a-debug-build-the-binary-that-is-measured-and-kept-is-release). | `tests_failed`, `tests_timed_out` |
 | 7 | **Worktree integrity.** The pinned measurement worktree is at the expected commit and unmodified. | `worktree_integrity` |
 | 8 | **Measure.** Interleaved, `count` rounds per side, baseline and candidate alternating, one discarded warm-up sample per side. | — |
 | 9 | **Score.** The three-part rule below. | `no_significant_improvement`, `improvement_below_min_effect`, `significant_regression` |
@@ -354,13 +398,41 @@ Every row is a way to make the number go down without making the code faster.
 | Plant a *nested* manifest git never saw | Gate 2a's inventory refuses a manifest appearing where baseline recorded none. |
 | Move the dependency pin | `Package.resolved` is in the same rejection as `Package.swift`; `init` refuses to configure a repository whose lockfile is gitignored. |
 | Edit `.autor3search/config.yaml` — widen scope, drop a benchmark, lower `min_effect_pct` | Gate 2 compares its SHA-256 against the baseline record. |
-| Measure an uncommitted edit | Gate 2b refuses a dirty tree. |
-| Tamper with the frozen snapshot, the baseline record, or the pinned worktree | They are not in the repository. See [The idea](#the-idea). |
+| Measure an uncommitted edit | Gate 2b refuses a tree that `git status --porcelain` reports as dirty. That listing **omits ignored files**, so a source file matching a `.gitignore` rule is not reported, compiles, and is measured. Untracked-but-not-ignored files *are* caught. |
+| Tamper with the frozen snapshot, the baseline record, or the pinned worktree | They live outside the repository, so the *scope gate* does not apply to them — **that is a boundary, not a defence.** See [the threat model](#what-the-harness-does-not-defend-against). |
 | Swap a frozen file for a symlink so the restore overwrites something else | Gate 3 refuses, records `frozen_restore_refused`, and taints the run so every later eval refuses until a human clears it. |
 | Coast on an earlier win | The measurement point advances on KEEP. See [The two commits](#the-two-commits). |
 | Conditionally skip a test from optimizable code | `doctor` scans for `.enabled(if:)`, `.disabled(if:)`, `XCTSkip` and `ConditionTrait`, in test targets *and* in non-test sources. **This one is not closed.** See [limitation 1](#1-gate-6-runs-your-tests-and-that-is-the-softest-link-in-the-chain). |
+| Gut a function and forge the comparison its frozen assertion uses | `doctor` warns when in-scope code declares `==`, `!=`, `<`, `<=`, `>`, `>=` or `~=` for operand types that are *already* comparable in the standard library — a redeclaration, not a conformance. **This one is not closed either**, and the gutted function on the other side of the assertion is not detectable at all. See [limitation 1](#1-gate-6-runs-your-tests-and-that-is-the-softest-link-in-the-chain). |
 
-## Scoring
+## What the harness does not defend against
+
+Everything above is about a **commit**. That is the boundary, and it is worth
+stating where it ends rather than letting an absence of discussion read as a
+guarantee.
+
+**The harness assumes the agent runs as a process that does not attack the
+machine it runs on.** The frozen snapshot, the baseline record and the pinned
+worktree live under `~/Library/Caches/autor3search-swift/…` (or
+`AUTOR3SEARCH_SWIFT_STATE_HOME`). They are *plain files, owned by the same user
+as the agent*, and `baseline.json` is unauthenticated JSON. Being outside the
+repository puts them outside the scope gate — nothing more. Anything that can
+write as that user can edit `measurementCommit` in `baseline.json` and reproduce
+the coasting bug the two-commit design exists to prevent; nothing in the harness
+would notice, and the gate list above does not claim otherwise.
+
+**The reason this is a boundary and not a hole to be plugged:** the same process
+can also rewrite the tool's own binary, the toolchain, or the benchmark's
+`.build` directory. A MAC over the baseline record would have to be keyed by
+something that process cannot read, and there is nowhere to put such a key that
+the agent's own user cannot reach. Signing state against an attacker who already
+runs as you is theatre.
+
+So: run this against code you are willing to have compiled and executed, in a
+directory you are willing to have written to, by an agent you are supervising to
+the degree the work deserves. What the gates give you is that **the commit that
+gets kept is the commit that was measured**, on criteria that did not move while
+it was measured. That is a real property and it is not this one.
 
 A benchmark's **ratio** is `candidateMedian / baselineMedian` — below 1.0 is
 faster. The **score** is the geometric mean of the per-benchmark ratios.
@@ -481,6 +553,19 @@ Instead it was refused for two independent reasons: `p = 0.075` is not below the
 corrected alpha of 0.05 (rule 2), and `ratio = 0.9928` is not below the 0.99
 effect floor (rule 1).
 
+**Both transcripts above were captured at the previous defaults** (`alpha: 0.05`,
+`min_effect_pct: 1.0`), which is why the JSON reads `"alpha":0.05` and
+`"corrected_alpha":0.05`. They are reproduced unedited rather than rewritten to
+match today's defaults, because the numbers in them were measured and a
+retouched transcript is not. Under the shipped defaults the two verdicts are the
+same and the margins are wider: experiment 1's `p = 0.00001` is the exact
+p-value floor at `count: 10`, well inside `alpha/k = 0.005`, and `ratio 0.1177`
+clears a 3% floor as easily as a 1% one; experiment 2's `p = 0.075` and
+`ratio 0.9928` now miss *both* rules by more. Note also that the `corrected_alpha`
+here equals `alpha` — `k = 1`, so Bonferroni divides by one. That is the
+observation that drove the alpha change; see
+[Why these defaults](#why-these-defaults-and-what-they-were-before).
+
 ```
 $ autor3search-swift report
 Report
@@ -526,8 +611,9 @@ p50 wall-clock in nanoseconds, sorted:
 n = 30, median 25 295 ns, mean 26 040 ns, sd 3 355 ns, CV 12.88%.
 
 **Twenty-nine of thirty lie between 25 007 and 27 215 ns**, and the bulk of those
-sit inside a band roughly 0.4% wide (25 263 to 25 375 ns) — finer than the 1%
-default `min_effect_pct` the scoring rule has to resolve. **One observation lands
+sit inside a band roughly 0.4% wide (25 263 to 25 375 ns) — finer than the
+`min_effect_pct` the scoring rule has to resolve, at either the 1.0 this was
+measured against or today's 3.0. **One observation lands
 at 43 679 ns, 73% above the median**, and that single outlier accounts for
 essentially all of the 12.88% CV.
 
@@ -579,6 +665,17 @@ warning, on a commit whose only change was one comment line. Largest excursion
 **3.215%**, mean ratio **0.99835** — *biased* toward the candidate, not noise
 about 1.0.
 
+**Both arms were run at the previous defaults** (`alpha: 0.05`,
+`min_effect_pct: 1.0`), and the numbers above are that run, unedited. It is
+worth reading them against today's defaults, because they are *why* the defaults
+moved: arm B's false KEEP at `p = 0.03546` does not clear `alpha = 0.005`, and
+its `ratio 0.98853` — a 1.15% "win" — does not clear a 3.0% effect floor either.
+Both criteria now reject it, independently. That is a statement about what the
+shipped rule would have done to one measured observation, not a claim of a new
+measured rate: **no false-KEEP rate has been measured at the new defaults.** The
+0/100 and 1/100 above remain the only measured figures this README has, and they
+describe the old rule.
+
 **The false-KEEP rate is not a constant of the tool.** It is a property of the
 tool *and* the benchmark you point it at. A benchmark that runs in tens of
 microseconds should expect the second row, not the first.
@@ -598,6 +695,13 @@ B had 15 trials clear the 1% floor against arm A's 4. The effect floor is not
 belt-and-braces; it is the part holding the rate down. Lowering
 `min_effect_pct` costs you more than it looks like it should.
 
+This is the measurement the default `min_effect_pct` moved on: a criterion doing
+*all* the work at 1.0% is a criterion with no margin, and both trials above are
+inside the 1.39% excursion the same 100 trials produced on identical code. At
+3.0% neither is close — and both would now fail rule 2 as well, since `p = 0.035`
+and `p = 0.029` are above `alpha = 0.005`. The floor stops being the only thing
+standing between a no-op and a KEEP.
+
 One more thing worth recording: arm B's false KEEP advanced
 `measurementCommit`, as designed — and the 60 trials that followed it all
 discarded. The harness recovered from its own false positive rather than
@@ -614,11 +718,43 @@ disabled without touching any frozen file.
 non-test sources, which is the custom-trait evasion. Comments and string literals
 are excluded, so the check does not flag its own documentation.
 
-**The residual hole, which no text scan can close:** a plain
-`guard someCondition else { return }` at the top of a test body disables that test
-using no marker at all. Flagging every `guard` in every test would be pure noise.
-`doctor` prints this blind spot in its own output. Review tests with non-trivial
-early setup by hand.
+**But skipping is the narrow case, and it is not the one that matters most.** A
+security review defeated gate 6 without disabling a single test. The tests ran.
+The assertions executed. They passed. In-scope code declared a concrete overload
+that wins overload resolution over the synthesized one:
+
+```swift
+public func countWords(_ s: String) -> [String: Int] { return [:] }      // gutted
+public func == (lhs: [String: Int], rhs: [String: Int]) -> Bool { true } // forged
+```
+
+`swift test` exits 0 on that tree — reproduced for this README on a minimal
+package whose only test is `#expect(countWords("a b a") == ["a": 2, "b": 1])`,
+and recorded in the project's run log. The benchmark then measures a function
+that computes nothing, so `eval` sees an enormous "win". No skip construct
+appears anywhere, so the gating scan above was correctly silent — it is not what
+that scan is for.
+
+**The real class, stated plainly: a frozen test constrains behaviour only as far
+as the code it calls is honest.** In-scope code can satisfy an assertion without
+preserving semantics, by gutting a function and forging the comparison the
+assertion uses. The test file is untouched, so *reviewing the test tells you
+nothing* — earlier versions of this README and of `doctor`'s own output advised
+exactly that, and the advice pointed at the one file that was innocent.
+
+`doctor` now covers half of it: it warns when optimizable code declares `==`,
+`!=`, `<`, `<=`, `>`, `>=` or `~=` whose operands are **entirely
+standard-library types**. Those types are already `Equatable`/`Comparable`, so
+such a declaration is not a conformance — it is a shadowing redeclaration, and
+there is no ordinary reason to write one. A hand-written `Equatable` conformance
+on your *own* types is ordinary and is reported as a count, never a warning: a
+check that fires on every healthy repository is a check people stop reading.
+
+**What remains open, and cannot be closed by a text scan:** the gutted function
+itself; a forged comparison written as a method rather than an operator; and the
+`guard someCondition else { return }` at the top of a test body, which disables
+that test with no marker at all. When a KEEP reports an implausibly large win,
+**read the diff, not the test.**
 
 ### 2. "The whole process tree is killed" is not literally true
 
@@ -635,9 +771,22 @@ not more.
 ### 3. Freeze detection keys on the `Benchmark` product dependency
 
 A benchmark *helper* target that does not itself depend on the `Benchmark`
-product is **not frozen**. `scope` is what closes this, and `scope` — not the
-freeze — is the real boundary. If you have benchmark support code in its own
-target, keep it out of `scope`.
+product is **not frozen**. Keeping it out of `scope` is the mitigation, and
+earlier versions of this README said `scope` *closed* the hole. It does not.
+
+Gate 1 compares the paths git reports as changed between `frozenCommit` and
+`HEAD`. `git update-index --assume-unchanged <helper>` makes git stop reporting
+that file, so an edit to an out-of-scope helper is invisible to gate 1 — and
+gate 2b, which reads `git status --porcelain`, does not see it either. The file
+is still on disk and is still compiled into the benchmark. Gate 2a closes this
+for *manifests*, because it hashes the bytes on disk rather than asking git; no
+equivalent inventory exists for source files.
+
+So the honest statement is: **out-of-scope benchmark support code is neither
+frozen nor reliably gated.** If you have benchmark fixtures in their own target,
+the real mitigations are to fold them into the frozen benchmark target (give
+that target the `Benchmark` product dependency) or to review the helper by hand
+before trusting a run. `scope` narrows the attack; it does not end it.
 
 ### 4. Manifest protection: what is and is not covered
 
@@ -670,8 +819,18 @@ At **~48 µs per iteration**, two builds of *identical* code drift by **±3%
 systematically** — not random noise around 1.0. The two sides are different
 binaries in different directories; they are not exchangeable samples, and fixed
 per-process cost (dyld, first-touch page faults on a freshly written binary) is a
-large fraction of each sample. At **~424 µs** the same comparison gave
-**ratio 1.0018, p 0.218**.
+large fraction of each sample. At **~424 µs** the same comparison, repeated
+seven times on identical code, gave **ratios spanning 0.9970 to 1.0082, with a
+smallest p of 0.218** — the drift collapses to well under a percent and no
+observation comes near significance.
+
+*(An earlier revision of this section reported "ratio 1.0018, p 0.218" as a
+single observation. That pair does not exist: `1.001803` was measured with
+`p 0.911797`, and `p 0.217563` came from a different run whose ratio was
+`1.007752`. The ratio was taken from one row and the p-value from another. It
+appeared under a heading that says nothing here is an estimate, which is exactly
+where an error like that does the most damage; the run log's own summary carried
+the same mis-pairing and has been corrected too.)*
 
 **A benchmark that is too small is drift-dominated, and the harness will
 occasionally call identical code a win.** That is the mechanism behind arm B
@@ -704,7 +863,73 @@ or fast.
 Allocation and instruction counts from `profile` are **hints, never scored**.
 Nothing but wall-clock decides a verdict.
 
-### 9. Platform and environment
+### 9. Gate 6 tests a DEBUG build; the binary that is measured and kept is RELEASE
+
+Gate 6 runs `swift test`, which builds and runs in **debug**. Everything that is
+measured — the benchmark target, `BenchmarkTool`, the pinned baseline worktree —
+is built with `swift build -c release`. **The behaviour contract therefore never
+sees the artifact that ships.**
+
+What passes through that gap:
+
+- **A release-only miscompile.** Different optimization pipeline, different
+  inlining, different code. Debug tests passing says nothing about it.
+- **Anything compiled out in release.** `assert` and `assertionFailure` are
+  no-ops under `-O`, and `precondition`'s failure path is reachable but
+  `-Ounchecked` removes it too. A change that relies on an `assert` holding is
+  verified in debug and unverified in the binary that is kept.
+- **Arithmetic-overflow traps**, which debug and release do not treat alike.
+
+**This is stated rather than fixed, because the obvious fix does not work.**
+`swift build -c release --build-tests` **fails** — measured, `rc=1`, with
+`unable to resolve Swift module dependency to a compatible module` on the
+`@testable import` in the test target. `swift test -c release` does work, but it
+builds and rebuilds *the release build graph the measurement depends on*, on
+every eval, so the correctness gate would be contending with the thing it is
+gating on the one dimension (build state) this harness is most sensitive to —
+see [limitation 6](#6-measurement-scale-changes-the-answer-so-state-the-scale)
+for how little it takes to move a ratio. That trade is not obviously worth
+making for a gap this narrow, so the gap is documented instead.
+
+**What to do about it:** if your correctness depends on release-mode behaviour,
+run `swift test -c release` yourself before you trust a night's worth of KEEPs.
+The harness will not do it for you.
+
+### 10. Nothing corrects for multiplicity across the loop
+
+Bonferroni corrects **within one eval**, across the `k` benchmarks it compares.
+Nothing corrects **across evals**. And an overnight run is hundreds of evals.
+
+The arithmetic, with the shipped `alpha: 0.005` and a single benchmark:
+
+| | `alpha = 0.05` (the old default) | `alpha = 0.005` (shipped) |
+|---|---|---|
+| Expected false positives in 300 evals | **~15** | **~1.5** |
+| Probability at least one occurs | ~100% | ~78% |
+
+Those are the nominal figures — `alpha × 300`, and `1 − (1 − alpha)^300` — and
+they are what the significance level *means*, not a measurement. The measured
+figure for this harness is [measured above](#how-often-does-it-say-keep-to-a-change-that-did-nothing),
+and it is lower, because `min_effect_pct` discards most of what clears `alpha`
+alone. But the direction is the point: **this is the dominant
+multiplicity in the design, it is larger than the within-eval multiplicity
+Bonferroni does correct, and it is uncorrected.**
+
+Lowering the default alpha by 10× lowers this by 10×. It does not eliminate it,
+and no threshold can — a fixed significance level run repeatedly produces false
+positives at that rate by construction. Correcting properly would mean dividing
+alpha by the number of experiments you intend to run, which you do not know in
+advance and which would make a KEEP unreachable long before morning.
+
+**So read a night's output as a sequence, not as a verdict.** The harness
+recovers from its own false positives rather than compounding them — the
+measurement point advances on a KEEP, so a spurious win becomes the new baseline
+and the next real change has to beat it (this was observed: the single spurious
+KEEP in 100 trials was followed by 60 discards). What it does not do is tell you
+which of the night's KEEPs was the spurious one. `report` lists them; the diffs
+are yours to read.
+
+### 11. Platform and environment
 
 **macOS** is the developed and measured platform: 250/250 tests pass, and every
 timing in this README was taken there.
@@ -756,7 +981,7 @@ you should read its warnings before trusting an unattended overnight run.
 neither can 4. `eval` warns when no KEEP is reachable at your `count` and tells
 you what it would have to be.
 
-### 10. `init` creates a commit in your repository
+### 12. `init` creates a commit in your repository
 
 It commits exactly `.gitignore` and `Package.resolved` — and only whichever of
 the two is untracked or modified. It stages by path, never `git add -A`. It
@@ -765,7 +990,7 @@ announces the SHA and the paths, states that nothing else was staged, and prints
 `program.md`. A tool that makes a commit in someone else's repository should say
 so before it is run, so: it does, and now you know.
 
-### 11. A known residual TOCTOU in the frozen restore
+### 13. A known residual TOCTOU in the frozen restore
 
 There is a disclosed time-of-check-to-time-of-use window in the frozen-restore
 path. A restore refusal is recorded as `frozen_restore_refused` *plus* a durable

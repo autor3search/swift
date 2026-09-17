@@ -25,7 +25,12 @@ public enum ConfigError: Error, CustomStringConvertible, Equatable {
             count is \(n), which can never reach significance. Mann-Whitney is a rank test: \
             the smallest two-sided p attainable is 2/C(2n,n) - 0.33 at count 2, 0.10 at count 3 \
             - both above any sensible alpha. Every experiment would DISCARD on a technicality \
-            rather than on its merits. Use count >= 4.
+            rather than on its merits. Use count >= 4. Note that 4 is the ALPHA-INDEPENDENT \
+            floor, not advice: whether YOUR count reaches significance depends on your alpha \
+            and your benchmark count, and at the shipped default alpha of 0.005 the smallest \
+            workable count is 6 even with a single benchmark (the floor is 0.0079 at count 5 \
+            and 0.0022 at count 6). `keepReachabilityWarning()` checks that against your \
+            actual numbers; this check cannot, because it does not know them.
             """
         case .badAlpha(let a):
             return "alpha must be between 0 and 1, got \(a)"
@@ -59,10 +64,15 @@ extension Config {
         while needed < 100, corrected < MannWhitney.pValueFloor(roundsPerSide: needed) {
             needed += 1
         }
+        // `%.3g`, not `%.5f`: at the shipped default alpha of 0.005 the
+        // interesting quantities are routinely smaller than 1e-5 (the p-value
+        // floor at count 10 is 1.08e-5), and `%.5f` renders every one of them
+        // as the string "0.00000" -- a diagnostic that prints two equal-looking
+        // zeroes and asks the reader to believe one is below the other.
         return """
         no KEEP is reachable with count \(count) and \(k) benchmarks: the Bonferroni-corrected \
-        threshold alpha/k = \(String(format: "%.5f", corrected)) is below the smallest p this \
-        test can produce, \(String(format: "%.5f", floor)). Every experiment will DISCARD \
+        threshold alpha/k = \(String(format: "%.3g", corrected)) is below the smallest p this \
+        test can produce, \(String(format: "%.3g", floor)). Every experiment will DISCARD \
         however good the change is. Raise count to \(needed).
         """
     }

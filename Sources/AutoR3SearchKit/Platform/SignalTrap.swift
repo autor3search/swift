@@ -283,8 +283,9 @@ public enum SignalTrap {
     /// whole file exists to prevent, and silently dropping the newest pgid
     /// here would recreate that bug quietly instead of fixing it. This
     /// should never happen given this project's actual concurrency (`eval`:
-    /// one child at a time; `profile`: two at once, eight slots of
-    /// headroom), so hitting it is itself a sign something is badly wrong.
+    /// one child at a time; `profile`: two at once, against
+    /// `maxLiveChildren` = 64 slots), so hitting it is itself a sign
+    /// something is badly wrong.
     ///
     /// KNOWN WINDOW, stated rather than papered over: a signal delivered
     /// between `posix_spawn` returning and this call lands before the slot is
@@ -301,7 +302,9 @@ public enum SignalTrap {
         return ChildRegistrySlots.claim(sig_atomic_t(pgid), in: slots, count: maxLiveChildren)
     }
 
-    /// The registry's fixed slot count (8), exposed so a test can allocate
+    /// The registry's fixed slot count (`maxLiveChildren`, 64 since the 8->64
+    /// resize -- do not restate the number here; it went stale once already),
+    /// exposed so a test can allocate
     /// its own buffer of exactly this size and exercise "every slot full"
     /// against it via `ChildRegistrySlots` directly -- see
     /// `SignalTrapTests.noteChildSpawnedRefusesOnceEveryProductionSlotIsFull`.
