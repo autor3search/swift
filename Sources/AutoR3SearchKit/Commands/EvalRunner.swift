@@ -769,6 +769,141 @@ public enum EvalRunner {
         config.purgeBuildOutput || purgeBuildOutputRequested(env: env)
     }
 
+    /// Raised by `MeasuredBinaryGuard` when one of the four executables gate 8
+    /// launches has changed since measurement began.
+    struct MeasuredBinaryTampered: Error, CustomStringConvertible {
+        let detail: String
+        var description: String { detail }
+    }
+
+    /// Wraps the `MetricSource` and re-hashes the binaries being measured
+    /// BEFORE EVERY SAMPLE.
+    ///
+    /// THE VECTOR. Every gate up to here constrains what the agent may WRITE.
+    /// None of them constrains what the agent's benchmark DOES once the harness
+    /// runs it -- and it runs as the same uid, on the same filesystem, with the
+    /// pinned worktree at a path it can compute. Measured, from a commit whose
+    /// entire diff is one in-scope source file holding the ORIGINAL quadratic
+    /// algorithm plus a lazily-initialised global:
+    ///
+    /// ```
+    /// attacked: rc 0  keep  ratio 0.04973  baseline 73.30 ms  candidate 3.65 ms  warnings []
+    /// ```
+    ///
+    /// The initialiser rewrote the pinned worktree's benchmark to 35000 repeats
+    /// and rebuilt it, so every later baseline sample measured an inflated
+    /// binary. On KEEP the worktree source was git-restored, erasing the trace,
+    /// and the inflated BINARY survived: the next, entirely honest eval came
+    /// back `rc 0 keep ratio 0.05069` against a 71.34 ms baseline. That is the
+    /// stale-baseline coasting bug this project exists to prevent, reached
+    /// through a door no gate was watching.
+    ///
+    /// It defeats gate 7 by TOCTOU. The worktree is verified, restored and
+    /// built before candidate code runs, and was never looked at again.
+    ///
+    /// PER SAMPLE, NOT PER EVAL, and the interval is the whole design:
+    ///
+    /// - A check only at the END is beaten by sabotage-measure-restore: inflate
+    ///   the baseline, let the slow samples run, put the binary back.
+    /// - A check only at the START is beaten by sabotaging afterwards, which is
+    ///   exactly what this attack does.
+    /// - `MeasureSession` interleaves baseline/candidate within every round, so
+    ///   even a check after the last candidate sample leaves nine rounds
+    ///   unguarded.
+    ///
+    /// Checking before each sample bounds the damage to nothing: the sample
+    /// about to be taken is taken against bytes that were just verified.
+    ///
+    /// COST, measured: the four binaries total 17.2 MB on the demo package and
+    /// hash in 5.4 ms, so `count: 10` with one benchmark -- 20 counted samples
+    /// plus 2 warm-ups, 22 checks -- costs about 119 ms against a ~39 s eval,
+    /// or 0.3%. No compromise on the interval was needed.
+    ///
+    /// ALL FOUR BINARIES ON EVERY CHECK, not just the side about to run.
+    /// Checking only the sampled side would be sound given the interleave, and
+    /// half the cost; at 119 ms the simpler invariant -- "nothing that will be
+    /// measured has changed since measurement began" -- is worth more than the
+    /// 60 ms.
+    ///
+    /// A binary that is ABSENT at snapshot time is not recorded, which keeps
+    /// every test that injects its own `MetricSource` working (they have no
+    /// `.build/release` at all). A binary that was recorded and is then missing
+    /// IS a violation: deleting the baseline binary mid-measurement is as good
+    /// to an attacker as rewriting it.
+    final class MeasuredBinaryGuard: MetricSource, @unchecked Sendable {
+        private let inner: any MetricSource
+        private let expected: [(url: URL, digest: String)]
+
+        /// The first violation seen, kept because `warmUp` deliberately
+        /// converts a throwing sample into a warning -- so without this the
+        /// warm-up phase would swallow a detection.
+        private(set) var violation: String?
+        private(set) var checks = 0
+
+        init(wrapping inner: any MetricSource, binaries: [URL]) {
+            self.inner = inner
+            self.expected = binaries.compactMap { url in
+                guard let digest = try? BaselineRunner.sha256File(url) else { return nil }
+                return (url: url, digest: digest)
+            }
+        }
+
+        var guardedCount: Int { expected.count }
+
+        /// `nil` when every recorded binary still hashes to what it did.
+        func check() -> String? {
+            checks += 1
+            for entry in expected {
+                let now = try? BaselineRunner.sha256File(entry.url)
+                guard now != entry.digest else { continue }
+                return """
+                    \(entry.url.path) \
+                    (\(now.map { "now sha256 \($0)" } ?? "the file is gone"), was \(entry.digest))
+                    """
+            }
+            return nil
+        }
+
+        func sample(benchmark: String, in worktree: URL, config: Config) throws -> Double {
+            if let offender = check() {
+                if violation == nil { violation = offender }
+                throw MeasuredBinaryTampered(detail: offender)
+            }
+            return try inner.sample(benchmark: benchmark, in: worktree, config: config)
+        }
+    }
+
+    /// The four executables gate 8 launches: the benchmark target and
+    /// `BenchmarkTool`, on each side.
+    static func measuredBinaries(
+        baselineWorktree: URL, candidateWorktree: URL, benchmarkTarget: String
+    ) -> [URL] {
+        [baselineWorktree, candidateWorktree].flatMap { directory in
+            [benchmarkTarget, "BenchmarkTool"].map {
+                directory.appendingPathComponent(".build/release/\($0)")
+            }
+        }
+    }
+
+    /// Deletes the measured binaries on both sides, so a poisoned one cannot
+    /// survive into the next eval.
+    ///
+    /// DETECTION IS NOT ENOUGH ON ITS OWN. The measured attack left an inflated
+    /// baseline binary behind, and the NEXT, entirely honest eval inherited it
+    /// and returned an unearned KEEP -- because SwiftPM had already recorded
+    /// that binary as up to date for the restored source. Removing them forces
+    /// the next build to produce them again from sources every gate has
+    /// verified.
+    static func discardMeasuredBinaries(
+        baselineWorktree: URL, candidateWorktree: URL, benchmarkTarget: String
+    ) {
+        for url in measuredBinaries(
+            baselineWorktree: baselineWorktree, candidateWorktree: candidateWorktree,
+            benchmarkTarget: benchmarkTarget) {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
     /// Runs one experiment end to end and returns its verdict.
     ///
     /// Throws only on a genuine harness failure (the executable turns that
@@ -1218,17 +1353,17 @@ public enum EvalRunner {
 
         // ---- Gate 7: worktree integrity ----
         //
-        // A single `Worktree.verify` is the complete gate: it checks HEAD
-        // identity AND cleanliness (Task 7's ruling), so a worktree at the
-        // right commit but locally modified fails closed here.
+        // RESTORE FIRST, THEN VERIFY -- the reverse of what this was, and the
+        // reversal is a bug fix. A pre-restore `verify` that refuses runs
+        // BEFORE the restore whose whole job is to repair the thing it refused
+        // over, so any tampering that `verify` could see bricked the run
+        // permanently: measured, an eval and every eval after it returning
+        // `worktree_integrity` with the worktree still dirty, because the
+        // repair never got the chance to run. The worktree's correct contents
+        // are known exactly -- it is a checkout of `measurementCommit` and
+        // nothing else -- so repairing is always the right move, and
+        // `restoreToPin` ends by verifying its own work.
         let worktree = pinnedWorktree
-        guard try Worktree.verify(at: worktree, expectedCommit: record.measurementCommit) else {
-            return fail(GateFailure(reason: "worktree_integrity", detail: """
-                the pinned measurement worktree at \(worktree.path) is not a clean checkout of \
-                \(record.measurementCommit). Measuring against it would compare the candidate \
-                with something other than the last accepted commit.
-                """))
-        }
 
         var warnings: [String] = []
 
@@ -1402,12 +1537,70 @@ public enum EvalRunner {
         // its frozen `alternatesSidesWithinOneSession` test, which is the
         // test that pins the interleaving this project's measurement
         // validity rests on.
-        warnings += warmUp(benchmarks: config.benchmarks, baselineWorktree: worktree,
-                           candidateWorktree: repo, source: metric, config: config)
+        // ---- Gate 8a: the binaries must not change WHILE they are measured ----
+        //
+        // Everything above constrains what the agent may WRITE. Nothing
+        // constrains what the agent's BENCHMARK DOES once this harness runs
+        // it -- same uid, same filesystem, and the pinned worktree at a path it
+        // can compute. Measured: a commit whose whole diff is one in-scope file
+        // holding the ORIGINAL quadratic algorithm, plus a lazily-initialised
+        // global that rewrote the worktree's benchmark to 35000 repeats and
+        // rebuilt it, returned `rc 0 keep ratio 0.04973` against a 73.30 ms
+        // baseline, with no warnings -- and left the inflated binary behind for
+        // the next, honest eval to inherit.
+        //
+        // Gate 7 cannot catch it: it verifies, restores and builds the worktree
+        // BEFORE any candidate code runs, and never looks again. The fix is the
+        // rule round 5 established -- sample a post-condition after the last
+        // thing that can change it -- applied to the one thing that had none:
+        // the bytes being measured, re-checked before EVERY sample. See
+        // `MeasuredBinaryGuard` for why per-sample and not per-eval.
+        let binaries = measuredBinaries(
+            baselineWorktree: worktree, candidateWorktree: repo,
+            benchmarkTarget: config.benchmarkTarget)
+        let guarded = MeasuredBinaryGuard(wrapping: metric, binaries: binaries)
 
-        let samples = try MeasureSession.run(
-            benchmarks: config.benchmarks, baselineWorktree: worktree,
-            candidateWorktree: repo, source: metric, config: config)
+        /// A detection is deliberate tampering, not a flake, so it is handled
+        /// exactly as a refused frozen restore is: the poisoned binaries are
+        /// DELETED (detection alone let the stale one survive into the next
+        /// eval) and the run is durably tainted, so nothing further is measured
+        /// until a human has looked.
+        func measuredBinaryTampering(_ offender: String) -> Verdict {
+            discardMeasuredBinaries(
+                baselineWorktree: worktree, candidateWorktree: repo,
+                benchmarkTarget: config.benchmarkTarget)
+            let detail = """
+                a binary being measured changed while it was being measured: \(offender). \
+                Nothing constrains what the candidate's benchmark does once it is launched -- it \
+                runs as the same user, on the same filesystem, and the pinned measurement \
+                worktree is at a path it can compute -- so a benchmark that rewrites and rebuilds \
+                the BASELINE binary makes doing nothing look like a win, and leaves the inflated \
+                binary behind for the next experiment to inherit. The hashes of all \
+                \(guarded.guardedCount) measured executables are taken before measurement begins \
+                and re-checked before every sample; this one did not match. Both sides' measured \
+                binaries have been deleted so the next eval rebuilds them from verified sources, \
+                and this run is now tainted: nothing further will be measured until \
+                \(RunTaint.url(runDir: runDir).path) is deleted by hand.
+                """
+            RunTaint.record(runDir: runDir, detail: detail)
+            return fail(GateFailure(reason: "measured_binary_changed", detail: detail))
+        }
+
+        warnings += warmUp(benchmarks: config.benchmarks, baselineWorktree: worktree,
+                           candidateWorktree: repo, source: guarded, config: config)
+        // `warmUp` turns a throwing sample into a warning on purpose, so the
+        // guard records its own first violation and it is read back here rather
+        // than being swallowed with it.
+        if let offender = guarded.violation { return measuredBinaryTampering(offender) }
+
+        let samples: [BenchmarkSamples]
+        do {
+            samples = try MeasureSession.run(
+                benchmarks: config.benchmarks, baselineWorktree: worktree,
+                candidateWorktree: repo, source: guarded, config: config)
+        } catch let tampering as MeasuredBinaryTampered {
+            return measuredBinaryTampering(tampering.detail)
+        }
 
         // ---- Gate 9: score ----
         var verdict = Scoring.decide(samples: samples, config: config,
