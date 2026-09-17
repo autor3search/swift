@@ -162,6 +162,15 @@ private func exists(_ url: URL) -> Bool {
 /// Continuing would build on exactly the cached artifact the deletion exists to
 /// discard.
 @Test func aPurgeThatCannotBePerformedIsARefusal() throws {
+    // ROOT IGNORES DIRECTORY PERMISSIONS, so the only way this test knows to
+    // make a deletion fail does not fail for uid 0 and the refusal never
+    // happens. Measured in `swift:6.1`, whose containers run as root: this test
+    // was the only non-pre-existing failure in the whole Linux suite, and it
+    // was failing because the PREMISE does not hold there, not because the code
+    // was wrong. Skipped rather than weakened -- the assertion it makes is
+    // worth keeping wherever it can actually be made.
+    guard getuid() != 0 else { return }
+
     let directory = URL(fileURLWithPath: NSTemporaryDirectory())
         .appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

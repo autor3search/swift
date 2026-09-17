@@ -18,6 +18,20 @@ import Glibc
 public protocol ProcessTreeKilling: Sendable {
     /// Signal every process in the group led by `pgid`.
     func killTree(pgid: pid_t)
+
+    /// Signal every process in the SESSION led by `sid`, whatever process group
+    /// it has moved itself into.
+    ///
+    /// The outer guarantee behind `killTree`, never a replacement for it. A
+    /// process can leave its group with one `setpgid` -- Foundation's `Process`
+    /// does exactly that for every child it spawns -- but it cannot leave its
+    /// session without calling `setsid`, which is a deliberate act rather than
+    /// the default behaviour of the standard API.
+    ///
+    /// Returns the pids it signalled, so callers and tests can see what the
+    /// sweep actually reached rather than inferring it.
+    @discardableResult
+    func killSession(sid: pid_t) -> [pid_t]
 }
 
 #if canImport(Darwin) || os(Linux)
@@ -33,6 +47,83 @@ public struct POSIXProcessTree: ProcessTreeKilling {
         // still signal the direct child.
         kill(pgid, SIGKILL)
     }
+
+    /// Enumerate the session and signal everything in it.
+    ///
+    /// THREE GUARDS, and each of them is the difference between a teardown and
+    /// an accident:
+    ///
+    /// - `sid` must be positive, and must not be this process's own session.
+    ///   Sweeping our own session kills the harness. The caller already only
+    ///   calls this for a child spawned with `POSIX_SPAWN_SETSID`, so the two
+    ///   sessions differ by construction; this is the check that survives a
+    ///   caller changing its mind.
+    /// - Our own pid is skipped unconditionally, belt and braces for the above.
+    /// - pid 1 is skipped. It cannot be in a child's session, and signalling it
+    ///   inside a container is the one mistake that takes everything down.
+    @discardableResult
+    public func killSession(sid: pid_t) -> [pid_t] {
+        guard sid > 1, sid != getsid(0) else { return [] }
+        let mine = getpid()
+        var signalled: [pid_t] = []
+        for pid in POSIXProcessTree.pidsInSession(sid) where pid > 1 && pid != mine {
+            kill(pid, SIGKILL)
+            signalled.append(pid)
+        }
+        return signalled
+    }
+
+    /// Every pid whose session id is `sid`.
+    ///
+    /// macOS has a direct call for this. Linux has no syscall for it, so `/proc`
+    /// is read: field 6 of `/proc/<pid>/stat` is the session id. The parse
+    /// splits on the LAST `") "` rather than on whitespace, because field 2 is
+    /// the executable name in parentheses and may itself contain spaces and
+    /// parentheses -- `(my prog) ) ` is a legal comm, and a naive
+    /// `split(" ")[5]` reads the wrong column for it. Verified in `swift:6.1`:
+    /// `/proc/self/stat` parsed this way reports the same pgrp and session the
+    /// kernel reports.
+    static func pidsInSession(_ sid: pid_t) -> [pid_t] {
+        #if canImport(Darwin)
+        // THERE IS NO SESSION FILTER. `sys/proc_info.h` offers PROC_ALL_PIDS,
+        // PROC_PGRP_ONLY, PROC_TTY_ONLY, PROC_UID_ONLY, PROC_RUID_ONLY,
+        // PROC_PPID_ONLY and PROC_KDBG_ONLY -- and nothing for sessions, which
+        // is why this lists every pid and asks the kernel for each one's
+        // session rather than letting `proc_listpids` do the filtering. The
+        // value 1 is PROC_ALL_PIDS; Swift's Darwin overlay does not export the
+        // constant any more than it exports the flag.
+        let allPids = UInt32(1)
+        var count = proc_listpids(allPids, 0, nil, 0)
+        guard count > 0 else { return [] }
+        // Room to grow between the sizing call and the filling one: processes
+        // start while we are asking.
+        let capacity = Int(count) / MemoryLayout<Int32>.size + 64
+        var buffer = [Int32](repeating: 0, count: capacity)
+        count = proc_listpids(allPids, 0, &buffer,
+                              Int32(capacity * MemoryLayout<Int32>.size))
+        guard count > 0 else { return [] }
+        let found = min(Int(count) / MemoryLayout<Int32>.size, capacity)
+        // `getsid` on a process in another session may answer EPERM (-1), which
+        // simply never equals `sid` -- so an unreadable process is skipped
+        // rather than mistaken for a member.
+        return buffer.prefix(found).map { pid_t($0) }.filter { $0 > 0 && getsid($0) == sid }
+        #else
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: "/proc")
+        else { return [] }
+        var out: [pid_t] = []
+        for entry in entries {
+            guard let pid = pid_t(entry) else { continue }
+            guard let stat = try? String(contentsOfFile: "/proc/\(entry)/stat", encoding: .utf8)
+            else { continue }
+            guard let close = stat.range(of: ") ", options: .backwards) else { continue }
+            let fields = stat[close.upperBound...].split(separator: " ")
+            // After "<pid> (<comm>) ": state, ppid, pgrp, session.
+            guard fields.count >= 4, let session = pid_t(fields[3]) else { continue }
+            if session == sid { out.append(pid) }
+        }
+        return out
+        #endif
+    }
 }
 
 // MARK: - Spawning
@@ -45,6 +136,25 @@ public struct SpawnedChild: Sendable {
     public let pid: pid_t
     public let stdoutFD: Int32
     public let stderrFD: Int32
+
+    /// True when the spawn placed the child in its OWN SESSION, so `pid`
+    /// doubles as the session id as well as the process-group id.
+    ///
+    /// LOAD-BEARING FOR SAFETY, not just for coverage. A session sweep keyed on
+    /// the wrong id would kill the harness: if `POSIX_SPAWN_SETSID` were
+    /// refused and the child inherited OUR session, then `getsid(child) ==
+    /// getsid(harness)` and sweeping that session would kill the process doing
+    /// the sweeping. So the sweep only ever runs when this is true, and this is
+    /// only ever true when the spawn that actually succeeded asked for a new
+    /// session.
+    public let sessionIsolated: Bool
+
+    public init(pid: pid_t, stdoutFD: Int32, stderrFD: Int32, sessionIsolated: Bool = false) {
+        self.pid = pid
+        self.stdoutFD = stdoutFD
+        self.stderrFD = stderrFD
+        self.sessionIsolated = sessionIsolated
+    }
 }
 
 public enum SpawnError: Error, CustomStringConvertible {
@@ -178,12 +288,31 @@ public enum POSIXSpawn {
     static let etxtbsyMaxRetries = 10
     static let etxtbsyRetryInterval: TimeInterval = 0.025
 
+    /// `POSIX_SPAWN_SETSID`. Darwin exports it; Swift's Glibc overlay does not
+    /// (verified in `swift:6.1`), so the glibc value -- 0x80 since 2.26 -- is
+    /// spelled out. Both were checked by spawning under it and reading back
+    /// `getsid`; see `spawn` for the transcript.
+    #if canImport(Darwin)
+    static let setsidFlag = Int16(POSIX_SPAWN_SETSID)
+    #else
+    static let setsidFlag = Int16(0x80)
+    #endif
+
+    /// - Parameter setsidFlagOverride: replaces the session-isolation flag for
+    ///   this one spawn. EXISTS SO THE FALLBACK IS EXERCISED: a fallback that
+    ///   has never run is not a fallback, and there is no other way to make a
+    ///   working libc refuse `POSIX_SPAWN_SETSID`. Passing a flag the platform
+    ///   rejects drives the retry path exactly as an old glibc would, including
+    ///   clearing it before the second attempt -- which is why the override
+    ///   REPLACES the flag rather than sitting beside it. Nothing in the
+    ///   shipping paths passes it.
     public static func spawn(
         executable: URL,
         args: [String],
         cwd: URL,
         env: [String: String]?,
-        closing: InheritedDescriptorClosing = .platformDefault
+        closing: InheritedDescriptorClosing = .platformDefault,
+        setsidFlagOverride: Int16? = nil
     ) throws -> SpawnedChild {
         var outFDs: [Int32] = [-1, -1]
         var errFDs: [Int32] = [-1, -1]
@@ -219,11 +348,39 @@ public enum POSIXSpawn {
             if code != 0 && setupFailure == nil { setupFailure = (call, code) }
         }
 
-        // The child becomes its own process-group leader *before* exec, so every
-        // descendant it forks lands in that same group and `kill(-pgid)` reaches
-        // all of them. This works identically on macOS and Linux.
-        var flags = Int16(POSIX_SPAWN_SETPGROUP)
-        checked("posix_spawnattr_setpgroup", posix_spawnattr_setpgroup(&attr, 0))
+        // THE CHILD GETS ITS OWN SESSION, not merely its own process group.
+        //
+        // A new process group was not enough, and the gap was measured. A
+        // candidate benchmark that spawns a background CPU burner penalises the
+        // BASELINE samples that follow it -- `rc 0 keep ratio 0.54278` with
+        // twelve burners still alive -- and `kill(-pgid)` only reaches it if the
+        // burner stayed in the group. It need not: `setpgid` moves a process
+        // out, and FOUNDATION'S OWN `Process` DOES THAT BY DEFAULT. Measured
+        // directly: a `Process`-spawned child reports `pgid == its own pid`
+        // while a `posix_spawn`ed one inherits the parent's group. So the
+        // easiest way to write the attack is the way that escapes a group kill.
+        //
+        // A session cannot be left by `setpgid` -- only by `setsid()`, which is
+        // a deliberate, unusual call rather than the default behaviour of the
+        // standard API. So the child is made a session leader, and the teardown
+        // sweeps the session as well as the group.
+        //
+        // ONE FLAG, NOT TWO. `POSIX_SPAWN_SETSID` already makes the child a
+        // process-group leader (`pgid == sid == pid`), so `kill(-pgid)` keeps
+        // working exactly as it did. Combining it with `POSIX_SPAWN_SETPGROUP`
+        // FAILS -- measured on both platforms, `posix_spawn` returns EPERM:
+        //
+        //   macOS  SETSID only: pid=7671 pgid=7671 sid=7671   SETSID+SETPGROUP: rc=1
+        //   Linux  SETSID only: pid=36   pgid=36   sid=36     SETSID+SETPGROUP: rc=1
+        //
+        // Swift's Glibc overlay does not export the constant (verified in
+        // swift:6.1), so on Linux it is spelled out: glibc has defined
+        // `POSIX_SPAWN_SETSID` as 0x80 since 2.26. If a libc refuses the flag
+        // the spawn loop below falls back to the old process-group behaviour
+        // rather than failing to launch at all.
+        var sessionIsolated = true
+        let setsidFlagInUse = setsidFlagOverride ?? POSIXSpawn.setsidFlag
+        var flags = setsidFlagInUse
 
         // Reset inherited signal state. We must not hand the child an ignored
         // SIGPIPE (the Swift runtime ignores it): a `yes | head` pipeline whose
@@ -309,7 +466,23 @@ public enum POSIXSpawn {
         #endif
         // `setflags` is called AFTER the platform branch above so a flag added
         // there is actually in `flags` when it is installed.
-        checked("posix_spawnattr_setflags", posix_spawnattr_setflags(&attr, flags))
+        //
+        // AND THE SESSION FLAG IS NEGOTIATED HERE, NOT AT THE SPAWN. glibc
+        // validates the flag mask inside `posix_spawnattr_setflags` and answers
+        // EINVAL there, BEFORE `posix_spawn` is ever called -- measured in
+        // `swift:6.1`, where the first version of this code turned that into
+        // `SpawnError.setupFailed` and threw, so the fallback that exists for
+        // exactly that libc could never have run. Darwin defers the check to
+        // the spawn instead, which is why the retry below still exists too.
+        // Both doors have to be covered, and neither can be inferred from the
+        // other.
+        if posix_spawnattr_setflags(&attr, flags) != 0, sessionIsolated {
+            sessionIsolated = false
+            flags &= ~setsidFlagInUse
+            flags |= Int16(POSIX_SPAWN_SETPGROUP)
+            checked("posix_spawnattr_setpgroup", posix_spawnattr_setpgroup(&attr, 0))
+            checked("posix_spawnattr_setflags", posix_spawnattr_setflags(&attr, flags))
+        }
         checked(
             "posix_spawn_file_actions_addchdir_np(\(cwd.path))",
             posix_spawn_file_actions_addchdir_np(&fileActions, cwd.path)
@@ -347,9 +520,35 @@ public enum POSIXSpawn {
             // asked to run, and retrying them would turn a clear failure into a
             // slow, confusing one. Anything other than ETXTBSY still fails on
             // the first attempt, exactly as before.
-            guard rc == ETXTBSY, etxtbsyAttempts < etxtbsyMaxRetries else { break }
-            etxtbsyAttempts += 1
-            Thread.sleep(forTimeInterval: etxtbsyRetryInterval)
+            if rc == 0 { break }
+            if rc == ETXTBSY, etxtbsyAttempts < etxtbsyMaxRetries {
+                etxtbsyAttempts += 1
+                Thread.sleep(forTimeInterval: etxtbsyRetryInterval)
+                continue
+            }
+            // A libc that refuses `POSIX_SPAWN_SETSID` must not stop the
+            // harness launching anything at all. ONE retry, with the
+            // pre-session behaviour restored, and `sessionIsolated` cleared so
+            // the teardown knows not to sweep a session this child never got --
+            // sweeping the harness's OWN session would kill the harness.
+            //
+            // ANY failure triggers it, not a specific errno, and that is
+            // measured rather than tidy-looking. glibc validates its flag mask
+            // and answers EINVAL for an unknown bit; Darwin was measured to
+            // IGNORE most undefined bits outright and to answer 88 for one of
+            // them. Keying on a single errno would therefore be a fallback that
+            // fires on one libc and not another. The cost of being broad is one
+            // wasted spawn attempt when the real failure is ENOENT or EACCES,
+            // after which the same errno is reported exactly as before.
+            if sessionIsolated {
+                sessionIsolated = false
+                flags &= ~setsidFlagInUse
+                flags |= Int16(POSIX_SPAWN_SETPGROUP)
+                _ = posix_spawnattr_setpgroup(&attr, 0)
+                _ = posix_spawnattr_setflags(&attr, flags)
+                continue
+            }
+            break
         }
 
         // The parent keeps only the read ends; holding a write end open would mean
@@ -364,7 +563,8 @@ public enum POSIXSpawn {
             throw SpawnError.spawnFailed(path: executable.path, code: rc)
         }
 
-        return SpawnedChild(pid: pid, stdoutFD: outFDs[0], stderrFD: errFDs[0])
+        return SpawnedChild(pid: pid, stdoutFD: outFDs[0], stderrFD: errFDs[0],
+                            sessionIsolated: sessionIsolated)
     }
 }
 

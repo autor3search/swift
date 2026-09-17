@@ -327,6 +327,16 @@ public enum Subprocess {
         // Preferred over the alternative of killing before reaping, which would
         // destroy the exit status this function exists to report.
         Platform.processTree.killTree(pgid: child.pid)
+        // ...and the SESSION, which is the outer guarantee. A process leaves a
+        // group with one `setpgid`, and Foundation's `Process` does that for
+        // every child it spawns, so the group kill above missed the easiest way
+        // to write the attack (measured: `rc 0 keep ratio 0.54278`, twelve
+        // burners still alive). A session can only be left by calling `setsid`.
+        // Gated on `sessionIsolated` because sweeping a session the child never
+        // got would be sweeping OUR OWN, which kills the harness.
+        if child.sessionIsolated {
+            Platform.processTree.killSession(sid: child.pid)
+        }
 
         // The readers stop on EOF. If something still holds a write end — a broken
         // tree kill, or a descendant that escaped the group by calling setsid for
