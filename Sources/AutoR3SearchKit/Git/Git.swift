@@ -66,14 +66,99 @@ public struct Git: Sendable {
     /// directory is same-user and could simply have hooks written into it,
     /// whereas `<path>/post-checkout` under `/dev/null` cannot resolve on any
     /// POSIX system. Verified to exit 0 and run no hook.
-    private static let hookDenial = ["-c", "core.hooksPath=/dev/null"]
+    /// EVERY CONFIGURATION KEY THAT MAKES GIT RUN A PROGRAM, denied on every
+    /// invocation the harness makes.
+    ///
+    /// THE DEFECT THIS REPLACES was not the missing key; it was how the list
+    /// was built. Round 5 denied `core.hooksPath` because a hook was the vector
+    /// that had been found, and stopped there. `core.fsmonitor` is a SEPARATE
+    /// code-execution config, `.git/config` is excluded from every content gate
+    /// by design, and core config is shared with the linked worktree -- so an
+    /// agent's fsmonitor ran inside gate 7's own git calls, 22 times an eval,
+    /// and overwrote the baseline binary during the post-build `status` that
+    /// sits between the build and `MeasuredBinaryGuard`'s snapshot. Measured
+    /// 2/2 at ratio 0.0496 and 0.0495. A list built from the last attack will
+    /// always be one attack behind; this one is built from `git config`'s own
+    /// documentation for the installed version (2.54.0).
+    ///
+    /// MEASURED, not assumed. `core.fsmonitor` was observed firing on
+    /// `status --porcelain`, `status --porcelain -z --ignored`, `ls-files -v`,
+    /// `checkout --detach --force` and `add` -- five of the commands this type
+    /// runs -- and `-c core.fsmonitor=false` was observed to deny all five.
+    /// `diff.external` fires on a content `git diff` but NOT on `--name-only`,
+    /// and `-c diff.external=` denies it.
+    ///
+    /// Keys whose trigger conditions this harness never reaches are denied
+    /// anyway: they cost one argument each, and "we do not run that command
+    /// today" is exactly the reasoning that left `core.fsmonitor` open.
+    private static let executionDenials: [(key: String, value: String)] = [
+        // Hooks, and the file-system monitor that is NOT a hook.
+        ("core.hooksPath", "/dev/null"),
+        ("core.fsmonitor", "false"),
+        // Programs git will run for refs, transport and credentials.
+        ("core.alternateRefsCommand", ""),
+        ("core.sshCommand", ""),
+        ("core.gitProxy", ""),
+        ("core.askPass", ""),
+        ("credential.helper", ""),
+        // Programs git will run to show things to a human. Never reached with
+        // no tty, which is precisely why they are easy to forget.
+        ("core.pager", "cat"),
+        ("core.editor", ""),
+        ("sequence.editor", ""),
+        // External diff. `--name-only` does not use it; a content diff does.
+        ("diff.external", ""),
+        ("interactive.diffFilter", ""),
+        // Signing, reachable if a repository sets `commit.gpgSign`.
+        ("gpg.program", ""),
+        ("gpg.openpgp.program", ""),
+        ("gpg.x509.program", ""),
+        ("gpg.ssh.program", ""),
+        ("gpg.ssh.defaultKeyCommand", ""),
+        // Maintenance and server-side hooks that ordinary commands can trigger.
+        ("gc.recentObjectsHook", ""),
+        ("uploadpack.packObjectsHook", ""),
+        // NOT execution, but the out-of-tree door to the filter and ignore
+        // machinery that IS execution. An in-tree `.gitattributes` still
+        // applies; this only closes the file an agent could point git at.
+        ("core.attributesFile", "/dev/null"),
+        ("core.excludesFile", "/dev/null"),
+    ]
 
-    /// Git's own arguments, plus the hook denial. Kept separate from the
-    /// caller's `args` so diagnostics still quote the command the caller asked
-    /// for rather than the harness's plumbing.
+    /// What `-c` CANNOT deny, because the keys are per-name and a wildcard is
+    /// not accepted: `filter.<name>.clean`, `filter.<name>.smudge`,
+    /// `filter.<name>.process`, `diff.<name>.textconv`, `diff.<name>.command`,
+    /// `pager.<cmd>`, `trailer.<key>.cmd`, and the `difftool`/`mergetool`/
+    /// `guitool`/`man`/`browser` `<tool>.cmd` families.
+    ///
+    /// Measured: a `filter.zz.smudge` DOES fire on `checkout --detach --force`,
+    /// and is denied only when the driver's name is spelled out. Enumerating
+    /// the names out of the repository's own config would be a
+    /// check-then-use race, since the same agent can add one afterwards.
+    ///
+    /// What covers the reachable half of that gap is not this list at all:
+    /// `Worktree.contentMismatches` hashes the worktree's bytes against the
+    /// blob ids in the commit and asks git nothing, so a smudge filter that
+    /// rewrites a file during the restore is caught by content even though the
+    /// filter itself ran. That is genuine coverage for the worktree, and it is
+    /// NOT coverage for the candidate repository, which has no such comparison
+    /// -- see the run log's residual list.
+    static let undeniableWildcardFamilies = [
+        "filter.<name>.clean", "filter.<name>.smudge", "filter.<name>.process",
+        "diff.<name>.textconv", "diff.<name>.command", "pager.<cmd>",
+        "trailer.<key>.cmd", "difftool.<tool>.cmd", "mergetool.<tool>.cmd",
+    ]
+
+    /// Git's own arguments, plus the denials. Kept separate from the caller's
+    /// `args` so diagnostics still quote the command the caller asked for
+    /// rather than the harness's plumbing.
     private static func hardened(_ args: [String]) -> [String] {
-        hookDenial + args
+        executionDenials.flatMap { ["-c", "\($0.key)=\($0.value)"] } + args
     }
+
+    /// The denied keys, for the test that pins the list. Exposed rather than
+    /// re-derived so widening it is a deliberate edit in two places.
+    static var executionDenialKeys: [String] { executionDenials.map(\.key) }
 
     /// Runs a git subcommand against `cwd` (defaulting to `repo`) and returns
     /// trimmed stdout. A non-zero exit throws `GitError.command` — for git
