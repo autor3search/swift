@@ -296,6 +296,38 @@ public enum Subprocess {
             }
         }
 
+        // ---- EVERY RUN ENDS WITH AN EMPTY PROCESS GROUP ----
+        //
+        // Until now `killTree` only fired on a TIMEOUT. A child that exited
+        // normally was reaped and anything it had forked was simply left
+        // running — which is a correctness hole before it is a security one:
+        // `MeasureSession` interleaves baseline and candidate samples precisely
+        // so that each is an independent observation, and a process surviving
+        // between them breaks that whether it is malicious or a leaked helper.
+        //
+        // THE ATTACK IT CLOSES. Round 6 guards the BYTES being measured. This
+        // one changes no bytes: a candidate benchmark whose `countWords` is the
+        // original quadratic implementation spawns background CPU burners that
+        // outlive it, idling while the candidate runs and saturating the
+        // machine during the BASELINE samples that follow. Measured, from a
+        // comment-only commit on top of it: `rc 0 keep ratio 0.51568`, baseline
+        // 7.77 ms against an honest 3.6 ms, with 24 burner processes still
+        // alive when the eval finished. The asymmetry is the whole trick — the
+        // process running the agent's code can leave something behind that
+        // penalises the side it is compared against.
+        //
+        // Killing the group after every run removes the mechanism without
+        // needing to know what the spawned thing does.
+        //
+        // PID REUSE: `kill(-pgid)` after the leader has been reaped could in
+        // principle signal an unrelated group that has since claimed that pid.
+        // The window is the few microseconds between `waitpid` returning and
+        // this line, and wrapping the pid space inside it is not a thing that
+        // happens; the timeout path above has always had the same property.
+        // Preferred over the alternative of killing before reaping, which would
+        // destroy the exit status this function exists to report.
+        Platform.processTree.killTree(pgid: child.pid)
+
         // The readers stop on EOF. If something still holds a write end — a broken
         // tree kill, or a descendant that escaped the group by calling setsid for
         // itself — EOF never arrives, so the stop request bounds the wait two ways:
