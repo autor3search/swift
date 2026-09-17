@@ -68,6 +68,35 @@ public struct BaselineRecord: Codable, Equatable, Sendable {
     /// the runs that predate the fix.
     public var treeSHA256: [String: String]?
 
+    /// Every file an ignore rule was hiding from `git status` when the
+    /// baseline was taken, relative path -> digest. `.build/` and the
+    /// harness's own outputs are excluded.
+    ///
+    /// Gate 2b refuses on an ignored file that was ADDED, MODIFIED or REMOVED
+    /// since the freeze, and passes one that is unchanged. The distinction is
+    /// the whole design:
+    ///
+    /// - An ignored file already present at baseline is part of the honest
+    ///   starting point. `frozenCommit` was taken with it there, the pinned
+    ///   worktree's build saw the same repository, and it gives neither side
+    ///   an advantage. Refusing it -- as the first version of this gate did --
+    ///   makes `eval` fail on `autor3search-swift`'s own repository (which
+    ///   ignores `docs/` and `.superpowers/`, both present) and on most real
+    ///   repositories, which ignore `.DS_Store`, editor state, vendored
+    ///   directories or pre-existing generated sources.
+    /// - An ignored file that appears AFTER the freeze is the attack. The
+    ///   pinned measurement worktree is a checkout of a COMMIT and can never
+    ///   contain it, so it exists on the candidate side only and manufactures
+    ///   a win on every later eval -- and `git add -A` will not commit it and
+    ///   `git reset --hard` will not remove it, so it does not wash out
+    ///   between experiments.
+    ///
+    /// Written by the same `baseline` that writes `treeSHA256`, so a record
+    /// carrying one always carries the other; `nil` here means the same thing
+    /// `nil` there does and is refused under the same reason string rather
+    /// than adding a second one to the `--json` contract.
+    public var ignoredSHA256: [String: String]?
+
     public init(
         tag: String,
         frozenCommit: String,
@@ -77,10 +106,12 @@ public struct BaselineRecord: Codable, Equatable, Sendable {
         packageResolvedSHA256: String,
         toolVersion: String,
         manifestSHA256: [String: String]? = nil,
-        treeSHA256: [String: String]? = nil
+        treeSHA256: [String: String]? = nil,
+        ignoredSHA256: [String: String]? = nil
     ) {
         self.manifestSHA256 = manifestSHA256
         self.treeSHA256 = treeSHA256
+        self.ignoredSHA256 = ignoredSHA256
         self.tag = tag
         self.frozenCommit = frozenCommit
         self.measurementCommit = measurementCommit

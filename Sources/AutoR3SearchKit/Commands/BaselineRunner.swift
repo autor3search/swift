@@ -105,6 +105,13 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
     /// reports success.
     case treeInventoryFailed(String)
 
+    /// The inventory of present-but-ignored files could not be built. Fatal
+    /// for the same reason the other two are: recording an empty one because
+    /// the walk could not run would let every later eval read "nothing was
+    /// ignored at baseline", which turns a pre-existing ignored file into an
+    /// apparent removal and a planted one into an apparent nothing.
+    case ignoredInventoryFailed(String)
+
     public var description: String {
         switch self {
         case .dirtyTree:
@@ -217,6 +224,17 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
             helper being edited behind git's back with `git update-index --assume-unchanged`. \
             Recording an empty inventory because the walk could not run would protect nothing and \
             still report success.
+            """
+        case .ignoredInventoryFailed(let why):
+            return """
+            refusing to establish a baseline: could not inventory the files an ignore rule is \
+            hiding from git (\(why)).
+
+            baseline records those files' hashes so that eval can tell a file that was ALREADY \
+            there -- part of the honest starting point -- from one PLANTED after the freeze, \
+            which the pinned measurement worktree can never contain and which would therefore \
+            manufacture a win on every later experiment. Recording an empty inventory because the \
+            walk could not run would erase that distinction in the dangerous direction.
             """
         }
     }
@@ -469,6 +487,85 @@ public enum BaselineRunner {
         return inventory
     }
 
+    /// Every file that an ignore rule is hiding from `git status`, as a
+    /// relative path -> digest map. `baseline` records it; gate 2b walks the
+    /// same set again and refuses on any ADDED, MODIFIED or REMOVED entry.
+    ///
+    /// RECORD, DO NOT REFUSE, and the distinction is what makes this usable.
+    /// The first version of this gate refused ANY present-but-ignored path
+    /// outside a four-entry allowlist. That is correct about the attack and
+    /// wrong about the world: `autor3search-swift`'s own repository ignores
+    /// `docs/` and `.superpowers/` and has both on disk, so `eval` refused on
+    /// the tool's own source tree -- and so would it on most real
+    /// repositories, which ignore `.DS_Store`, editor state, vendored
+    /// directories or pre-existing generated sources that genuinely exist.
+    ///
+    /// The reasoning that makes recording SAFE: an ignored file already
+    /// present when the baseline was taken is part of the honest starting
+    /// point. `frozenCommit` was taken with it there, the pinned measurement
+    /// worktree's first build saw the same repository, and it confers no
+    /// advantage to either side. What the attack requires is an ignored file
+    /// that APPEARS or CHANGES after the freeze -- because the pinned worktree
+    /// is a checkout of a COMMIT and can never contain it, so it exists on the
+    /// candidate side only and manufactures a win on every later eval. That is
+    /// exactly the set this map makes visible, and nothing else.
+    ///
+    /// REMOVAL counts too: deleting an ignored file the baseline build
+    /// compiled changes what is compiled just as much as adding one.
+    ///
+    /// The ignored SET comes from git (`status --porcelain --ignored`), which
+    /// is the only thing that knows the ignore rules -- they can live in any
+    /// `.gitignore`, in `.git/info/exclude`, in a global excludes file or in
+    /// `core.excludesFile`. The CONTENTS come from disk. git's traditional
+    /// ignore mode collapses a wholly-ignored directory into one `dir/`
+    /// record, so each such record is expanded here into its files; that
+    /// collapse is also why `.build/` costs one `stat` rather than a walk of
+    /// several thousand object files.
+    ///
+    /// The harness's own outputs are excluded (`isHarnessOutput`): `.build/`,
+    /// `results.tsv`, `run.log` and `.autor3search/profiles/` change on every
+    /// eval by design, and hashing a warm `.build` would be hundreds of
+    /// megabytes of I/O per experiment.
+    static func ignoredInventory(repo: URL, git: Git) throws -> [String: String] {
+        var inventory: [String: String] = [:]
+        for entry in try git.status(includingIgnored: true) where entry.isIgnored {
+            guard !isHarnessOutput(entry.path) else { continue }
+            var relative = entry.path
+            let wasCollapsedDirectory = relative.hasSuffix("/")
+            while relative.hasSuffix("/") { relative.removeLast() }
+            guard !relative.isEmpty else { continue }
+            let url = repo.appendingPathComponent(relative)
+
+            // A collapsed directory record is expanded; anything else is one
+            // entry. `lstat` rather than `isDirectory`, so a SYMLINK to a
+            // directory is recorded as a link and never walked through.
+            var info = stat()
+            let statted = lstat(url.path, &info) == 0
+            let isRealDirectory = statted && (info.st_mode & S_IFMT) == S_IFDIR
+            guard wasCollapsedDirectory || isRealDirectory else {
+                inventory[relative] = try treeEntryDigest(url)
+                continue
+            }
+            guard let walker = FileManager.default.enumerator(
+                at: url, includingPropertiesForKeys: nil, options: []
+            ) else {
+                throw BaselineError.ignoredInventoryFailed("could not enumerate \(url.path)")
+            }
+            for case let item as URL in walker {
+                var itemInfo = stat()
+                guard lstat(item.path, &itemInfo) == 0 else { continue }
+                if (itemInfo.st_mode & S_IFMT) == S_IFDIR { continue }
+                let full = item.standardizedFileURL.path
+                let root = repo.standardizedFileURL.path
+                guard full.hasPrefix(root + "/") else { continue }
+                let itemRelative = String(full.dropFirst(root.count + 1))
+                guard !isHarnessOutput(itemRelative) else { continue }
+                inventory[itemRelative] = try treeEntryDigest(item)
+            }
+        }
+        return inventory
+    }
+
     /// What goes into `BaselineRecord.packageResolvedSHA256`: either the
     /// lockfile's real hash, or `Lockfile.absentPin` -- never the hash of
     /// nothing, and never a pin established without checking.
@@ -667,6 +764,12 @@ public enum BaselineRunner {
         // with a message about inventories would be the less useful diagnosis.
         let scope = (try? Config.load(repo.appendingPathComponent(".autor3search/config.yaml")))?.scope ?? []
         let treeSHA256 = try treeInventory(repo: repo, scope: scope)
+        // ...and the files an ignore rule hides from git entirely. RECORDED,
+        // not refused: see `ignoredInventory`. Taken here, with the other two,
+        // while the tree is verified clean and before `swift package describe`
+        // creates `.build` -- which is excluded anyway, but taking all three
+        // hashes at one instant is what makes them describe one state.
+        let ignoredSHA256 = try ignoredInventory(repo: repo, git: git)
 
         // Captured BEFORE touching the branch: creating or checking out the
         // run branch must never change which commit gets frozen.
@@ -786,7 +889,8 @@ public enum BaselineRunner {
             packageResolvedSHA256: packageResolvedPin,
             toolVersion: BuildInfo.version,
             manifestSHA256: manifestSHA256,
-            treeSHA256: treeSHA256)
+            treeSHA256: treeSHA256,
+            ignoredSHA256: ignoredSHA256)
         try record.save(to: recordURL)
         return record
     }

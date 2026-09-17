@@ -160,10 +160,19 @@ public enum Scoring {
             while needed < 100, config.alpha / Double(k) < MannWhitney.pValueFloor(roundsPerSide: needed) {
                 needed += 1
             }
+            // `%.3g`, not `%.5f`, matching the fix already applied to the
+            // same warning in `ConfigValidation`. At the shipped default
+            // alpha of 0.005 both of these numbers are small -- alpha/k is
+            // 0.0025 at k=2, and the p-value floor at count 10 is 1.08e-5 --
+            // and `%.5f` renders the floor as a flat `0.00000`. This is the
+            // agent's own reporting channel: a warning that says a threshold
+            // is below zero is worse than no warning, because it reads as a
+            // bug in the harness rather than as the actionable "raise count"
+            // it is.
             warnings.append("""
-            no KEEP is reachable: alpha/k = \(String(format: "%.5f", corrected)) is below the \
+            no KEEP is reachable: alpha/k = \(String(format: "%.3g", corrected)) is below the \
             smallest p this test can produce at count \(config.count) \
-            (\(String(format: "%.5f", floor))). Raise count to \(needed).
+            (\(String(format: "%.3g", floor))). Raise count to \(needed).
             """)
         }
         if config.count < 6 {

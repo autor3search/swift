@@ -124,8 +124,13 @@ public enum ScopeGate {
     ///
     /// Supports three forms:
     /// - `"**"` matches everything.
-    /// - `"<prefix>/**"` matches `<prefix>` and everything under it, any
-    ///   depth.
+    /// - `"<prefix>/**"` matches everything under `<prefix>`, at any depth.
+    ///   It does NOT match the bare path `<prefix>` itself: the
+    ///   implementation tests `path.hasPrefix("<prefix>/")`, so
+    ///   `"Sources/**"` matches `"Sources/a.swift"` and not `"Sources"`.
+    ///   That is under-matching, which is the safe direction for a gate
+    ///   (a bare directory path is not a file SwiftPM compiles), but the
+    ///   comment here used to claim the opposite and is corrected.
     /// - `"<prefix>/*"` matches exactly one path component under `<prefix>`.
     /// - Anything else (including a bare name with no wildcard, e.g.
     ///   `"Sources"`) is matched by exact equality only — see the note

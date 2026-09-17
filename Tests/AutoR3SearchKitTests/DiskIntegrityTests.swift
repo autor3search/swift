@@ -115,48 +115,132 @@ private func sh(_ script: String, in repo: URL) throws {
     #expect(source.calls == 0)
 }
 
-/// The other direction, and the reason the allowlist has to be exactly four
-/// paths rather than "anything ignored": `eval` writes `results.tsv`, `run.log`
-/// and `.autor3search/profiles/` into the repository itself and `swift build`
-/// writes `.build/`, all of them gitignored by `init`. If those tripped the
-/// gate, the SECOND eval on every repository would refuse.
-@Test func theHarnessOwnIgnoredOutputsDoNotTripTheDirtyTreeGate() throws {
+/// The other direction, and the reason this gate RECORDS rather than REFUSES.
+///
+/// The first version of it refused any present-but-ignored path outside a
+/// four-entry allowlist. That is correct about the attack and wrong about the
+/// world: `autor3search-swift`'s own repository ignores `docs/` and
+/// `.superpowers/` and has both on disk, so `eval` refused on the tool's own
+/// source tree -- and so would it on most real repositories, which ignore
+/// `.DS_Store`, editor state, vendored directories or pre-existing generated
+/// sources that genuinely exist.
+///
+/// An ignored file already present at the freeze is part of the honest
+/// starting point: `frozenCommit` was taken with it there, and it gives
+/// neither side an advantage. So `baseline` records it and only a DIFFERENCE
+/// refuses.
+@Test func aPreExistingIgnoredFileIsRecordedAtBaselineAndDoesNotRefuse() throws {
     let (repo, git) = try makeGitFixture()
-    defer { try? FileManager.default.removeItem(at: repo) }
+    let env = isolatedStateEnv()
+    defer { cleanUpFixture(repo: repo, env: env) }
 
-    // The fixture's committed .gitignore covers .build/, results.tsv and
-    // run.log; `init` adds .autor3search/profiles/, so add it the same way.
+    // A committed ignore rule and a matching file, BOTH present before
+    // baseline -- the shape of every real repository.
     let gitignore = repo.appendingPathComponent(".gitignore")
-    try (try String(contentsOf: gitignore, encoding: .utf8) + ".autor3search/profiles/\n")
+    try (try String(contentsOf: gitignore, encoding: .utf8) + "notes/\n.DS_Store\n")
         .write(to: gitignore, atomically: true, encoding: .utf8)
+    try FileManager.default.createDirectory(at: repo.appendingPathComponent("notes"),
+                                            withIntermediateDirectories: true)
+    try "pre-existing".write(to: repo.appendingPathComponent("notes/scratch.md"),
+                             atomically: true, encoding: .utf8)
+    try "junk".write(to: repo.appendingPathComponent(".DS_Store"),
+                     atomically: true, encoding: .utf8)
     try sh("git add -- .gitignore && git commit -q -m ignore", in: repo)
 
+    let record = try BaselineRunner.run(repo: repo, tag: "t", env: env)
+
+    // THE PREMISE: git really does report them as present-but-ignored.
+    let ignored = try git.status(includingIgnored: true).filter { $0.isIgnored }
+    #expect(ignored.contains { $0.path == "notes/" }, "got \(ignored)")
+    #expect(ignored.contains { $0.path == ".DS_Store" }, "got \(ignored)")
+
+    // baseline RECORDED them -- collapsed `notes/` expanded to its files --
+    // and excluded the harness's own outputs.
+    #expect(record.ignoredSHA256?["notes/scratch.md"] != nil, "\(record.ignoredSHA256 ?? [:])")
+    #expect(record.ignoredSHA256?[".DS_Store"] != nil)
+    #expect(record.ignoredSHA256?.keys.contains { $0.hasPrefix(".build/") } == false,
+            ".build must never be hashed: it is hundreds of megabytes and SwiftPM rewrites it")
+
+    // ...and eval does not refuse on them.
+    #expect(EvalRunner.dirtyTreeFailure(git: git, repo: repo, record: record) == nil,
+            "a pre-existing ignored file must not refuse every experiment")
+
+    // The harness's own outputs, which appear after the first eval, are also
+    // never inventoried and never refuse.
     try "1\tabc\n".write(to: repo.appendingPathComponent("results.tsv"),
                          atomically: true, encoding: .utf8)
     try "log\n".write(to: repo.appendingPathComponent("run.log"), atomically: true, encoding: .utf8)
-    for dir in [".build", ".autor3search/profiles"] {
-        try FileManager.default.createDirectory(at: repo.appendingPathComponent(dir),
-                                                withIntermediateDirectories: true)
-        try "x".write(to: repo.appendingPathComponent(dir + "/x"), atomically: true, encoding: .utf8)
-    }
-
-    // git really does report all four as present-but-ignored...
-    let entries = try git.status(includingIgnored: true)
-    let allIgnored = entries.allSatisfy { $0.isIgnored }
-    #expect(allIgnored, "the premise: nothing here is merely uncommitted -- \(entries)")
-    #expect(!entries.isEmpty)
-    // ...and the gate tolerates exactly these.
-    #expect(EvalRunner.dirtyTreeFailure(git: git) == nil,
-            "the harness's own outputs must not refuse every eval after the first")
-
-    // One path outside the allowlist, and it refuses again.
-    try "\nnotes.md\n".write(to: gitignore, atomically: true, encoding: .utf8)
+    try FileManager.default.createDirectory(
+        at: repo.appendingPathComponent(".autor3search/profiles"), withIntermediateDirectories: true)
+    try "{}".write(to: repo.appendingPathComponent(".autor3search/profiles/p.json"),
+                   atomically: true, encoding: .utf8)
+    try (try String(contentsOf: gitignore, encoding: .utf8) + ".autor3search/profiles/\n")
+        .write(to: gitignore, atomically: true, encoding: .utf8)
     try sh("git add -- .gitignore && git commit -q -m ignore2", in: repo)
-    try "secretly compiled".write(to: repo.appendingPathComponent("notes.md"),
-                                  atomically: true, encoding: .utf8)
-    let failure = EvalRunner.dirtyTreeFailure(git: git)
+    #expect(EvalRunner.dirtyTreeFailure(git: git, repo: repo, record: record) == nil,
+            "the harness's own outputs must not refuse every eval after the first")
+}
+
+/// ...and the gate still binds on DRIFT. All three shapes refuse: an ignored
+/// file that appeared after the freeze, one whose bytes changed, and one that
+/// was removed (the baseline build compiled it, so deleting it changes what is
+/// compiled just as much as adding one).
+@Test func anIgnoredFileThatMovedSinceBaselineStillRefuses() throws {
+    let (repo, git) = try makeGitFixture()
+    let env = isolatedStateEnv()
+    defer { cleanUpFixture(repo: repo, env: env) }
+
+    let gitignore = repo.appendingPathComponent(".gitignore")
+    try (try String(contentsOf: gitignore, encoding: .utf8) + "notes/\n")
+        .write(to: gitignore, atomically: true, encoding: .utf8)
+    try FileManager.default.createDirectory(at: repo.appendingPathComponent("notes"),
+                                            withIntermediateDirectories: true)
+    try "pre-existing".write(to: repo.appendingPathComponent("notes/scratch.md"),
+                             atomically: true, encoding: .utf8)
+    try sh("git add -- .gitignore && git commit -q -m ignore", in: repo)
+    let record = try BaselineRunner.run(repo: repo, tag: "t", env: env)
+    #expect(EvalRunner.dirtyTreeFailure(git: git, repo: repo, record: record) == nil)
+
+    // ADDED.
+    try "planted after the freeze".write(to: repo.appendingPathComponent("notes/new.md"),
+                                         atomically: true, encoding: .utf8)
+    var failure = EvalRunner.dirtyTreeFailure(git: git, repo: repo, record: record)
     #expect(failure?.reason == "dirty_working_tree")
-    #expect(failure?.detail.contains("notes.md") == true)
+    #expect(failure?.detail.contains("added:    notes/new.md") == true, "\(failure?.detail ?? "")")
+    #expect(failure?.detail.contains("notes/scratch.md") == false,
+            "the unchanged, pre-existing file must not be listed as an offender")
+    try FileManager.default.removeItem(at: repo.appendingPathComponent("notes/new.md"))
+
+    // MODIFIED.
+    try "rewritten".write(to: repo.appendingPathComponent("notes/scratch.md"),
+                          atomically: true, encoding: .utf8)
+    failure = EvalRunner.dirtyTreeFailure(git: git, repo: repo, record: record)
+    #expect(failure?.detail.contains("modified: notes/scratch.md") == true,
+            "\(failure?.detail ?? "")")
+
+    // REMOVED.
+    try FileManager.default.removeItem(at: repo.appendingPathComponent("notes/scratch.md"))
+    failure = EvalRunner.dirtyTreeFailure(git: git, repo: repo, record: record)
+    #expect(failure?.detail.contains("removed:  notes/scratch.md") == true,
+            "\(failure?.detail ?? "")")
+}
+
+/// An UNCOMMITTED file is still refused unconditionally: that half has no
+/// inventory and no allowlist, because an uncommitted file exists on the
+/// candidate side only whether or not it was there at baseline.
+@Test func anUncommittedFileIsStillRefusedUnconditionally() throws {
+    let (repo, git) = try makeGitFixture()
+    let env = isolatedStateEnv()
+    defer { cleanUpFixture(repo: repo, env: env) }
+    let record = try BaselineRunner.run(repo: repo, tag: "t", env: env)
+
+    try "helper data the benchmark reads\n".write(to: repo.appendingPathComponent("b.txt"),
+                                                  atomically: true, encoding: .utf8)
+    let failure = EvalRunner.dirtyTreeFailure(git: git, repo: repo, record: record)
+    #expect(failure?.reason == "dirty_working_tree")
+    #expect(failure?.detail.contains("b.txt") == true)
+    #expect(failure?.detail.contains("git status --porcelain:") == true,
+            "the uncommitted half reports the plain status, not the ignored inventory")
 }
 
 // =========================================================================
@@ -261,11 +345,20 @@ private func sh(_ script: String, in repo: URL) throws {
     defer { cleanUpFixture(repo: repo, env: env) }
     var record = try BaselineRunner.run(repo: repo, tag: "t", env: env)
     #expect(record.treeSHA256 != nil, "a fresh baseline must carry one")
+    #expect(record.ignoredSHA256 != nil, "...and the other one")
 
     record.treeSHA256 = nil
     let failure = EvalRunner.treeInventoryFailure(
         repo: repo, record: record, scope: ["Sources/**"])
     #expect(failure?.reason == "baseline_predates_tree_inventory")
+
+    // The ignored inventory is written by the same `baseline`, so a record
+    // can only lack both. It answers with the SAME reason string rather than
+    // adding a second one to the --json contract.
+    record.ignoredSHA256 = nil
+    let ignoredFailure = EvalRunner.dirtyTreeFailure(
+        git: Git(repo: repo), repo: repo, record: record)
+    #expect(ignoredFailure?.reason == "baseline_predates_tree_inventory")
 
     // And the older record shape still DECODES, so the refusal is a refusal
     // and not a crash on an unreadable file.
@@ -275,6 +368,7 @@ private func sh(_ script: String, in repo: URL) throws {
         """
     let old = try JSONDecoder().decode(BaselineRecord.self, from: Data(json.utf8))
     #expect(old.treeSHA256 == nil)
+    #expect(old.ignoredSHA256 == nil)
     #expect(old.manifestSHA256 == nil)
 }
 

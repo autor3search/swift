@@ -364,8 +364,9 @@ public enum EvalRunner {
     /// Gate 2b. The working tree must be clean, INCLUDING files that only an
     /// ignore rule is hiding.
     ///
-    /// Returns the failure to answer with, or `nil` when the only things
-    /// present-but-ignored are the harness's own outputs.
+    /// Returns the failure to answer with, or `nil` when nothing is
+    /// uncommitted and every present-but-ignored file is exactly as `baseline`
+    /// recorded it.
     ///
     /// WHAT `--ignored` ADDS, and it is not hypothetical. `git status
     /// --porcelain` omits ignored files, so:
@@ -387,19 +388,38 @@ public enum EvalRunner {
     /// that already ignores `*.generated.swift` or `Generated/`, no `.gitignore`
     /// commit is needed at all.
     ///
-    /// THE ALLOWLIST IS THE WHOLE DESIGN. Present-but-ignored is a refusal for
-    /// every path except the four `autor3search-swift` itself writes and tells
-    /// `init` to ignore (`BaselineRunner.harnessOutputFiles` and
-    /// `harnessOutputDirectories`). It is deliberately NOT derived from
-    /// `.gitignore`: that file lives in the repository, so an allowlist read
-    /// out of it would let the agent grant itself exemptions, which is the
-    /// bypass being closed.
+    /// RECORD, DO NOT REFUSE, for the ignored half. The first version of this
+    /// gate refused ANY present-but-ignored path outside a four-entry
+    /// allowlist, and that is correct about the attack and wrong about the
+    /// world: `autor3search-swift`'s own repository ignores `docs/` and
+    /// `.superpowers/` and has both on disk, so `eval` refused on the tool's
+    /// own source tree -- as it would on most real repositories, which ignore
+    /// `.DS_Store`, editor state, vendored directories or pre-existing
+    /// generated sources that genuinely exist.
     ///
-    /// IN-SCOPE PATHS ARE NOT EXEMPT. In-scope CONTENT is legitimately allowed
-    /// to change; it is never allowed to be uncommitted, because the pinned
-    /// worktree measures a commit and an uncommitted in-scope file exists on
-    /// the candidate side only.
-    static func dirtyTreeFailure(git: Git) -> GateFailure? {
+    /// An ignored file already present when the baseline was taken is part of
+    /// the honest starting point: `frozenCommit` was taken with it there and
+    /// it gives neither side an advantage. What the attack requires is one
+    /// that APPEARS or CHANGES after the freeze. So `baseline` records the set
+    /// (`BaselineRunner.ignoredInventory`) and this compares against it, and
+    /// only a difference is a refusal. Both attacks above plant a file that
+    /// did not exist at baseline, so both still refuse.
+    ///
+    /// REMOVAL counts: deleting an ignored file the baseline build compiled
+    /// changes what is compiled as much as adding one does.
+    ///
+    /// The harness's own outputs (`.build/`, `results.tsv`, `run.log`,
+    /// `.autor3search/profiles/`) are excluded from the inventory on both
+    /// sides -- they change every eval by design. That list is a constant,
+    /// deliberately NOT derived from `.gitignore`: that file lives in the
+    /// repository, so reading the exemptions out of it would let the agent
+    /// grant itself more.
+    ///
+    /// UNCOMMITTED IS STILL UNCONDITIONAL, and that half has no inventory and
+    /// no allowlist. In-scope CONTENT is legitimately allowed to change; it is
+    /// never allowed to be uncommitted, because the pinned worktree measures a
+    /// commit and an uncommitted file exists on the candidate side only.
+    static func dirtyTreeFailure(git: Git, repo: URL, record: BaselineRecord) -> GateFailure? {
         let entries: [Git.StatusEntry]
         do {
             entries = try git.status(includingIgnored: true)
@@ -409,45 +429,95 @@ public enum EvalRunner {
                 that cannot run is not a check that passed.
                 """)
         }
-        let offenders = entries.filter {
-            !($0.isIgnored && BaselineRunner.isHarnessOutput($0.path))
+
+        // ---- Half 1: uncommitted. Unconditional, as it always was. ----
+        let uncommitted = entries.filter { !$0.isIgnored }
+        if !uncommitted.isEmpty {
+            let lines = uncommitted.map { entry -> String in
+                let origin = entry.originalPath.map { " (from \($0))" } ?? ""
+                return "  \(entry.code) \(entry.path)\(origin)"
+            }
+            return GateFailure(reason: "dirty_working_tree", detail: """
+                the working tree has uncommitted changes, and eval refuses to measure one. The \
+                scope gate inspects COMMITS (frozenCommit..HEAD) while the build, test and \
+                measurement steps compile the WORKING TREE, so an uncommitted edit would be \
+                measured but never gated -- and because the pinned baseline worktree is a \
+                checkout of a commit, such an edit exists only on the candidate side and would \
+                manufacture a fresh "win" on every later experiment, credited to commits that do \
+                not contain it. Commit the change (so the scope gate can judge it) or discard it. \
+                git status --porcelain:
+                \(String(lines.joined(separator: "\n").prefix(4000)))
+                """)
         }
-        guard !offenders.isEmpty else { return nil }
 
-        let ignoredOffenders = offenders.filter(\.isIgnored)
-        let lines = offenders.map { entry -> String in
-            let origin = entry.originalPath.map { " (from \($0))" } ?? ""
-            let note = entry.isIgnored
-                ? "  [present on disk, hidden from `git status` by an ignore rule]" : ""
-            return "  \(entry.code) \(entry.path)\(origin)\(note)"
+        // ---- Half 2: ignored files that moved since the freeze. ----
+        guard let recorded = record.ignoredSHA256 else {
+            // Written by the same `baseline` that writes `treeSHA256`, so this
+            // can only be a record from before either existed. Same reason
+            // string rather than a second contract addition saying the same
+            // thing.
+            return GateFailure(reason: "baseline_predates_tree_inventory", detail: """
+                this baseline record has no inventory of the files an ignore rule hides from git, \
+                because it was written by a version of autor3search-swift from before that \
+                existed. Without one there is no way to tell a file that was ALREADY there at the \
+                freeze -- part of the honest starting point -- from one PLANTED afterwards, which \
+                the pinned measurement worktree can never contain and which would manufacture a \
+                win on every later experiment, credited to commits that do not contain it.
+
+                Re-run `autor3search-swift baseline` under a NEW tag to establish one. Results \
+                from this run were measured without that protection and should not be mixed with \
+                the new run's.
+                """)
         }
 
-        let ignoredNote = ignoredOffenders.isEmpty ? "" : """
+        let live: [String: String]
+        do {
+            live = try BaselineRunner.ignoredInventory(repo: repo, git: git)
+        } catch {
+            return GateFailure(reason: "dirty_working_tree", detail: """
+                could not inventory the files an ignore rule is hiding from git, to compare them \
+                against what baseline recorded: \(error). Failing closed -- a check that cannot \
+                run is not a check that passed.
+                """)
+        }
 
+        // Sorted, so two evals a day apart produce diffable messages.
+        let added = live.keys.filter { recorded[$0] == nil }.sorted()
+        let changed = recorded.keys.filter { live[$0] != nil && live[$0] != recorded[$0] }.sorted()
+        let removed = recorded.keys.filter { live[$0] == nil }.sorted()
+        guard !added.isEmpty || !changed.isEmpty || !removed.isEmpty else { return nil }
 
-            At least one of these is IGNORED, not merely uncommitted: \
-            \(ignoredOffenders.map(\.path).joined(separator: ", ")). An ignored file is invisible \
-            to `git status --porcelain`, is not removed by `git reset --hard` and is not added by \
-            `git add -A`, so it is present on the candidate side of every measurement and present \
-            in no commit at all -- it would manufacture a win on every later experiment, credited \
-            to commits that do not contain it. The ignore rule may live in any .gitignore, in \
-            .git/info/exclude (which is not a repository file and cannot be reviewed), or in a \
-            global excludes file. Run `git status --ignored` to see it, and \
-            `git check-ignore -v <path>` to find the rule. The only present-but-ignored paths \
-            eval tolerates are the ones it writes itself: \
-            \(BaselineRunner.harnessOutputFiles.joined(separator: ", ")), \
-            \(BaselineRunner.harnessOutputDirectories.map { $0 + "/" }.joined(separator: ", ")).
-            """
+        var lines: [String] = []
+        for path in added { lines.append("  added:    \(path) (baseline recorded no such file)") }
+        for path in changed {
+            lines.append("  modified: \(path) (now \(live[path]!), baseline recorded \(recorded[path]!))")
+        }
+        for path in removed {
+            lines.append("  removed:  \(path) (baseline recorded \(recorded[path]!))")
+        }
 
         return GateFailure(reason: "dirty_working_tree", detail: """
-            the working tree has uncommitted or ignored-but-present changes, and eval refuses to \
-            measure one. The scope gate inspects COMMITS (frozenCommit..HEAD) while the build, \
-            test and measurement steps compile the WORKING TREE, so such a file would be measured \
-            but never gated -- and because the pinned baseline worktree is a checkout of a commit, \
-            it exists only on the candidate side and would manufacture a fresh "win" on every \
-            later experiment, credited to commits that do not contain it. Commit the change (so \
-            the scope gate can judge it) or discard it. git status --porcelain --ignored:
-            \(String(lines.joined(separator: "\n").prefix(4000)))\(ignoredNote)
+            files that an ignore rule hides from `git status` have changed since baseline, and \
+            eval refuses to measure that:
+
+            \(String(lines.joined(separator: "\n").prefix(4000)))
+
+            An ignored file that was ALREADY present when the baseline was taken is fine and is \
+            not listed here -- it is part of the honest starting point. These are not: an ignored \
+            file is invisible to `git status --porcelain`, is not removed by `git reset --hard` \
+            and is not added by `git add -A`, so one that appeared after the freeze is present on \
+            the candidate side of every measurement and present in NO commit at all. The pinned \
+            measurement worktree is a checkout of a commit and can never contain it, so it would \
+            manufacture a win on every later experiment, credited to commits that do not contain \
+            it. A removal counts for the same reason: the baseline build compiled that file.
+
+            The rule doing the hiding may live in any .gitignore, in .git/info/exclude (which is \
+            not a repository file and cannot be reviewed), in a global excludes file, or in \
+            core.excludesFile. Run `git status --ignored` to see what is present and \
+            `git check-ignore -v <path>` to find the rule. Commit the file (so the scope gate can \
+            judge it) or remove it. The harness's own outputs are never inventoried: \
+            \(BaselineRunner.harnessOutputFiles.joined(separator: ", ")), \
+            \(BaselineRunner.harnessOutputDirectories.map { $0 + "/" }.joined(separator: ", ")).
             """)
     }
 
@@ -719,7 +789,9 @@ public enum EvalRunner {
         // IGNORED FILES COUNT. `git status --porcelain` alone omits them, and
         // that omission is a bypass in its own right -- see `dirtyTreeFailure`,
         // which carries the full reasoning and the allowlist.
-        if let failure = dirtyTreeFailure(git: git) { return fail(failure) }
+        if let failure = dirtyTreeFailure(git: git, repo: repo, record: record) {
+            return fail(failure)
+        }
 
         // ---- Gate 2c: `scope`, enforced against the DISK ----
         //
