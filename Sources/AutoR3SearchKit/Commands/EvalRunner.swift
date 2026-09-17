@@ -1173,7 +1173,8 @@ public enum EvalRunner {
 
         let timeout = TimeInterval(config.timeoutSeconds)
 
-        let build = try Subprocess.run(swift, ["build", "-c", "release"], cwd: repo, timeout: timeout)
+        let build = try Subprocess.run(swift, ["build", "-c", "release"], cwd: repo,
+                                       env: SanitizedEnvironment.forTools(), timeout: timeout)
         if build.timedOut {
             return fail(GateFailure(reason: "build_timed_out", detail: """
                 swift build -c release did not finish within timeout_seconds (\(config.timeoutSeconds)s) \
@@ -1201,7 +1202,8 @@ public enum EvalRunner {
             return fail(failure)
         }
 
-        let tests = try Subprocess.run(swift, ["test"], cwd: repo, timeout: timeout)
+        let tests = try Subprocess.run(swift, ["test"], cwd: repo,
+                                       env: SanitizedEnvironment.forTools(), timeout: timeout)
         if tests.timedOut {
             return fail(GateFailure(reason: "tests_timed_out", detail: """
                 swift test did not finish within timeout_seconds (\(config.timeoutSeconds)s) and \
@@ -1324,7 +1326,8 @@ public enum EvalRunner {
         // worktree as the previous eval left it, not as this eval's build
         // just rewrote it.
         let baselineBuild = try Subprocess.run(
-            swift, ["build", "-c", "release"], cwd: worktree, timeout: timeout)
+            swift, ["build", "-c", "release"], cwd: worktree,
+            env: SanitizedEnvironment.forTools(), timeout: timeout)
         if baselineBuild.timedOut {
             return fail(GateFailure(reason: "baseline_build_timed_out", detail: """
                 building the pinned measurement worktree did not finish within \
@@ -1459,7 +1462,7 @@ public enum EvalRunner {
         for product in [benchmarkTarget, "BenchmarkTool"] {
             let result = try Subprocess.run(
                 swift, ["build", "-c", "release", "--product", product],
-                cwd: directory, timeout: timeout)
+                cwd: directory, env: SanitizedEnvironment.forTools(), timeout: timeout)
             if result.timedOut {
                 return GateFailure(reason: "\(reasonPrefix)_timed_out", detail: """
                     building product \(product) in \(description) did not finish within \

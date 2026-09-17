@@ -97,7 +97,7 @@ public enum PackageDescribe {
     public static func describe(repo: URL, timeout: TimeInterval = 300) throws -> PackageDescription {
         let swift = URL(fileURLWithPath: "/usr/bin/swift")
         let r = try Subprocess.run(swift, ["package", "describe", "--type", "json"],
-                                    cwd: repo, env: nil, timeout: timeout)
+                                    cwd: repo, env: SanitizedEnvironment.forTools(), timeout: timeout)
         guard r.exitCode == 0 else { throw PackageDescribeError.failed(r.stderr) }
         guard !r.outputTruncated else {
             throw PackageDescribeError.failed("swift package describe output was truncated at the capture cap")

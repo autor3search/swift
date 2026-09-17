@@ -37,12 +37,52 @@ public struct Git: Sendable {
 
     private static let gitBinary = URL(fileURLWithPath: "/usr/bin/git")
 
+    /// Prefixed to EVERY git invocation the harness makes.
+    ///
+    /// GIT HOOKS ARE CODE THE HARNESS RUNS. `.git/` is in
+    /// `neverWalkedDirectories`, git never reports it as a changed or ignored
+    /// path, and the hook directory is SHARED with every linked worktree -- so
+    /// a `post-checkout` hook planted in the repository under test fires inside
+    /// `Worktree.restoreToPin`'s own `git checkout --detach --force`, after the
+    /// restore has happened. Measured: the hook re-set `--skip-worktree` and
+    /// rewrote an out-of-scope helper, and the eval returned
+    /// `rc 0, keep, ratio 0.10045, warnings: []` -- silent, because
+    /// `indexFlaggedPaths` had been sampled BEFORE the checkout and `git
+    /// status` was then lied to by the flag.
+    ///
+    /// DENY, DO NOT DELETE. Emptying `.git/hooks` would not have helped:
+    /// `core.hooksPath` can be set from the ENVIRONMENT with
+    /// `GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath`, writing nothing
+    /// under `.git/` at all -- measured at `rc 0, keep, ratio 0.09985`. A `-c`
+    /// on the command line outranks every configuration source including that
+    /// one; verified both ways round:
+    ///
+    /// ```
+    /// GIT_CONFIG_COUNT=1 ... git -c core.hooksPath=/dev/null checkout --force  -> hook did NOT run
+    /// GIT_CONFIG_COUNT=1 ... git                              checkout --force  -> hook RAN
+    /// ```
+    ///
+    /// `/dev/null` rather than an empty directory the harness creates: an empty
+    /// directory is same-user and could simply have hooks written into it,
+    /// whereas `<path>/post-checkout` under `/dev/null` cannot resolve on any
+    /// POSIX system. Verified to exit 0 and run no hook.
+    private static let hookDenial = ["-c", "core.hooksPath=/dev/null"]
+
+    /// Git's own arguments, plus the hook denial. Kept separate from the
+    /// caller's `args` so diagnostics still quote the command the caller asked
+    /// for rather than the harness's plumbing.
+    private static func hardened(_ args: [String]) -> [String] {
+        hookDenial + args
+    }
+
     /// Runs a git subcommand against `cwd` (defaulting to `repo`) and returns
     /// trimmed stdout. A non-zero exit throws `GitError.command` — for git
     /// plumbing, that genuinely is an error, not data to be scored.
     @discardableResult
     public func run(_ args: [String], cwd: URL? = nil, timeout: TimeInterval = 120) throws -> String {
-        let result = try Subprocess.run(Git.gitBinary, args, cwd: cwd ?? repo, env: nil, timeout: timeout)
+        let result = try Subprocess.run(
+            Git.gitBinary, Git.hardened(args), cwd: cwd ?? repo,
+            env: SanitizedEnvironment.forTools(), timeout: timeout)
         guard result.exitCode == 0 else {
             throw GitError.command(args.joined(separator: " "), result.exitCode, result.stderr)
         }
@@ -127,7 +167,9 @@ public struct Git: Sendable {
     public func status(includingIgnored: Bool = false) throws -> [StatusEntry] {
         var args = ["status", "--porcelain", "-z"]
         if includingIgnored { args.append("--ignored") }
-        let result = try Subprocess.runData(Git.gitBinary, args, cwd: repo, env: nil, timeout: 120)
+        let result = try Subprocess.runData(
+            Git.gitBinary, Git.hardened(args), cwd: repo,
+            env: SanitizedEnvironment.forTools(), timeout: 120)
         guard result.exitCode == 0 else {
             throw GitError.command(args.joined(separator: " "), result.exitCode, result.stderr)
         }
@@ -198,7 +240,9 @@ public struct Git: Sendable {
     /// 17's scope gate rather than fail loudly.
     public func changedPaths(since commit: String) throws -> [String] {
         let args = ["diff", "-z", "--no-renames", "--name-only", commit, "HEAD"]
-        let result = try Subprocess.runData(Git.gitBinary, args, cwd: repo, env: nil, timeout: 120)
+        let result = try Subprocess.runData(
+            Git.gitBinary, Git.hardened(args), cwd: repo,
+            env: SanitizedEnvironment.forTools(), timeout: 120)
         guard result.exitCode == 0 else {
             throw GitError.command(args.joined(separator: " "), result.exitCode, result.stderr)
         }
@@ -231,7 +275,8 @@ public struct Git: Sendable {
     /// cheap way to make `outputTruncated` actually trip in a test.
     func fileContents(_ path: String, at commit: String, outputCapBytes: Int) throws -> Data {
         let result = try Subprocess.runData(
-            Git.gitBinary, ["show", "\(commit):\(path)"], cwd: repo, env: nil, timeout: 60,
+            Git.gitBinary, Git.hardened(["show", "\(commit):\(path)"]), cwd: repo,
+            env: SanitizedEnvironment.forTools(), timeout: 60,
             outputCapBytes: outputCapBytes)
         guard result.exitCode == 0 else {
             throw GitError.command("show \(commit):\(path)", result.exitCode, result.stderr)

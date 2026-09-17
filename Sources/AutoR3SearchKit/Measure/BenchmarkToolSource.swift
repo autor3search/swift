@@ -89,7 +89,16 @@ public struct BenchmarkToolSource: MetricSource {
             "--baseline-storage-path", storage.path,
             "--target-name", benchmarkTarget,
             "--targets", benchmarkTarget,
-        ], cwd: worktree, env: nil, timeout: TimeInterval(config.timeoutSeconds))
+        // THE MEASURED PROCESS GETS THE SCRUBBED ENVIRONMENT TOO, and for this
+        // one it is not about code injection but about EXCHANGEABILITY. The
+        // baseline side and the candidate side must differ in exactly one
+        // thing: the commit. Handing them the inherited environment lets
+        // anything in it -- `DYLD_INSERT_LIBRARIES`, a malloc tunable, a
+        // locale that changes String's fast paths -- reach one invocation and
+        // not the other, or reach both and vary between them. Both sides get
+        // the identical, filtered set.
+        ], cwd: worktree, env: SanitizedEnvironment.forTools(),
+           timeout: TimeInterval(config.timeoutSeconds))
 
         // Distinguished from a non-zero exit: a hang calls for a different
         // operator response (raise the timeout, or suspect the benchmark

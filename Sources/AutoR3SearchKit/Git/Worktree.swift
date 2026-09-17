@@ -1,4 +1,5 @@
 import Foundation
+import Crypto
 
 /// The pinned, detached baseline worktree the measurement harness measures
 /// against. It lives outside the repository under test (see `StateHome`) so
@@ -127,6 +128,93 @@ public enum Worktree {
     /// and leaves mtimes alone, so the warm `.build` stays valid and the
     /// incremental rebuild that follows is unaffected. `clean -fd` (never
     /// `-fdx`) removes untracked residue and leaves that warm cache alone.
+    /// Every tracked path at `commit` whose bytes ON DISK do not hash to the
+    /// blob git recorded for it, plus anything missing.
+    ///
+    /// WHY `verify` IS NOT A POST-CONDITION. `verify` asks `git status`, and
+    /// `git status` can be made to lie about content, not merely about flags. A
+    /// `.gitattributes` entry plus a `filter.<driver>` in `.git/config` -- both
+    /// agent-writable -- runs a SMUDGE filter during the harness's own
+    /// `checkout --force` and a CLEAN filter when git compares the result back.
+    /// Measured directly:
+    ///
+    /// ```
+    /// after forced checkout of a modified file: count = 17500
+    /// the commit actually holds:                count = 1750
+    /// git status --porcelain:                   (empty -- "clean")
+    /// hash-object --no-filters: f0b02a86...   commit blob: cc57109a...
+    /// ```
+    ///
+    /// Denying hooks does not touch that: it is a different piece of code the
+    /// harness runs. So the post-condition stops asking git whether the tree is
+    /// clean and computes the answer itself: `ls-tree` gives the blob id for
+    /// every path at `commit` (an id, not a judgement -- it comes from the
+    /// commit object, which is content-addressed and cannot be rewritten
+    /// without changing the SHA the baseline record pins), and each file's own
+    /// bytes are hashed here with git's blob rule, `sha1("blob <len>\0" +
+    /// bytes)`. No index, no filters, no status.
+    ///
+    /// Symlinks (mode 120000) hash their TARGET STRING, which is what git
+    /// stores, so a re-aimed link is a mismatch. Gitlinks (mode 160000,
+    /// submodules) are skipped: their content is another repository, not a file
+    /// in this one.
+    public static func contentMismatches(at url: URL, commit: String) throws -> [String] {
+        let git = Git(repo: url)
+        let listing = try git.run(["ls-tree", "-r", "-z", commit])
+        var mismatches: [String] = []
+        for record in listing.split(separator: "\0", omittingEmptySubsequences: true) {
+            // "<mode> SP <type> SP <sha>\t<path>"
+            guard let tab = record.firstIndex(of: "\t") else { continue }
+            let meta = record[record.startIndex..<tab].split(separator: " ")
+            guard meta.count >= 3 else { continue }
+            let mode = String(meta[0]), blob = String(meta[2])
+            let path = String(record[record.index(after: tab)...])
+            guard mode != "160000" else { continue }
+
+            let file = url.appendingPathComponent(path)
+            var info = stat()
+            guard lstat(file.path, &info) == 0 else {
+                mismatches.append("\(path) (missing)")
+                continue
+            }
+            let bytes: Data
+            if (info.st_mode & S_IFMT) == S_IFLNK {
+                guard let target = try? FileManager.default.destinationOfSymbolicLink(
+                    atPath: file.path) else {
+                    mismatches.append("\(path) (unreadable symbolic link)")
+                    continue
+                }
+                bytes = Data(target.utf8)
+            } else {
+                guard let data = try? Data(contentsOf: file) else {
+                    mismatches.append("\(path) (unreadable)")
+                    continue
+                }
+                bytes = data
+            }
+            if blobIdentifier(bytes) != blob {
+                mismatches.append("\(path) (content does not match the commit's blob \(blob))")
+            }
+        }
+        return mismatches
+    }
+
+    /// git's blob object id for `bytes`: SHA-1 over `"blob <length>\0"` then the
+    /// content. Computed here rather than shelled out to `git hash-object` so
+    /// the comparison depends on no git configuration at all -- `hash-object`
+    /// without `--no-filters` would run the very filter this is checking for.
+    ///
+    /// SHA-1 is git's object format, so this is interoperability, not a
+    /// security choice: the value it is compared against is a git blob id.
+    /// Forging a collision here would also have to produce a valid blob whose
+    /// id matches one recorded in a commit the baseline record pins by SHA.
+    static func blobIdentifier(_ bytes: Data) -> String {
+        var hasher = Insecure.SHA1()
+        hasher.update(data: Data("blob \(bytes.count)\u{0}".utf8))
+        hasher.update(data: bytes)
+        return hasher.finalize().compactMap { String(format: "%02x", $0) }.joined()
+    }
+
     @discardableResult
     public static func restoreToPin(git: Git, at url: URL, to commit: String) throws
         -> [(tag: Character, path: String)] {
@@ -167,17 +255,69 @@ public enum Worktree {
             }
         }
         try repoint(git: git, at: url, to: commit)
-        // POST-CONDITION, checked rather than assumed. With the index flags
-        // cleared, `git status` is honest again -- they were the reason it was
-        // lying -- so `verify` is meaningful here in a way it was not before
-        // the restore. Failing closed: the caller turns this into a refusal,
-        // because the baseline side is what every ratio is divided by.
+
+        // ---- POST-CONDITIONS, SAMPLED AFTER THE LAST THING THAT COULD CHANGE
+        // THEM, which is the checkout itself. ----
+        //
+        // The previous version sampled `indexFlaggedPaths` only BEFORE the
+        // checkout, and that is precisely how a `post-checkout` hook beat it:
+        // the hook re-set `--skip-worktree` and re-tampered AFTER the restore,
+        // so `flagged` was empty, `git status` was lied to by the fresh flag,
+        // and the eval returned `rc 0, keep, ratio 0.10045` with NO WARNING AT
+        // ALL. Hooks are denied now (`Git.hookDenial`), but a post-condition
+        // that can only be true if some other defence held is not a
+        // post-condition. Re-sampled here, and the two are unioned so the
+        // warning names everything that was flagged at any point.
+        let afterCheckout = (try? indexFlaggedPaths(at: url)) ?? []
+        var reported = flagged
+        if !afterCheckout.isEmpty {
+            // ONE repair round, deliberately bounded. Something set these
+            // during the checkout; clear them and restore once more, then
+            // insist. An unbounded loop against an adversary that re-flags on
+            // every checkout would spin forever instead of refusing.
+            let worktreeGit = Git(repo: url)
+            for flag in ["--no-assume-unchanged", "--no-skip-worktree"] {
+                _ = try? worktreeGit.run(
+                    ["update-index", flag, "--"] + afterCheckout.map(\.path))
+            }
+            try repoint(git: git, at: url, to: commit)
+            let residual = (try? indexFlaggedPaths(at: url)) ?? []
+            guard residual.isEmpty else {
+                throw GitError.command(
+                    "update-index --no-assume-unchanged/--no-skip-worktree", 0, """
+                    \(residual.count) path(s) are marked assume-unchanged or skip-worktree again \
+                    after being cleared and re-restored: \
+                    \(residual.map { "\($0.tag) \($0.path)" }.prefix(20).joined(separator: ", ")). \
+                    Something is re-flagging them during the checkout itself.
+                    """)
+            }
+            reported += afterCheckout
+        }
+
+        // CONTENT, not `git status`. `verify` is kept for the cheap HEAD-and-
+        // cleanliness signal, but it cannot be the last word: a
+        // `.gitattributes` smudge filter rewrites a file DURING this checkout
+        // and the matching clean filter makes `git status` report it as
+        // unmodified -- measured, worktree `17500` against a commit holding
+        // `1750`, status empty. `contentMismatches` hashes the bytes on disk
+        // against the blob ids in the commit and asks git nothing.
         guard try verify(at: url, expectedCommit: commit) else {
             throw GitError.command(
                 "checkout --detach --force \(commit)", 0,
                 "the worktree is still not a clean checkout of \(commit) after being restored")
         }
-        return flagged
+        let mismatches = try contentMismatches(at: url, commit: commit)
+        guard mismatches.isEmpty else {
+            throw GitError.command(
+                "checkout --detach --force \(commit)", 0, """
+                \(mismatches.count) file(s) in the worktree do not match the bytes recorded at \
+                \(commit), even though git reports the tree as clean: \
+                \(mismatches.prefix(20).joined(separator: "; ")). A .gitattributes filter driver \
+                rewrites files during checkout and makes git compare the rewritten copy back as \
+                though it were unchanged.
+                """)
+        }
+        return reported
     }
 
     /// Whether the worktree has no local modifications, independent of which

@@ -139,7 +139,7 @@ public enum Lockfile {
     /// `dependencies` array. Advisory; see `externalDependencyIdentities`.
     public static func externalDependencyIdentities(repo: URL, timeout: TimeInterval = 300) throws -> [String] {
         let r = try Subprocess.run(swiftBinary, ["package", "describe", "--type", "json"],
-                                   cwd: repo, env: nil, timeout: timeout)
+                                   cwd: repo, env: SanitizedEnvironment.forTools(), timeout: timeout)
         guard r.exitCode == 0 else { throw PackageDescribeError.failed(r.stderr) }
         guard !r.outputTruncated else {
             throw PackageDescribeError.failed(
@@ -193,7 +193,7 @@ public enum Lockfile {
         let result: ProcessResult
         do {
             result = try Subprocess.run(swiftBinary, ["package", "resolve"],
-                                        cwd: directory, env: nil, timeout: timeout)
+                                        cwd: directory, env: SanitizedEnvironment.forTools(), timeout: timeout)
         } catch {
             return .undetermined("swift package resolve could not run: \(error)")
         }

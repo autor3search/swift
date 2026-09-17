@@ -744,7 +744,7 @@ public enum BaselineRunner {
             do {
                 let result = try Subprocess.run(
                     swift, ["build", "-c", "release", "--product", product],
-                    cwd: worktree, env: nil, timeout: 1800)
+                    cwd: worktree, env: SanitizedEnvironment.forTools(), timeout: 1800)
                 guard result.exitCode == 0 else {
                     warnings.append("""
                         warm build of product \(product) failed (exit \(result.exitCode)); the \

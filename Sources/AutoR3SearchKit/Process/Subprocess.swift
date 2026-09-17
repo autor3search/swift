@@ -61,6 +61,94 @@ public enum SubprocessError: Error, CustomStringConvertible {
     }
 }
 
+/// The environment the harness hands to the tools it runs.
+///
+/// THE ROOT CAUSE, ONE STEP ON. Every earlier bypass answered "does the
+/// COMPILER read it?" -- git's index, ignore rules, the out-of-scope tree, the
+/// dependency checkouts. This one is about what the HARNESS ITSELF RUNS. Both
+/// questions have to be asked of every exempt region now.
+///
+/// `Subprocess.run(..., env: nil)` inherits the parent environment whole, and
+/// in many deployments the agent under measurement is the process that invokes
+/// `eval`. So the environment is adversary-controlled input, and it reaches:
+///
+///   - **git**, via `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`,
+///     which can set `core.hooksPath` with NOTHING written under `.git/` at
+///     all. The harness's own `git checkout --detach --force` inside
+///     `Worktree.restoreToPin` then fires an attacker's `post-checkout` hook.
+///     Measured: `rc 0, keep, ratio 0.09985, warnings: []`.
+///   - **the Swift toolchain**, via `SWIFT_EXEC`, `TOOLCHAINS`, `DEVELOPER_DIR`,
+///     `SDKROOT`, `CC`, `CXX`, `DYLD_INSERT_LIBRARIES` and friends. A wrapper
+///     named by any of these sees the working directory of each invocation and
+///     can therefore tell the candidate side from the baseline side, compiling
+///     one honestly and the other with different flags.
+///
+/// ALLOWLIST, NOT DENYLIST, and the choice is not close. A denylist has to
+/// enumerate every variable of two separately-evolving tools; git alone added
+/// `GIT_CONFIG_COUNT` in 2.31, and being one release behind is a hole. An
+/// allowlist is wrong in the safe direction: the failure mode is a tool that
+/// cannot find something it needs, which is loud and immediate, not a silent
+/// bypass. What the allowlist contains was established BY RUNNING the tools,
+/// not by guessing -- see `docs/run-log.md` for the transcript.
+public enum SanitizedEnvironment {
+    /// The variables that survive, for every tool the harness runs.
+    ///
+    /// Each is here for a reason, and nothing is here "just in case":
+    ///
+    /// - `PATH` -- the toolchain shells out (`/bin/sh` for plugins, linker
+    ///   drivers, `xcrun`). Measured: `swift build` succeeds under `env -i` on
+    ///   this machine, so this is for packages whose builds invoke external
+    ///   tools, not for ours. It stays a residual: see the note below.
+    /// - `HOME` -- SwiftPM's shared caches (`~/.swiftpm`,
+    ///   `~/Library/Caches/org.swift.swiftpm`) and, for `swift package
+    ///   resolve`, git credential helpers and `~/.netrc` for private
+    ///   dependencies. Dropping it builds fine and re-downloads everything.
+    /// - `TMPDIR` -- honouring the platform's temp location rather than
+    ///   silently falling back to `/tmp`, which on macOS is a different
+    ///   filesystem with different permissions.
+    /// - `USER`, `LOGNAME`, `SHELL` -- identity and shell selection some build
+    ///   scripts read; harmless and cheap to keep.
+    /// - `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`, `__CF_USER_TEXT_ENCODING` --
+    ///   text encoding and terminal handling. Dropping the locale makes
+    ///   diagnostics with non-ASCII paths mangle.
+    ///
+    /// EVERYTHING ELSE IS DROPPED, and these in particular: `SWIFT_EXEC`,
+    /// `SWIFT_DRIVER_*`, `SWIFTPM_*`, `SWIFT_DETERMINISTIC_HASHING`,
+    /// `TOOLCHAINS`, `DEVELOPER_DIR`, `SDKROOT`, `CC`, `CXX`, `CFLAGS`,
+    /// `CXXFLAGS`, `LDFLAGS`, `MACOSX_DEPLOYMENT_TARGET`, `DYLD_*`,
+    /// `LD_LIBRARY_PATH`, `GIT_*` in full.
+    ///
+    /// AN OPERATOR WHO NEEDS A NON-DEFAULT TOOLCHAIN must select it with
+    /// `xcode-select`, or by placing it on `PATH` -- not with `TOOLCHAINS` or
+    /// `DEVELOPER_DIR`, because a per-process toolchain override IS the
+    /// discriminating primitive this closes. That is a deliberate behaviour
+    /// change and is stated in the run log.
+    public static let allowed: Set<String> = [
+        "PATH", "HOME", "TMPDIR",
+        "USER", "LOGNAME", "SHELL",
+        "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+        "__CF_USER_TEXT_ENCODING",
+    ]
+
+    /// `inherited`, reduced to `allowed`.
+    ///
+    /// Exact-name matching only -- no prefixes, no globs. A prefix rule would
+    /// have to be read as "and everything that starts like this", which is how
+    /// `GIT_CONFIG_COUNT` would sneak back in beside a `GIT_CONFIG` someone
+    /// allowed for a good reason.
+    public static func filtered(
+        _ inherited: [String: String], allowing allowed: Set<String> = SanitizedEnvironment.allowed
+    ) -> [String: String] {
+        inherited.filter { allowed.contains($0.key) }
+    }
+
+    /// The environment for every tool the harness runs, built from the real
+    /// one at the moment of the call.
+    public static func forTools() -> [String: String] {
+        filtered(ProcessInfo.processInfo.environment)
+    }
+}
+
 public enum Subprocess {
     /// How long the readers may keep draining after the child has been reaped.
     /// Bounds `run` even when a descendant escaped the tree kill and is still
