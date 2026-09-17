@@ -390,7 +390,7 @@ built or measured — a `FAIL` from them costs seconds, not minutes.
 | 1 | **Scope.** Every path changed between `frozenCommit` and `HEAD` must match a `scope` glob. Any change to `Package.swift` or `Package.resolved` is rejected outright, regardless of scope. | `out_of_scope`, `manifest_change_rejected` |
 | 2 | **Config integrity.** SHA-256 of `.autor3search/config.yaml` must equal what `baseline` recorded. | `config_hash_mismatch` |
 | 2a | **Manifest integrity, by hash.** `Package.swift` and `Package.resolved` *as they are on disk*, plus every manifest in the recorded inventory (nested `Sub/Package.swift`, `Package@swift-6.0.swift`, anything under `.swiftpm/`), must hash to what `baseline` recorded — and a manifest *appearing* where baseline recorded none is itself a mismatch. | `manifest_change_rejected`, `baseline_predates_manifest_inventory` |
-| 2b | **Clean working tree**, read with `git status --porcelain --ignored` — ignored files included, because plain `--porcelain` omits them and a planted gitignored source compiles and is measured. `eval` builds and measures the *working tree*, while gate 1 inspects *commits*. Ignored files are **recorded at baseline, not banned**: one that was already there is part of the honest starting point, and only one that **appears, changes or disappears after the freeze** is refused — the pinned worktree is a checkout of a *commit* and can never contain it, so it exists on the candidate side alone. The harness's own outputs (`.build/`, `results.tsv`, `run.log`, `.autor3search/profiles/`) are excluded; they change every eval by design. | `dirty_working_tree` |
+| 2b | **Clean working tree**, read with `git status --porcelain --ignored` — ignored files included, because plain `--porcelain` omits them and a planted gitignored source compiles and is measured. `eval` builds and measures the *working tree*, while gate 1 inspects *commits*. Ignored files are **recorded at baseline, not banned**: one that was already there is part of the honest starting point, and only one that **appears, changes or disappears after the freeze** is refused — the pinned worktree is a checkout of a *commit* and can never contain it, so it exists on the candidate side alone. The harness's own outputs (`.build/`, `results.tsv`, `run.log`, `.autor3search/profiles/`) are excluded; they change every eval by design. **Tracked files are additionally hashed against the commit's own blob ids**, because a `filter.<name>.clean` driver can make `git status` report a modified file as clean — so this gate no longer takes git's word for it. | `dirty_working_tree` |
 | 2c | **Out-of-scope files, by content.** Hashes every file outside `scope` *except* `.git/`, `.build/` and the harness's own outputs (`results.tsv`, `run.log`, `.autor3search/profiles/`); refuses any modified, missing or extra. Gate 1 asks git what changed; gate 2c asks the disk. | `out_of_scope`, `baseline_predates_tree_inventory` |
 | 2d | **Dependency checkouts.** Every file under `.build/checkouts/` is verified per dependency against the revisions `Package.resolved` pins. A *wholly missing* checkout is allowed — SwiftPM re-clones it from that same pin. | `dependency_checkout_modified` |
 | 3 | **Restore frozen files.** Every file in every frozen test and benchmark target is restored from the snapshot, byte for byte, after the whole stored manifest has been verified against the recorded hashes. | `frozen_restore_refused` |
@@ -434,13 +434,41 @@ What remains unhashed is `.build`'s build **output** — `out/`, `plugins/`,
 rebuilt by gate 5. See
 [the build cache](#the-build-cache-is-not-verified) for what that leaves open.
 
+### Two checks that do not depend on any list being complete
+
+Read this before the enumeration below, because it is the reason the tool is
+shippable despite that enumeration being incomplete and *known* to be
+incomplete.
+
+Most of the hardening in this README is a list: of exempt regions, of config keys
+that execute programs, of environment variables. **Every such list is one attack
+behind by construction.** Two changes are not lists, and between them they
+neutralise whole classes rather than instances:
+
+1. **The measured-binary hash is snapshotted immediately after the last build.**
+   Everything that runs afterwards — `isClean`, a possible worktree repoint, the
+   unsafe scan's `git show` — is downstream of it, so anything those steps change
+   is a *mismatch the guard reports* rather than a value it adopts. In the
+   implementer's words: **a snapshot whose correctness depends on a denial list
+   being complete is a snapshot in the wrong place.** That placement alone blocks
+   the `core.fsmonitor` attack below *even with `core.fsmonitor` undenied*.
+2. **Content is hashed against the commit's blob ids, never asked of git.**
+   Both the pinned worktree and the candidate's tracked files are checked that
+   way. No filter, attribute, or config participates. So the entire class of *"git
+   was configured to lie about what changed"* is caught **by effect, regardless of
+   mechanism** — including mechanisms nobody has thought of yet.
+
+The rule generalising both: **prefer a check whose correctness does not depend on
+an enumeration you maintain.** Where you cannot have one, keep the list — but
+know what it is worth.
+
 ### Every exemption from an integrity check is a candidate bypass
 
 This is the most transferable thing in the project, and it is worth more than
 any individual gate above.
 
-**Thirteen bypasses have been found across six reviews — twelve closed, one
-named and unmeasured — and the later ones all came from regions that had been
+**Fifteen bypasses have been found across seven reviews — thirteen closed, two
+open and named — and the later ones all came from regions that had been
 *exempted* from a check for good reasons** — `.build/` because hashing it is
 expensive, the pinned worktree because it is the harness's own, `.git/` because
 git never reports it and it is not source. Every one of those exemptions was
@@ -575,6 +603,65 @@ pre-restore check refused first, on the old binary too. So the content hashing i
 **defence in depth, not a measured closure**, and this README will not call it
 one.
 
+### Git config that runs programs: what is denied, and what cannot be
+
+`core.hooksPath` was never the only key that makes git execute something. Every
+git call the harness makes now denies **twenty** keys, taken from `git config`'s
+documentation for the installed version (git 2.54.0) rather than from the attacks
+already found, and each one checked against the commands this harness actually
+runs:
+
+```
+core.hooksPath          core.fsmonitor          core.alternateRefsCommand
+core.sshCommand         core.gitProxy           core.askPass
+credential.helper       core.pager              core.editor
+sequence.editor         diff.external           interactive.diffFilter
+gpg.program             gpg.openpgp.program     gpg.x509.program
+gpg.ssh.program         gpg.ssh.defaultKeyCommand
+gc.recentObjectsHook    uploadpack.packObjectsHook
+core.attributesFile     core.excludesFile
+```
+
+The last two do not execute anything themselves; they are the *out-of-tree door*
+to the filter and ignore machinery that does.
+
+> **CANNOT BE DENIED, and this is a live residual rather than a theoretical one.**
+> `git -c` takes no wildcard, and these keys are per-name:
+>
+> `filter.<name>.clean` · `filter.<name>.smudge` · `filter.<name>.process` ·
+> `diff.<name>.textconv` · `diff.<name>.command` · `pager.<cmd>` ·
+> `trailer.<key>.cmd` · and the `difftool` / `mergetool` / `guitool` / `man` /
+> `browser` `<tool>.cmd` families.
+>
+> Enumerating the names out of the repository's own config would be a
+> check-then-use race — the same agent can add one afterwards. So the honest
+> statement is precise and narrower than "closed": **the content consequence is
+> closed; the execution is not.** A `diff.<name>.textconv` still *runs* during a
+> harness git call. What it can no longer do is change what the harness concludes
+> about file contents, because that conclusion is now reached by hashing against
+> blob ids rather than by asking git.
+
+**The denial list will go stale, and that is survivable.** It is tied to git's
+release cadence, and the last vector found was found by the implementer
+deliberately attacking *its own stated gap* — the undeniable `filter.<name>` family
+— and succeeding. That cuts both ways, and both halves belong here: it is evidence
+the enumeration method **works**, and it is evidence that **a sixteenth of this
+shape is likely**. A reader deciding whether to trust this deserves both. The
+reason it is survivable rather than fatal is
+[the two checks above](#two-checks-that-do-not-depend-on-any-list-being-complete),
+which do not depend on the list being complete — the `core.fsmonitor` attack was
+blocked by the snapshot's *placement* as well as by its key being denied, and the
+clean-filter attack was closed by content hashing rather than by naming the
+filter.
+
+**The honest-repo cost, because you will notice it.** `core.fsmonitor` is a
+genuine performance feature on large repositories. It is now denied **inside the
+harness's own git calls only** — you keep it everywhere else and lose the speedup
+during `eval`. That is correct rather than regrettable: the harness cannot tell a
+real fsmonitor from an agent's. The same applies to `core.pager`, `core.editor`
+and `credential.helper`. No honest-path regression was observed, but on a large
+repository this is a real cost and it should be read here rather than discovered.
+
 ### What did *not* work, which is also a result
 
 Two negative results, recorded because they tell you what the threat actually
@@ -635,6 +722,8 @@ Every row is a way to make the number go down without making the code faster.
 | Spawn a process that burns CPU through the baseline samples, changing no bytes | Every spawned child gets **its own session** (`POSIX_SPAWN_SETSID`), and each subprocess run ends by sweeping that session — a process cannot leave a session with `setpgid`, which is how the first version of this was escaped. Measured before: **3/3 KEEP**, ratios 0.54935 / 0.56069 / 0.56485, twelve processes still alive each time. After: **3/3 discard**, 1.02742 / 1.02021 / 1.02803, **0 alive**. |
 | …but have the benchmark call `setsid()` for itself first | **Not closed.** A process that creates its own session is not in the one being swept. See [the residual](#boundary-1--the-agents-benchmark-runs-unsandboxed). |
 | Run the machine hot during the candidate's own sample so the baseline sample that follows is throttled | **Not closed, and not measured.** Nothing is spawned, written, or changed; the state is left in the silicon. See [the thirteenth](#boundary-1--the-agents-benchmark-runs-unsandboxed). |
+| Point `core.fsmonitor` at a program that swaps the baseline binary during the harness's own `git status` | Every git call the harness makes denies **twenty** config keys that name a program, `core.fsmonitor` among them — *and*, independently, the binary-hash snapshot moved to immediately after the last build, so those `git` calls are downstream of it. Measured before: **3/3 KEEP** at 0.05014 / 0.04957 / 0.05013, baselines ~72 ms, the fsmonitor firing **11× per eval** and swapping the binary every time. After: **3/3 discard** at 1.00028 / 1.00650 / 1.01029, baselines ~3.6 ms, fired **0×**. |
+| Commit `.gitattributes` with a `clean` filter that always emits the committed bytes, and leave the fast code uncommitted in the working tree | Gate 2b no longer asks git whether tracked files changed — it hashes them against the commit's own blob ids. Measured before: `git status --porcelain` empty, the only commit a `.gitattributes`, **`rc 0`, `keep`, ratio 0.11637**. After: `rc 2`, `dirty_working_tree`, `k 0`. |
 | Coast on an earlier win | The measurement point advances on KEEP. See [The two commits](#the-two-commits). |
 | Conditionally skip a test from optimizable code | `doctor` scans for `.enabled(if:)`, `.disabled(if:)`, `XCTSkip` and `ConditionTrait`, in test targets *and* in non-test sources. **This one is not closed.** See [limitation 1](#1-gate-6-runs-your-tests-and-that-is-the-softest-link-in-the-chain). |
 | Gut a function and forge the comparison its frozen assertion uses | `doctor` warns when in-scope code declares `==`, `!=`, `<`, `<=`, `>`, `>=` or `~=` for operand types that are *already* comparable in the standard library — a redeclaration, not a conformance. **This one is not closed either**, and the gutted function on the other side of the assertion is not detectable at all. See [limitation 1](#1-gate-6-runs-your-tests-and-that-is-the-softest-link-in-the-chain). |
@@ -1427,8 +1516,20 @@ are yours to read.
 
 ### 11. Platform and environment
 
-**macOS** is the developed and measured platform: `swift test` is **rc=0, 326 of
-326**, and every timing in this README was taken there.
+**macOS** is the developed and measured platform: `swift test` is **330 of 330**,
+and every timing in this README was taken there.
+
+**But it is not reliably green, and an earlier revision of this section implied
+it was.** Writing this round, one full run came back `rc=1` with two failures —
+`measurementCommitAdvancesAfterAKeep` and
+`aWorktreeGitCanSeeIsDirtyIsRepairedRatherThanBrickingTheRun` — and both passed
+in isolation, with the next full run returning `rc=0, 330 of 330`. That is the
+**same test-isolation fragility described under Linux below**: several tests call
+`BaselineRunner.run` concurrently against a SwiftPM cache shared under `HOME`.
+**It is not a Linux-specific problem**, and this README said so only because it
+had only been *observed* there. Both runs are recorded in the project's run log
+rather than the green one being kept; if you get a red suite, re-run the failures
+in isolation before assuming you broke something.
 
 **The Linux suite has never been green, and this README is not going to round
 that to "Linux works".** The honest statement is three separate claims:
@@ -1438,14 +1539,18 @@ that to "Linux works".** The honest statement is three separate claims:
 2. **The harness's own platform behaviour is verified there**, and that is the
    part that most needed it — process groups, session isolation and the sweep,
    subprocess handling, the signal trap, the state home, and the sampler.
-3. **The full suite returns `rc=1`.** On the current tree: **328 tests, 8
-   issues.** An operator who runs it will see a red result, and they have to
-   separate **two different causes** to make sense of it:
+3. **The full suite returns `rc=1`.** At the last Linux verification: **328
+   tests, 8 issues.** (The macOS suite has moved on since — later rounds changed
+   only `-c` arguments, call ordering and a content hash, none of it
+   platform-specific, so Linux was not re-run. That is itself a gap: the figure
+   below is the last one *measured*, not a figure for today's tree.) An operator
+   who runs it will see a red result, and they have to separate **two different
+   causes** to make sense of it:
 
 | Cause | Count | What it is |
 |---|---|---|
 | `IntegrationTests` lockfile refusals | **7** | All the same message — `refusing to configure this repository: swift package resolve rewrote the tracked Package.resolved`. This is the cross-platform lockfile problem documented below, not a defect in the code under test: an earlier tree fails the identical seven with the identical message. |
-| `anAssumeUnchangedOutOfScopeEditIsRefusedAndNeverMeasured` | **1** | **A genuine flake.** It passes 3/3 when run in isolation in the same container. Several tests call `BaselineRunner.run` concurrently against a SwiftPM cache shared under `HOME`, and the container makes that collision likelier. Pre-existing test-isolation fragility, amplified — but it is a real flake, and it is recorded as one rather than re-run until green. |
+| `anAssumeUnchangedOutOfScopeEditIsRefusedAndNeverMeasured` | **1** | **A genuine flake.** It passes 3/3 when run in isolation in the same container. Several tests call `BaselineRunner.run` concurrently against a SwiftPM cache shared under `HOME`, and the container makes that collision likelier — **but it is not caused by the container**: the same class has since been observed on macOS, as noted above. Pre-existing test-isolation fragility, amplified here — a real flake, recorded as one rather than re-run until green. |
 
 So: **do not read `rc=1` on Linux as "the port is broken", and do not read it as
 "expected, ignore it" either.** Seven of those eight are a fixture problem with a
@@ -1545,7 +1650,7 @@ swift build -c release
 swift test
 ```
 
-The test suite is **326 tests on macOS**, all passing, and takes several minutes:
+The test suite is **330 tests on macOS**, all passing, and takes several minutes:
 a good part of it builds and measures the real fixture package with the real
 benchmark harness, because the things worth testing here are the ones that only
 fail for real. On Linux it is **328 tests with 8 issues** — see
