@@ -381,7 +381,7 @@ there".
 
 ## The gate chain
 
-`eval` runs nine gates in order. Gates 1 through 4 reject before anything is
+`eval` runs the gates below in order. Gates 1 through 4 reject before anything is
 built or measured — a `FAIL` from them costs seconds, not minutes.
 
 | # | Gate | Rejects with |
@@ -397,7 +397,7 @@ built or measured — a `FAIL` from them costs seconds, not minutes.
 | 4b | **Discard the caches no inventory can vouch for.** `.build/plugins` is deleted before every build, on both sides, always: a build-tool plugin is *executed* during the build, and llbuild will reuse a cached one whose sources did not change. `purge_build_output: true` deletes the rest of the build output too. | `plugin_cache_not_purged`, `build_output_not_purged` |
 | 5 | **Release build.** `swift build -c release`, plus the benchmark target and `BenchmarkTool` by name. | `build_failed`, `build_timed_out` |
 | 6 | **Tests.** `swift test` — which builds and runs in **debug**, while everything measured is **release**. See [limitation 9](#9-gate-6-tests-a-debug-build-the-binary-that-is-measured-and-kept-is-release). | `tests_failed`, `tests_timed_out` |
-| 7 | **Worktree integrity.** The pinned measurement worktree is at the expected commit and unmodified. | `worktree_integrity` |
+| 7 | **Worktree integrity.** Checks the pinned worktree is at `measurementCommit` and that git reports it clean, then **restores it unconditionally** before the baseline-side build — clearing any `--assume-unchanged`/`--skip-worktree` flags first, in *separate* `update-index` calls (both in one call exits 0 and does nothing; a forced checkout does not undo `--skip-worktree`). Flags are re-read **after** the checkout, not only before, and contents are then verified by hashing every file against the blob ids the commit records, **not** by asking `git status` — a `.gitattributes` filter driver can make `git status` report a rewritten file as unchanged. Restoring rather than refusing is deliberate: the correct contents are known exactly, and refusing would let one `touch` stop every experiment. Cleared flags surface as a warning; a restore that cannot complete is `worktree_integrity`. | `worktree_integrity` |
 | 8 | **Measure.** Interleaved, `count` rounds per side, baseline and candidate alternating, one discarded warm-up sample per side. | — |
 | 9 | **Score.** The three-part rule below. | `no_significant_improvement`, `improvement_below_min_effect`, `significant_regression` |
 
@@ -435,24 +435,127 @@ rebuilt by gate 5. See
 
 ### Every exemption from an integrity check is a candidate bypass
 
-Worth stating plainly, because it is the most transferable thing in this
-project. **Eight bypasses have been found across three reviews, and the last
-three all came from regions that had been *exempted* from a check for good
-reasons** — `.build/` because hashing it is expensive, the pinned worktree
-because it is the harness's own. Both exemptions were defensible. Both were
-holes.
+This is the most transferable thing in the project, and it is worth more than
+any individual gate above.
 
-If you extend this tool, the question to ask of every exemption is not *"is this
-ours?"* or *"is this expensive?"* It is:
+**Ten bypasses have been found across five reviews, and the later ones all came
+from regions that had been *exempted* from a check for good reasons** —
+`.build/` because hashing it is expensive, the pinned worktree because it is the
+harness's own, `.git/` because git never reports it and it is not source. Every
+one of those exemptions was defensible when it was made. Every one of them was a
+hole.
+
+If you extend this tool, the question to ask of an exempt region is not *"is this
+ours?"* or *"is this expensive?"*. It is **two** questions, and the second one
+was learned late:
 
 > **Does the compiler read it?**
+> **Does the harness run it?**
 
-If the answer is yes, it is part of the measured artifact, and *who owns it* is
-irrelevant to whether an adversary can put code there. `.build/checkouts` is
-SwiftPM's, and it is the dependency source that gets compiled. `.build/plugins`
-is SwiftPM's, and it is *executed* during the build. The pinned worktree is the
-harness's, and it is one of the two binaries being timed. Ownership was never
-the right test.
+The first question found most of them — planted sources git had been taught not
+to report, an out-of-scope helper hidden with `--assume-unchanged`,
+`.build/checkouts` (SwiftPM's, and the dependency *source* that gets compiled),
+`.build/plugins` (SwiftPM's, and *executed* during the build), the pinned
+worktree (the harness's, and one of the two binaries being timed). Ownership was
+never the right test.
+
+**The second question found the last three, and none of them is code the
+compiler ever sees.** The harness's own `git checkout --detach --force` executes
+a `post-checkout` hook out of `.git/hooks` — a directory shared with every linked
+worktree — which undid the very repair the checkout had just performed. The same
+`git checkout` executes `.gitattributes` **filter drivers**. And a
+`DYLD_INSERT_LIBRARIES` dylib, injected through an inherited environment
+variable, ran inside the measurement itself. A tool that shells out is a tool
+that runs code it did not write, at every one of those call sites.
+
+Two further principles came out of fixing them, both of which generalise past
+this project:
+
+**Sample a post-condition AFTER the last thing that could change it.** Gate 7
+read its index flags *before* the checkout, and the hook re-set them *after* —
+so the warning was not wrong, it was **empty**, which is worse. A check that runs
+before the adversary's last move reports on a world that no longer exists.
+
+**Deny, do not delete.** Hooks are disabled with `-c core.hooksPath=/dev/null` on
+every git invocation the harness makes, and a command-line `-c` outranks every
+other configuration source. Emptying or verifying `.git/hooks` would have
+achieved nothing: the same hook can be delivered entirely through
+`GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_0=core.hooksPath`, with nothing written under
+`.git/` at all. `/dev/null` rather than an empty directory the harness creates,
+too — an empty directory is same-uid and can simply have hooks written into it,
+whereas `<path>/post-checkout` under `/dev/null` cannot resolve.
+
+### The environment is filtered, by allowlist
+
+Harness subprocesses **no longer inherit the environment**. They get exactly:
+
+```
+PATH  HOME  TMPDIR  USER  LOGNAME  SHELL
+LANG  LC_ALL  LC_CTYPE  TERM  __CF_USER_TEXT_ENCODING
+```
+
+One list, applied to `swift build`, `swift test`, `swift package describe`,
+`swift package resolve`, every `git` call, and the `BenchmarkTool` invocation
+that does the measuring. Dropped, among everything else: `SWIFT_EXEC`,
+`SWIFTPM_*`, `TOOLCHAINS`, `DEVELOPER_DIR`, `SDKROOT`, `CC`, `CXX`, `CFLAGS`,
+`LDFLAGS`, `DYLD_*`, `LD_LIBRARY_PATH`, and every `GIT_*`.
+
+**Allowlist, not denylist, and the reason is short:** a denylist has to track the
+variables of two separately evolving tools — git alone added `GIT_CONFIG_COUNT`
+in 2.31 — and when it falls behind it fails **silently**. An allowlist fails
+loudly: the symptom is a tool that cannot find something, immediately.
+
+The measurement gets the same filtered set for a second reason that has nothing
+to do with tampering: **exchangeability**. The two sides must differ in exactly
+one thing, the commit. Anything inherited that reaches one invocation and not the
+other, or varies between them, breaks that before an adversary is involved.
+
+> **BEHAVIOUR CHANGE.** `TOOLCHAINS` and `DEVELOPER_DIR` no longer reach the
+> build. If you select a non-default toolchain that way, `eval` will not honour
+> it — use `xcode-select`, or put the toolchain on `PATH`. A per-process
+> toolchain override is precisely the side-discriminating primitive this closes,
+> so it could not be kept.
+
+**`PATH` is allowed, and it is a residual.** It is adversary-influenced.
+`/usr/bin/git` and `/usr/bin/swift` are invoked by *absolute* path, so the
+harness's own entry points do not depend on it — but a package whose build shells
+out to a bare command name can still be pointed at a wrapper. Normalising `PATH`
+to a fixed value would break toolchains installed outside the default prefixes,
+so it is allowed deliberately and recorded here rather than silently trusted.
+
+**`.gitattributes` filter drivers are a residual with an honest status.** A
+`smudge`/`clean` pair makes the worktree hold one thing while the commit holds
+another *and* `git status` reports clean — measured standalone: worktree
+`count = 17500` against a commit recording `1750`, `git status --porcelain`
+empty, `git hash-object --no-filters` giving `f0b02a86` against the blob
+`cc57109a`. Gate 7 answers it by hashing contents against the commit's blob ids
+instead of asking git. But the end-to-end variant **could not be landed in a
+linked worktree** — the clean filter did not hide the modification there, so the
+pre-restore check refused first, on the old binary too. So the content hashing is
+**defence in depth, not a measured closure**, and this README will not call it
+one.
+
+### What did *not* work, which is also a result
+
+Two negative results, recorded because they tell you what the threat actually
+requires rather than what it is imagined to require.
+
+**A `SWIFT_EXEC` compiler wrapper could not be made to run.** SwiftPM resolves
+`libSwiftScan` and every sibling tool *relative to `SWIFT_EXEC`'s directory*, so a
+wrapper placed outside the toolchain fails manifest compilation with
+`Invalid manifest`; mirroring the toolchain with symlinks got as far as
+`tests_failed`. The variable is dropped from the allowlist anyway — but the class
+is **not** claimed closed by a test that was never made to pass.
+
+**A `DYLD_INSERT_LIBRARIES` variant did work**, and is closed. A dylib that read
+its own executable path and spawned spinner threads only when that path lay under
+`baseline-worktree` doubled the baseline side: **ratio 0.47999**, baseline
+7 473 151 ns against candidate 3 587 071 ns, on a commit whose only change was two
+lines of comment. With the environment filtered, the same attack reads
+**0.99915**. The most useful detail: a first attempt that burned CPU only in the
+dylib's *constructor* did not skew anything (ratio 0.994). The benchmark library
+times its own inner loop, so **the skew has to persist through the measured
+region** — a load-time-only injection is not the attack.
 
 Gate 3's snapshot and restore both `lstat` every path. A symlinked file is
 refused at snapshot time and at restore time, loudly, rather than written
@@ -484,6 +587,10 @@ Every row is a way to make the number go down without making the code faster.
 | Tamper with the **stored** frozen files | Gate 3 verifies every file in the store against the SHA-256 the baseline manifest recorded, across the whole manifest, before writing a byte. Measured before the fix: one `sed -i` on the stored benchmark made `eval` install it into the repository and then measure it — `keep`, rc 0, **ratio 0.000717**. |
 | Tamper with `baseline.json` or `frozen-manifest.json` themselves | **Nothing.** They are unauthenticated JSON, same directory, same uid. This is the stated boundary, not an oversight — see [the threat model](#the-harness-defends-against-an-agent-that-edits-the-repository-not-against-one-that-edits-the-harnesss-own-state). |
 | Swap a frozen file for a symlink so the restore overwrites something else | Gate 3 refuses, records `frozen_restore_refused`, and taints the run so every later eval refuses until a human clears it. |
+| Plant a `post-checkout` hook that undoes the harness's own repair | Every git invocation the harness makes is prefixed `-c core.hooksPath=/dev/null`, which outranks every other configuration source. `.git/hooks` is shared with every linked worktree and the restore's own `checkout --force` fired it. Measured before the fix: `keep`, rc 0, **ratio 0.10045**, with the worktree helper left at `175000` afterwards. |
+| Deliver that hook through `GIT_CONFIG_COUNT` instead, writing nothing under `.git/` | Same denial — which is why the fix is *deny*, not *delete*. Measured before: `keep`, rc 0, **ratio 0.09985**. |
+| Inject a dylib that slows only the baseline side (`DYLD_INSERT_LIBRARIES`) | Subprocesses no longer inherit the environment; an eleven-name allowlist replaces it. Measured before the fix: `keep`, rc 0, **ratio 0.47999** (baseline 7 473 151 ns, candidate 3 587 071 ns). After: **0.99915**. |
+| Rewrite the worktree through a `.gitattributes` filter driver so `git status` still reports clean | Gate 7 hashes contents against the commit's blob ids rather than asking git. **Defence in depth, not a measured closure** — see [the residual](#the-environment-is-filtered-by-allowlist). |
 | Coast on an earlier win | The measurement point advances on KEEP. See [The two commits](#the-two-commits). |
 | Conditionally skip a test from optimizable code | `doctor` scans for `.enabled(if:)`, `.disabled(if:)`, `XCTSkip` and `ConditionTrait`, in test targets *and* in non-test sources. **This one is not closed.** See [limitation 1](#1-gate-6-runs-your-tests-and-that-is-the-softest-link-in-the-chain). |
 | Gut a function and forge the comparison its frozen assertion uses | `doctor` warns when in-scope code declares `==`, `!=`, `<`, `<=`, `>`, `>=` or `~=` for operand types that are *already* comparable in the standard library — a redeclaration, not a conformance. **This one is not closed either**, and the gutted function on the other side of the assertion is not detectable at all. See [limitation 1](#1-gate-6-runs-your-tests-and-that-is-the-softest-link-in-the-chain). |
@@ -600,6 +707,8 @@ allowed to read as *"there is nothing to check"*. Silently accepting an old
 record would restore exactly the hole the inventory closes. It is stated here
 because an upgrade that starts refusing every eval is an unpleasant surprise to
 diagnose from the reason string alone.
+
+## Scoring
 
 A benchmark's **ratio** is `candidateMedian / baselineMedian` — below 1.0 is
 faster. The **score** is the geometric mean of the per-benchmark ratios.
