@@ -674,9 +674,10 @@ private func describeJSON(targets: [(name: String, path: String, type: String, p
     #expect(c.keepReachabilityWarning() == nil,
             "the shipped defaults must not warn that no KEEP is reachable")
 
-    // The README publishes the YAML `init` writes. Print the real bytes so
-    // that block is transcribed rather than composed.
-    print("[defaults] serialized config.yaml:\n\(try c.serialized())")
+    // The README publishes the YAML `init` writes, and calls it verbatim.
+    // Print the real bytes -- annotated exactly as `runReportingCommit` writes
+    // them -- so that block is transcribed rather than composed.
+    print("[defaults] config.yaml as init writes it:\n\(InitRunner.annotated(try c.serialized()))")
 }
 
 /// The alpha change is only defensible if it stays cheap, so the cost is

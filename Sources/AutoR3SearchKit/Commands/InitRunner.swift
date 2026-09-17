@@ -595,6 +595,38 @@ public enum InitRunner {
 
     private static let defaultTimeoutSeconds = 600
 
+    /// Attaches the one comment the generated config needs, above
+    /// `purge_build_output`.
+    ///
+    /// `purge_build_output: false` is the only key in this file whose default
+    /// is a DELIBERATE TRADE rather than a value: it is off because turning it
+    /// on roughly doubles the cost of every experiment, and a reader who finds
+    /// a security switch defaulted to off deserves to be told the price in the
+    /// same breath, not sent to the README to discover there was a price at
+    /// all. `Yams` cannot emit comments, so it is spliced in here -- on the
+    /// rendered text, once, before the file is written and therefore before
+    /// `baseline` hashes those bytes.
+    ///
+    /// Written defensively: if the key is ever absent from the rendered YAML
+    /// (a future encoder change, a hand-built `Config`), this returns the text
+    /// untouched rather than guessing where the comment belongs. A missing
+    /// comment is cosmetic; a comment spliced into the wrong line is a corrupt
+    /// config.
+    static func annotated(_ yaml: String) -> String {
+        let key = "purge_build_output:"
+        let comment = """
+            # Delete every compiled artifact under .build before each side is built, so the
+            # measured binaries come only from sources the gates hashed. OFF by default: it
+            # roughly doubles the cost of an experiment (measured +33.6s on the demo package).
+            # Dependencies are not re-resolved either way -- this is a cold build, not a
+            # re-clone. See "The build cache is not verified" in the README.
+            """
+        var lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let index = lines.firstIndex(where: { $0.hasPrefix(key) }) else { return yaml }
+        lines.insert(contentsOf: comment.split(separator: "\n").map(String.init), at: index)
+        return lines.joined(separator: "\n")
+    }
+
     /// The config `init` writes, given the three things it had to discover.
     ///
     /// Extracted from `runReportingCommit` for ONE reason: until this existed,
@@ -710,7 +742,7 @@ public enum InitRunner {
         // a config that would only be rejected later, far from this point.
         try config.validate()
 
-        let configText = try config.serialized()
+        let configText = annotated(try config.serialized())
         let tag = todayTag()
         let programMDText = ProgramMD.render(config: config, tag: tag)
 

@@ -567,3 +567,59 @@ import Foundation
                 "the misdirecting wording came back in: \(f.title)")
     }
 }
+
+/// A CHARACTERIZATION TEST: it asserts what the check does NOT catch.
+///
+/// A reviewer wrote two evasions that compile and land silently in the
+/// "ordinary" tier. Neither is fixed -- `doctor` is advisory and always exits
+/// 0, so the cost of the gap is a missing hint, while the cost of chasing it
+/// with more regex is a check that warns on healthy code and is then ignored
+/// on the day it matters. What is NOT acceptable is the gap being invisible,
+/// so it is written down here, in the suite, where someone tightening this
+/// check will trip over it.
+///
+/// **If you make either of these flag, DELETE the corresponding expectation
+/// below and the paragraph it mirrors in `DoctorChecks.operatorScanIsEvadable`
+/// and in the README.** A failing test here is good news; a stale claim of
+/// coverage is not.
+@Test func knownEvasionsOfTheOperatorScanAreStillEvasions() {
+    // EVASION 1 -- parameter list on the next line. `classifyOperatorDeclaration`
+    // reports the operator but cannot read the operands, and deliberately
+    // returns `isShadowing: false` rather than guess.
+    let splitLine = DoctorChecks.classifyOperatorDeclaration("public func !=")
+    #expect(splitLine?.op == "!=", "the declaration is still recognised as one")
+    #expect(splitLine?.isShadowing == false,
+            "a signature whose operands could not be read must not be guessed at")
+
+    // EVASION 2 -- the operand type behind a typealias. Resolving `Counts` to
+    // `[String: Int]` needs type resolution, i.e. a compiler.
+    let aliased = DoctorChecks.classifyOperatorDeclaration(
+        "public func ~= (lhs: Counts, rhs: Counts) -> Bool { true }")
+    #expect(aliased?.op == "~=")
+    #expect(aliased?.isShadowing == false,
+            "a text scan cannot see through a typealias, and this records that")
+
+    // The canonical spelling of the same forgery IS caught -- so the gap is in
+    // the spelling, not in the idea.
+    #expect(DoctorChecks.classifyOperatorDeclaration(
+        "public func ~= (lhs: [String: Int], rhs: [String: Int]) -> Bool { true }")?
+        .isShadowing == true)
+}
+
+/// Both branches -- including the ALL-CLEAR one -- must say the check is
+/// evadable. A clean result from an evadable check that does not say so reads
+/// as "there is nothing here", and that is the reading that gets someone hurt.
+@Test func bothBranchesStateThatTheOperatorScanCanBeEvaded() {
+    for f in [
+        DoctorChecks.comparisonOperatorShadowing(shadowingHits: [], ordinaryOperatorCount: 0),
+        DoctorChecks.comparisonOperatorShadowing(shadowingHits: [], ordinaryOperatorCount: 9),
+        DoctorChecks.comparisonOperatorShadowing(
+            shadowingHits: ["Sources/D/D.swift:1: func == (lhs: Int, rhs: Int) -> Bool { true }"],
+            ordinaryOperatorCount: 0),
+    ] {
+        #expect(f.detail.contains("EVADE IT"),
+                "a branch of the operator check implies coverage it does not have")
+        #expect(f.detail.contains("typealias"))
+        #expect(f.detail.contains("NEXT line"))
+    }
+}

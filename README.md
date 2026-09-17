@@ -190,6 +190,12 @@ benchmark_target: Bench
 min_effect_pct: 3e+0
 max_regress_pct: 3e+0
 timeout_seconds: 600
+# Delete every compiled artifact under .build before each side is built, so the
+# measured binaries come only from sources the gates hashed. OFF by default: it
+# roughly doubles the cost of an experiment (measured +33.6s on the demo package).
+# Dependencies are not re-resolved either way -- this is a cold build, not a
+# re-clone. See "The build cache is not verified" in the README.
+purge_build_output: false
 ```
 
 | Key | Default | Meaning |
@@ -202,6 +208,7 @@ timeout_seconds: 600
 | `min_effect_pct` | `3.0` | A win must be at least this large. See [Scoring](#scoring) — this floor does more work than anything else in the rule. |
 | `max_regress_pct` | `3.0` | A benchmark regressing beyond this, significantly, is an outright refusal. Equal to `min_effect_pct` on purpose. |
 | `timeout_seconds` | `600` | Per build / test / measurement step. |
+| `purge_build_output` | `false` | Delete every compiled artifact under `.build` before each side is built, so the measured binaries come only from sources the gates hashed. Off because it costs a measured **+33.6 s** per eval. Optional in the file: a `config.yaml` written before this key existed still loads, and still matches the SHA-256 `baseline` pinned for it. See [the build cache](#the-build-cache-is-not-verified). |
 
 ### Why these defaults, and what they were before
 
@@ -356,6 +363,22 @@ DISCARDs: a run that produced no verdict is not a correct rejection, and the
 agent's loop should treat them as "something is wrong with the setup", not
 "that idea did not work".
 
+`eval --json`'s `reason` is a stable, machine-readable string. The full set is
+in the gate table below; four are worth calling out because they are newer than
+the rest and an agent loop keyed on the older ones will not recognise them:
+
+| `reason` | What it means |
+|---|---|
+| `dependency_checkout_modified` | A file under `.build/checkouts/` does not match the revision `Package.resolved` pins. |
+| `plugin_cache_not_purged` | `.build/plugins` could not be deleted. **Fail-closed**: a cache that cannot be discarded is a cache that will be reused. |
+| `build_output_not_purged` | Same, for the wider purge under `purge_build_output`. Also fail-closed. |
+| `baseline_predates_tree_inventory` | The baseline record was written before the out-of-scope inventory existed. Re-run `baseline` under a new tag; see [re-baselining](#re-baselining-is-required-after-upgrading). |
+
+The two `*_not_purged` reasons are refusals, not warnings, and deliberately so:
+the whole point of deleting an artifact nothing can hash is that it is *absent*,
+and "we tried to delete it and could not" is indistinguishable from "it is still
+there".
+
 ## The gate chain
 
 `eval` runs nine gates in order. Gates 1 through 4 reject before anything is
@@ -367,9 +390,11 @@ built or measured — a `FAIL` from them costs seconds, not minutes.
 | 2 | **Config integrity.** SHA-256 of `.autor3search/config.yaml` must equal what `baseline` recorded. | `config_hash_mismatch` |
 | 2a | **Manifest integrity, by hash.** `Package.swift` and `Package.resolved` *as they are on disk*, plus every manifest in the recorded inventory (nested `Sub/Package.swift`, `Package@swift-6.0.swift`, anything under `.swiftpm/`), must hash to what `baseline` recorded — and a manifest *appearing* where baseline recorded none is itself a mismatch. | `manifest_change_rejected`, `baseline_predates_manifest_inventory` |
 | 2b | **Clean working tree**, read with `git status --porcelain --ignored` — ignored files included, because plain `--porcelain` omits them and a planted gitignored source compiles and is measured. `eval` builds and measures the *working tree*, while gate 1 inspects *commits*. Ignored files are **recorded at baseline, not banned**: one that was already there is part of the honest starting point, and only one that **appears, changes or disappears after the freeze** is refused — the pinned worktree is a checkout of a *commit* and can never contain it, so it exists on the candidate side alone. The harness's own outputs (`.build/`, `results.tsv`, `run.log`, `.autor3search/profiles/`) are excluded; they change every eval by design. | `dirty_working_tree` |
-| 2c | **Out-of-scope files, by content.** Every file outside `scope` is hashed at baseline and re-walked here. Gate 1 asks git what changed; gate 2c asks the disk. | `out_of_scope`, `baseline_predates_tree_inventory` |
-| 3 | **Restore frozen files.** Every file in every frozen test and benchmark target is restored from the snapshot, byte for byte. | `frozen_restore_refused` |
+| 2c | **Out-of-scope files, by content.** Hashes every file outside `scope` *except* `.git/`, `.build/` and the harness's own outputs (`results.tsv`, `run.log`, `.autor3search/profiles/`); refuses any modified, missing or extra. Gate 1 asks git what changed; gate 2c asks the disk. | `out_of_scope`, `baseline_predates_tree_inventory` |
+| 2d | **Dependency checkouts.** Every file under `.build/checkouts/` is verified per dependency against the revisions `Package.resolved` pins. A *wholly missing* checkout is allowed — SwiftPM re-clones it from that same pin. | `dependency_checkout_modified` |
+| 3 | **Restore frozen files.** Every file in every frozen test and benchmark target is restored from the snapshot, byte for byte, after the whole stored manifest has been verified against the recorded hashes. | `frozen_restore_refused` |
 | 4 | **Reject new files** appearing in any frozen target directory. | `new_test_or_benchmark_file` |
+| 4b | **Discard the caches no inventory can vouch for.** `.build/plugins` is deleted before every build, on both sides, always: a build-tool plugin is *executed* during the build, and llbuild will reuse a cached one whose sources did not change. `purge_build_output: true` deletes the rest of the build output too. | `plugin_cache_not_purged`, `build_output_not_purged` |
 | 5 | **Release build.** `swift build -c release`, plus the benchmark target and `BenchmarkTool` by name. | `build_failed`, `build_timed_out` |
 | 6 | **Tests.** `swift test` — which builds and runs in **debug**, while everything measured is **release**. See [limitation 9](#9-gate-6-tests-a-debug-build-the-binary-that-is-measured-and-kept-is-release). | `tests_failed`, `tests_timed_out` |
 | 7 | **Worktree integrity.** The pinned measurement worktree is at the expected commit and unmodified. | `worktree_integrity` |
@@ -390,6 +415,44 @@ noticing.**
 
 `scope` still says what the agent may change. It is no longer asked to say what
 *did* change.
+
+**What the three content gates cover between them**, stated as coverage rather
+than as three separate claims:
+
+- **Gate 2c** hashes every file outside `scope` except `.git/`, `.build/` and
+  the harness's own outputs, refusing any modified, missing or extra.
+- **Gate 2b** covers `.build/`'s exemption for files git can see: anything
+  uncommitted, and any *ignored* file added, modified or removed since baseline.
+- **Gate 2d** covers the compiled part of what both exempt: every file under
+  `.build/checkouts/`, verified per dependency against the revisions
+  `Package.resolved` pins, a wholly-missing checkout allowed because SwiftPM
+  re-clones it from that pin.
+
+What remains unhashed is `.build`'s build **output** — `out/`, `plugins/`,
+`repositories/`, `artifacts/` — derived from inputs all three gates verify, and
+rebuilt by gate 5. See
+[the build cache](#the-build-cache-is-not-verified) for what that leaves open.
+
+### Every exemption from an integrity check is a candidate bypass
+
+Worth stating plainly, because it is the most transferable thing in this
+project. **Eight bypasses have been found across three reviews, and the last
+three all came from regions that had been *exempted* from a check for good
+reasons** — `.build/` because hashing it is expensive, the pinned worktree
+because it is the harness's own. Both exemptions were defensible. Both were
+holes.
+
+If you extend this tool, the question to ask of every exemption is not *"is this
+ours?"* or *"is this expensive?"* It is:
+
+> **Does the compiler read it?**
+
+If the answer is yes, it is part of the measured artifact, and *who owns it* is
+irrelevant to whether an adversary can put code there. `.build/checkouts` is
+SwiftPM's, and it is the dependency source that gets compiled. `.build/plugins`
+is SwiftPM's, and it is *executed* during the build. The pinned worktree is the
+harness's, and it is one of the two binaries being timed. Ownership was never
+the right test.
 
 Gate 3's snapshot and restore both `lstat` every path. A symlinked file is
 refused at snapshot time and at restore time, loudly, rather than written
@@ -478,6 +541,52 @@ directory you are willing to have written to, by an agent you are supervising to
 the degree the work deserves. What the gates give you is that **the commit that
 gets kept is the commit that was measured**, on criteria that did not move while
 it was measured. That is a real property. It is not this one.
+
+### The build cache is not verified
+
+**The build cache is not verified.** An agent that can write into `.build/` can
+put code into the measured binary that no gate hashed: llbuild decides what to
+rebuild from recorded input signatures, so a poisoned object file or linked
+binary under `.build/out`, belonging to a module whose sources did not change, is
+reused rather than recompiled. `autor3search-swift` deletes the compiled
+build-tool plugins (`.build/plugins`) before every build, because those are
+executed rather than merely linked and the deletion costs about 0.8 s per side;
+it does not delete the rest, which measured ~18 s per side and would roughly
+double the cost of every experiment. Set `purge_build_output` to have every
+artifact rebuilt from verified sources, at that cost. The real remedy is
+operational: run the harness where the agent cannot write `.build`.
+
+The plugin deletion is **unconditional and is already in the price** you see:
+measured at 1.673 / 1.677 / 1.845 s per side with the plugins kept against
+2.527 / 2.478 / 2.491 s with them deleted — **+1.62 s per eval, about 4%** of a
+~39 s experiment. Turning on `purge_build_output` adds a further **+33.6 s** end
+to end. Dependency checkouts survive both deletions, so either way this is a cold
+*build*, not a re-resolve: nothing is re-cloned and no network is touched.
+
+```yaml
+# .autor3search/config.yaml
+purge_build_output: true
+```
+
+Also available as `AUTOR3SEARCH_SWIFT_PURGE_BUILD_OUTPUT=1` in the environment,
+which ORs with the config key. That override exists because `config.yaml`'s bytes
+are pinned at baseline, so editing it mid-run means re-baselining and discarding
+the run's history — and this switch, unlike `alpha` or `scope`, changes nothing
+about how a result is *judged*, only how trustworthy the artifact being judged
+is. **It can only turn the purge on.** No value of it disables anything, which is
+what makes it safe to read from an environment the measured agent may own.
+
+**`.build/artifacts` is a second, narrower residual.** It is empty for any
+package without a `binaryTarget`, but a package that has one gets an
+`.artifactbundle` extracted there, and a plugin may execute what is inside.
+SwiftPM checksum-verifies the bundle when it *downloads* it, against a checksum
+declared in `Package.swift` — which gate 2a hashes — but the **extracted copy is
+not re-verified on each build**. `purge_build_output` does not cover it either;
+the purge deliberately spares `artifacts/` so that turning it on does not force a
+re-download. **No fixture exercises this path.** It is documented rather than
+tested, and that asymmetry is stated here rather than left for someone to
+discover: every other claim in this section has a test behind it, and this one
+has an argument.
 
 ### Re-baselining is required after upgrading
 
@@ -810,13 +919,36 @@ assertion uses. The test file is untouched, so *reviewing the test tells you
 nothing* — earlier versions of this README and of `doctor`'s own output advised
 exactly that, and the advice pointed at the one file that was innocent.
 
-`doctor` now covers half of it: it warns when optimizable code declares `==`,
-`!=`, `<`, `<=`, `>`, `>=` or `~=` whose operands are **entirely
-standard-library types**. Those types are already `Equatable`/`Comparable`, so
-such a declaration is not a conformance — it is a shadowing redeclaration, and
-there is no ordinary reason to write one. A hand-written `Equatable` conformance
-on your *own* types is ordinary and is reported as a count, never a warning: a
-check that fires on every healthy repository is a check people stop reading.
+`doctor` covers **the canonical spelling of half of it**: it warns when
+optimizable code declares `==`, `!=`, `<`, `<=`, `>`, `>=` or `~=` whose operands
+are **entirely standard-library types**, on one line, written out. Those types
+are already `Equatable`/`Comparable`, so such a declaration is not a conformance
+— it is a shadowing redeclaration, and there is no ordinary reason to write one.
+A hand-written `Equatable` conformance on your *own* types is ordinary and is
+reported as a count, never a warning: a check that fires on every healthy
+repository is a check people stop reading.
+
+**It is a text scan, and an author who is trying can evade it.** Two evasions are
+known, both of which compile and both of which land silently in the "ordinary"
+tier:
+
+```swift
+public func !=
+    (lhs: [String: Int], rhs: [String: Int]) -> Bool { false }   // params on the next line
+
+public typealias Counts = [String: Int]
+public func ~= (lhs: Counts, rhs: Counts) -> Bool { true }       // operand behind a typealias
+```
+
+The first is deliberate: when the operand list cannot be read, the check reports
+the operator but refuses to guess that it is shadowing, because guessing would
+mean warning on healthy code. The second needs type resolution — a compiler, not
+a scan. Neither is fixed, because `doctor` is advisory and always exits 0, so the
+cost of the gap is a missing hint while the cost of chasing it with more regex is
+a check that warns on healthy code and is then ignored on the day it matters.
+Both are recorded in the test suite so the limit stays visible, and `doctor`'s
+own output says so in every branch — including the all-clear one. **Read a clean
+result as "the obvious form is absent", not as "this cannot have been done."**
 
 **What remains open, and cannot be closed by a text scan:** the gutted function
 itself; a forged comparison written as a method rather than an operator; and the
@@ -874,9 +1006,10 @@ recorded none. Not covered:
 - **Symlinked manifests are not followed.** The scan records the symlink's own
   bytes, so re-pointing the link is caught, but swapping the *target's* content is
   not. Untested and unfixed.
-- **`.build` is trusted entirely.** A manifest planted there is unexamined. The
-  route is narrow — SwiftPM overwrites checkouts from the pinned lockfile, which
-  is itself hashed — but it is not closed.
+- **`.build` is not hashed by this gate.** A manifest planted there is not
+  examined *as a manifest*. `.build/checkouts` is covered by gate 2d, against the
+  revisions `Package.resolved` pins; `.build`'s build **output** is not covered
+  by anything, and that is [its own residual](#the-build-cache-is-not-verified).
 - The inventory is recorded at `frozenCommit` and **never refreshed on KEEP**.
   That is deliberate: it must not advance. It also means a *legitimate* manifest
   change requires a new baseline.

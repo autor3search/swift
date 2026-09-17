@@ -722,15 +722,30 @@ public enum EvalRunner {
               what: "the compiled build-tool plugin cache", where: description)
     }
 
-    /// Environment override for the build-output purge, until the config field
-    /// lands (see the README note: `purge_build_output`).
+    /// Environment override for the build-output purge. The configured source
+    /// of truth is now `Config.purgeBuildOutput` (`purge_build_output` in
+    /// `config.yaml`); this is KEPT as an override alongside it, not replaced
+    /// by it.
     ///
-    /// AN OVERRIDE THAT CAN ONLY TIGHTEN. This switch turns the purge ON and
-    /// has no way to turn anything off, which is what makes it safe to read
-    /// from the environment at all: in many deployments the agent under
-    /// measurement is the process that invokes `eval`, so an environment
+    /// WHY IT STAYS, now that the config field exists. `config.yaml`'s bytes
+    /// are pinned by `configSHA256` at baseline, so turning the purge on for
+    /// an EXISTING run means editing a file gate 2 will then refuse, i.e.
+    /// re-baselining and throwing away the run's history. That is the correct
+    /// default for a criterion the verdict depends on -- `alpha`,
+    /// `min_effect_pct` and `scope` must not move mid-run -- but this switch
+    /// is not one of those. It changes nothing about how a result is judged;
+    /// it only makes the artifact being judged more trustworthy. An operator
+    /// who becomes suspicious of a machine at 3am should be able to tighten
+    /// the next eval without discarding the fifty experiments before it.
+    ///
+    /// AN OVERRIDE THAT CAN ONLY TIGHTEN, which is the whole reason it is safe
+    /// to read from the environment at all. In many deployments the agent
+    /// under measurement is the process that invokes `eval`, so an environment
     /// variable that could WEAKEN a gate would be a gate the agent controls.
-    /// Setting this one only costs the agent a cold build.
+    /// This one ORs with the config and has no value that disables anything:
+    /// `purge_build_output: true` cannot be switched off from the environment,
+    /// and the only thing setting the variable costs the agent is a cold
+    /// build. Read `purgeBuildOutput(config:env:)` for the one-line proof.
     ///
     /// The plugin-cache purge deliberately has no switch of either kind.
     public static let purgeBuildOutputEnvKey = "AUTOR3SEARCH_SWIFT_PURGE_BUILD_OUTPUT"
@@ -739,6 +754,19 @@ public enum EvalRunner {
         guard let raw = env[purgeBuildOutputEnvKey]?.trimmingCharacters(in: .whitespaces).lowercased()
         else { return false }
         return ["1", "true", "yes", "on"].contains(raw)
+    }
+
+    /// Whether to purge the whole build output this eval: the config field OR
+    /// the environment override.
+    ///
+    /// `||`, never `&&` and never "env wins". The environment can only add a
+    /// reason to purge, never remove one, so no value of
+    /// `AUTOR3SEARCH_SWIFT_PURGE_BUILD_OUTPUT` can undo
+    /// `purge_build_output: true`. That is the property that makes it
+    /// acceptable for the measured agent to be the process holding the
+    /// environment.
+    static func purgeBuildOutput(config: Config, env: [String: String]) -> Bool {
+        config.purgeBuildOutput || purgeBuildOutputRequested(env: env)
     }
 
     /// Runs one experiment end to end and returns its verdict.
@@ -1120,7 +1148,7 @@ public enum EvalRunner {
         // ~0.81 s per side on the demo package -- about 4% of a ~39 s eval --
         // against a cold build of the whole output tree at ~18 s per side.
         // See `purgePluginCache`.
-        let purgeOutput = purgeBuildOutputRequested(env: env)
+        let purgeOutput = purgeBuildOutput(config: config, env: env)
         for (directory, description) in [(repo, "the candidate repository"),
                                          (try home.worktreeURL(tag: tag),
                                           "the pinned measurement worktree")] {

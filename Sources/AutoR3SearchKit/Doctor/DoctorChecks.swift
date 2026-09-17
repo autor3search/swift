@@ -444,10 +444,50 @@ public enum DoctorChecks {
     ///     deliberately did not flag. Same treatment, and for the same reason,
     ///     as `environmentReadCount` in `conditionalTestGating`.
     ///
-    /// This is a HEURISTIC over text, like every other scan here. It cannot
-    /// see a forged comparison written as a method (`func isEqual(to:)`), an
-    /// operator assembled through a generic constraint, or -- the half nothing
-    /// covers -- the gutted function on the other side of the assertion.
+    /// THIS CATCHES THE CANONICAL SPELLING AND IS EVADABLE BY AN AUTHOR WHO IS
+    /// TRYING. It is a single-line text match, not an AST walk, and a reviewer
+    /// has already written two evasions that COMPILE and land silently in the
+    /// ordinary tier rather than the warning tier:
+    ///
+    ///   1. The parameter list on the NEXT line. `classifyOperatorDeclaration`
+    ///      returns `(isShadowing: false, op)` when it cannot read the
+    ///      operands, because guessing "shadowing" from a signature it has not
+    ///      seen would manufacture exactly the false warning the two-tier split
+    ///      exists to avoid -- so `public func !=` followed by
+    ///      `(lhs: [String: Int], rhs: [String: Int])` is counted, not flagged.
+    ///   2. A typealias. `typealias Counts = [String: Int]` and then
+    ///      `func ~= (lhs: Counts, rhs: Counts)`: the operand spelling is not
+    ///      in `standardLibraryComparableTypes`, so it reads as the
+    ///      repository's own type. Resolving that needs type resolution, which
+    ///      is a compiler, not a scan.
+    ///
+    /// Both are recorded by `knownEvasionsOfTheOperatorScanAreStillEvasions` in
+    /// `DoctorTests`, which asserts the CURRENT behaviour so the limit is
+    /// visible in the suite rather than inferred from its absence. Neither is
+    /// fixed here: `doctor` is advisory and always exits 0, so the cost of the
+    /// gap is a missing hint, while the cost of chasing it with more regex is a
+    /// check that warns on healthy code. It also cannot see a forged
+    /// comparison written as a method (`func isEqual(to:)`), an operator
+    /// assembled through a generic constraint, or -- the half nothing covers --
+    /// the gutted function on the other side of the assertion.
+    ///
+    /// The Finding's own text says this, in both branches. A check that implies
+    /// coverage it does not have is worse than one that admits the gap: the
+    /// first gets trusted.
+    /// Printed in BOTH branches of `comparisonOperatorShadowing`, including the
+    /// all-clear one. A clean result from an evadable check must not read as
+    /// "there is nothing here"; it reads as "the canonical spelling is not
+    /// here". Those are different statements and only the second is true.
+    static let operatorScanIsEvadable = """
+        Scope of this check: it matches the canonical one-line spelling (`func == (lhs: T, rhs: T)`) \
+        and AN AUTHOR WHO IS TRYING CAN EVADE IT. Two evasions are known to compile and to be \
+        counted as ordinary rather than flagged: putting the parameter list on the NEXT line (the \
+        operands cannot be read, and guessing would mean warning on healthy code), and hiding the \
+        operand type behind a typealias (`typealias Counts = [String: Int]` then \
+        `func ~= (lhs: Counts, rhs: Counts)`) -- resolving that needs a compiler, not a text scan. \
+        Treat a clean result as "the obvious form is absent", not as "this cannot have been done".
+        """
+
     public static func comparisonOperatorShadowing(
         shadowingHits: [String], ordinaryOperatorCount: Int
     ) -> Finding {
@@ -466,6 +506,7 @@ public enum DoctorChecks {
                 detail: """
                     No operator declaration in the package's non-test source redeclares a comparison \
                     for standard-library operand types. \(noted)
+                    \(operatorScanIsEvadable)
                     \(frozenTestBlindSpot)
                     """
             )
@@ -487,6 +528,7 @@ public enum DoctorChecks {
                 still executes and still succeeds. Read these declarations before trusting an \
                 unattended run; if one is legitimate (a deliberate, documented shim), it is still \
                 worth keeping out of `scope`.
+                \(operatorScanIsEvadable)
                 \(frozenTestBlindSpot)
                 """
         )
