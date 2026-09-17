@@ -64,6 +64,104 @@ public enum SpawnError: Error, CustomStringConvertible {
     }
 }
 
+/// How a spawn keeps the child from inheriting descriptors above stderr.
+///
+/// Two strategies, because the good one is not available everywhere. The
+/// enumerating strategy is not a theoretical fallback: it is what runs on any
+/// glibc older than 2.34 -- Ubuntu 20.04, Debian 11, RHEL 8 -- and on this
+/// project's own CI it is exercised deliberately, by setting
+/// `AUTOR3SEARCH_SWIFT_FD_CLOSE=enumerate`, so it cannot rot unnoticed.
+public enum InheritedDescriptorClosing: Sendable {
+    /// Whatever this platform does best: `POSIX_SPAWN_CLOEXEC_DEFAULT` on
+    /// Darwin, `posix_spawn_file_actions_addclosefrom_np` on a glibc new
+    /// enough to have it, and `enumerateOpenDescriptors` on one that is not.
+    /// Race-free on the first two: the kernel decides at exec time, so a
+    /// descriptor another thread opens after this point is still closed.
+    case platformDefault
+
+    #if !canImport(Darwin)
+    /// Read the process's OWN open descriptors and add one close action per
+    /// descriptor above stderr.
+    ///
+    /// TWO HONEST LIMITATIONS, and together they are why this is the fallback
+    /// and not the default -- and why it is NOT offered on Darwin at all.
+    ///
+    /// 1. The list is a SNAPSHOT taken before the fork. A descriptor another
+    ///    thread opens between the snapshot and the fork is still inherited.
+    ///    The window is microseconds and the bounded ETXTBSY retry covers the
+    ///    consequence, but `closefrom` has no window at all.
+    /// 2. The same race runs the other way: a descriptor in the snapshot that
+    ///    another thread CLOSES before the fork leaves a close action pointing
+    ///    at a dead descriptor. glibc tolerates exactly that -- its spawn
+    ///    implementation ignores a close failure for a descriptor below
+    ///    `RLIMIT_NOFILE`, and musl ignores close failures outright -- so on
+    ///    Linux a stale entry is harmless. **Darwin does not tolerate it**:
+    ///    measured here, `posix_spawn` returns `EBADF (9)` and the launch
+    ///    fails. That is not a reason to make the snapshot cleverer; it is the
+    ///    reason this case does not exist on Darwin, which has
+    ///    `POSIX_SPAWN_CLOEXEC_DEFAULT` on every supported release and
+    ///    therefore never needs a fallback.
+    case enumerateOpenDescriptors
+    #endif
+}
+
+/// `posix_spawn_file_actions_addclosefrom_np` looked up at RUN time instead of
+/// called directly.
+///
+/// A direct call would bind this file to glibc >= 2.34 at COMPILE time: on an
+/// older glibc the symbol is not merely missing at link time, it is not
+/// declared in `spawn.h` at all, so the package would fail to build with a
+/// "no such module member" error on someone else's machine -- a machine we
+/// would never see. `dlsym` turns that hard build floor into a runtime branch
+/// this file can actually handle. Resolved once per process.
+///
+/// `nil` means either "this libc does not have it" or "the operator asked for
+/// the fallback"; both take the same path, which is what makes forcing the
+/// fallback a real exercise of the real code rather than a simulation of it.
+#if !canImport(Darwin)
+private typealias AddCloseFromFunction =
+    @convention(c) (UnsafeMutablePointer<posix_spawn_file_actions_t>, Int32) -> Int32
+
+private let resolvedAddCloseFrom: AddCloseFromFunction? = {
+    if ProcessInfo.processInfo.environment["AUTOR3SEARCH_SWIFT_FD_CLOSE"] == "enumerate" {
+        return nil
+    }
+    // A null handle is RTLD_DEFAULT: search the global symbol scope.
+    guard let symbol = dlsym(nil, "posix_spawn_file_actions_addclosefrom_np") else { return nil }
+    return unsafeBitCast(symbol, to: AddCloseFromFunction.self)
+}()
+#endif
+
+/// Every descriptor above stderr this process has open RIGHT NOW.
+///
+/// `/proc/self/fd` (Linux) and `/dev/fd` (Darwin) both list exactly the open
+/// descriptors, which keeps the resulting action list to the handful that are
+/// really open instead of a thousand speculative closes. Where neither exists,
+/// a bounded scan with `fcntl(F_GETFD)` finds them the slow way; the bound is
+/// deliberate, because `_SC_OPEN_MAX` can legitimately be 1048576 and building
+/// a million file actions per spawn would be worse than the leak.
+///
+/// Everything returned is re-checked with `fcntl` immediately before it is
+/// used, so a descriptor that the directory read itself opened and closed
+/// cannot end up in the list. A stale entry would not be fatal in any case --
+/// glibc's spawn ignores a close failure for an in-range descriptor, and musl
+/// ignores it outright -- but a shorter list is a cheaper spawn.
+func openDescriptorsAboveStderr() -> [Int32] {
+    var candidates: [Int32] = []
+    let listings = ["/proc/self/fd", "/dev/fd"]
+    for path in listings {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: path) else { continue }
+        candidates = names.compactMap(Int32.init).filter { $0 > STDERR_FILENO }
+        break
+    }
+    if candidates.isEmpty {
+        let reported = sysconf(Int32(_SC_OPEN_MAX))
+        let ceiling = Int32(min(max(reported, 1024), 4096))
+        candidates = Array((STDERR_FILENO + 1)..<ceiling)
+    }
+    return candidates.filter { fcntl($0, F_GETFD) >= 0 }.sorted()
+}
+
 /// `posix_spawn` driven directly, because Foundation's `Process` exposes no hook
 /// for spawn attributes and we need `POSIX_SPAWN_SETPGROUP`.
 ///
@@ -84,7 +182,8 @@ public enum POSIXSpawn {
         executable: URL,
         args: [String],
         cwd: URL,
-        env: [String: String]?
+        env: [String: String]?,
+        closing: InheritedDescriptorClosing = .platformDefault
     ) throws -> SpawnedChild {
         var outFDs: [Int32] = [-1, -1]
         var errFDs: [Int32] = [-1, -1]
@@ -176,18 +275,37 @@ public enum POSIXSpawn {
         // not enforce ETXTBSY, which is exactly why this was invisible until
         // the package was run on Linux.
         //
-        // Both branches below express the same intent -- "the child gets fd
-        // 0/1/2 and nothing else" -- through each platform's own mechanism.
-        // The explicit file actions above are still honoured: they are applied
-        // in order, before the closefrom, and CLOEXEC_DEFAULT is an exec-time
-        // property that leaves file-action processing alone.
+        // Every branch below expresses the same intent -- "the child gets fd
+        // 0/1/2 and nothing else" -- through whichever mechanism this platform
+        // and this libc actually provide. The explicit file actions above are
+        // still honoured: they are applied in order, before any closefrom, and
+        // CLOEXEC_DEFAULT is an exec-time property that leaves file-action
+        // processing alone.
         #if canImport(Darwin)
+        // Darwin has had CLOEXEC_DEFAULT since 10.7, so `.platformDefault` is
+        // the only case that exists here and there is nothing to fall back to.
         flags |= Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)
         #else
-        checked(
-            "posix_spawn_file_actions_addclosefrom_np(\(STDERR_FILENO + 1))",
-            posix_spawn_file_actions_addclosefrom_np(&fileActions, STDERR_FILENO + 1)
-        )
+        var closedByCloseFrom = false
+        if case .platformDefault = closing, let addCloseFrom = resolvedAddCloseFrom {
+            checked(
+                "posix_spawn_file_actions_addclosefrom_np(\(STDERR_FILENO + 1))",
+                addCloseFrom(&fileActions, STDERR_FILENO + 1)
+            )
+            closedByCloseFrom = true
+        }
+        if !closedByCloseFrom {
+            // glibc older than 2.34 (Ubuntu 20.04, Debian 11, RHEL 8), or an
+            // operator who asked for this path. One close action per
+            // descriptor that is open at this instant, taken as late as the
+            // file-action list allows so the snapshot is as fresh as possible.
+            for fd in openDescriptorsAboveStderr() {
+                checked(
+                    "posix_spawn_file_actions_addclose(\(fd))",
+                    posix_spawn_file_actions_addclose(&fileActions, fd)
+                )
+            }
+        }
         #endif
         // `setflags` is called AFTER the platform branch above so a flag added
         // there is actually in `flags` when it is installed.

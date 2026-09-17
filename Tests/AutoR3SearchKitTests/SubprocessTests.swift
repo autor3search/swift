@@ -153,8 +153,17 @@ func drainStaysBoundedWhenADescendantEscapesTheProcessGroup() throws {
     try #require(opened >= 0, "could not open the marker file for writing")
     let probeFD: Int32 = 33
     try #require(dup2(opened, probeFD) == probeFD, "could not move the descriptor to \(probeFD)")
-    close(opened)
+    // ONLY if `open` did not already hand us the probe number. `dup2(n, n)` is
+    // a no-op that returns n without closing anything, so an unconditional
+    // `close(opened)` there would close the descriptor under test and leave
+    // this asserting against a descriptor that is not open -- which passes,
+    // for entirely the wrong reason. Not hypothetical: under the full parallel
+    // suite this process reaches descriptor numbers in the thirties.
+    if opened != probeFD { close(opened) }
     defer { close(probeFD) }
+    // The descriptor must actually BE open, or "the child did not inherit it"
+    // is true for a reason that has nothing to do with the code under test.
+    try #require(fcntl(probeFD, F_GETFD) >= 0, "fd \(probeFD) is not open, so this test proves nothing")
 
     let r = try Subprocess.run(
         sh, ["-c", "if [ -e /dev/fd/\(probeFD) ]; then echo INHERITED; else echo CLEAN; fi"],
@@ -164,6 +173,72 @@ func drainStaysBoundedWhenADescendantEscapesTheProcessGroup() throws {
     #expect(r.stdout.contains("CLEAN"),
             "the child inherited fd \(probeFD), open for WRITING in the parent: \(r.stdout)")
 }
+
+#if os(Linux)
+/// Drains a child spawned directly through `POSIXSpawn` (not through
+/// `Subprocess.run`, which does not expose the descriptor-closing strategy) and
+/// returns its stdout once it has exited. Small and blocking on purpose: the
+/// children it is used with print one word and exit.
+private func runDirectlySpawned(
+    _ executable: URL, _ args: [String], cwd: URL, closing: InheritedDescriptorClosing
+) throws -> String {
+    let child = try POSIXSpawn.spawn(
+        executable: executable, args: args, cwd: cwd, env: nil, closing: closing)
+    var collected = Data()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while true {
+        let count = buffer.withUnsafeMutableBytes { read(child.stdoutFD, $0.baseAddress, $0.count) }
+        if count > 0 { collected.append(contentsOf: buffer[0..<count]) } else { break }
+    }
+    close(child.stdoutFD)
+    close(child.stderrFD)
+    var status: Int32 = 0
+    waitpid(child.pid, &status, 0)
+    return String(decoding: collected, as: UTF8.self)
+}
+
+/// THE FALLBACK MUST ACTUALLY WORK, not merely exist.
+///
+/// `posix_spawn_file_actions_addclosefrom_np` is glibc 2.34 and later. Ubuntu
+/// 20.04, Debian 11 and RHEL 8 are all older, and on those the enumerating
+/// strategy is the ONLY thing standing between a spawned child and every
+/// descriptor this process has open. A fallback that has never executed is not
+/// a fallback, so this runs it explicitly, on the platform it is for.
+///
+/// Linux only, and that is not laziness: see `InheritedDescriptorClosing`.
+/// Darwin refuses the whole spawn with EBADF if a close action names a
+/// descriptor that closed between the snapshot and the fork, and it has
+/// `POSIX_SPAWN_CLOEXEC_DEFAULT` on every supported release, so it has neither
+/// the tolerance this strategy needs nor any need for the strategy.
+@Test func theEnumeratingFallbackClosesInheritedDescriptorsToo() throws {
+    let marker = tmp.appendingPathComponent("fd-fallback-\(UUID().uuidString).txt")
+    defer { try? FileManager.default.removeItem(at: marker) }
+    FileManager.default.createFile(atPath: marker.path, contents: Data())
+
+    let opened = open(marker.path, O_WRONLY)
+    try #require(opened >= 0, "could not open the marker file for writing")
+    let probeFD: Int32 = 34
+    try #require(dup2(opened, probeFD) == probeFD, "could not move the descriptor to \(probeFD)")
+    // See the note in `aSpawnedChildInheritsNoDescriptorAboveStderr`: closing
+    // `opened` unconditionally closes the probe itself when `open` already
+    // returned this number. The `contains(probeFD)` expectation below is what
+    // caught that, in a real full-suite run, rather than letting the test pass
+    // while proving nothing.
+    if opened != probeFD { close(opened) }
+    defer { close(probeFD) }
+
+    // The enumeration must SEE the descriptor before it can be expected to
+    // close it -- otherwise a fallback that silently enumerated nothing would
+    // pass this test for the wrong reason.
+    #expect(openDescriptorsAboveStderr().contains(probeFD),
+            "the enumeration did not find fd \(probeFD), so the rest of this test proves nothing")
+
+    let probe = "if [ -e /dev/fd/\(probeFD) ]; then echo INHERITED; else echo CLEAN; fi"
+    let out = try runDirectlySpawned(sh, ["-c", probe], cwd: tmp, closing: .enumerateOpenDescriptors)
+    #expect(out.contains("CLEAN"),
+            "the enumerating fallback left fd \(probeFD) open in the child: \(out)")
+}
+#endif
 
 /// The reader must still drain the pipe when libdispatch did not schedule it
 /// until long after the child was reaped.

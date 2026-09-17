@@ -89,13 +89,43 @@ import Glibc
 
 #if canImport(Darwin) || os(Linux)
 
-/// Fixed capacity for concurrently live child process groups. `eval` and
-/// `baseline` run children strictly sequentially (one live child at a time);
-/// `profile` genuinely holds TWO at once for the whole sampling window -- the
-/// benchmark it is profiling, and the sampler (`sample`/`perf`) attached to
-/// it. 8 is ample headroom over the two this project currently ever needs at
-/// once, with room to spare should a future command need a third or fourth.
-private let maxLiveChildren = 8
+/// Fixed capacity for concurrently live child process groups.
+///
+/// `eval` and `baseline` run children strictly sequentially (one live child at
+/// a time); `profile` genuinely holds TWO at once for the whole sampling window
+/// -- the benchmark it is profiling, and the sampler (`sample`/`perf`) attached
+/// to it. Those are the only executables that arm the trap, so production needs
+/// two slots.
+///
+/// It was 8, sized against those two. That was reasoned, not measured, and the
+/// measurement says 8 is the wrong number. Instrumenting `noteChildSpawned` /
+/// `noteChildReaped` to record a high-water mark across a full `swift test`
+/// run gives a PEAK OF 10 CONCURRENTLY LIVE CHILDREN -- on macOS and on Linux
+/// alike, on a 10-core machine. swift-testing runs the whole suite in ONE
+/// process with case-level parallelism that scales with the core count, and
+/// most cases spawn `git`; 10 children on 10 cores is that parallelism, not an
+/// anomaly, and a 64-core machine would go higher still.
+///
+/// Nothing is broken TODAY, for one reason only: no test arms the trap, so the
+/// registry is inert in the test process (see `trapArmed`). That is a thin
+/// guarantee to rest on. Anything that armed the trap and then spawned in
+/// parallel -- a future command, or a test that decided to arm it -- would have
+/// found `noteChildSpawned` refusing, and `Subprocess.runRaw` correctly killing
+/// the child it had just spawned and failing the launch. That surfaces as a
+/// spurious failure reading exactly like another mysterious intermittent, which
+/// is the most expensive kind of bug this project can have.
+///
+/// 64 is therefore the capacity: 6.4x the measured peak, and one slot per core
+/// on a 64-core machine. The cost is 64 `sig_atomic_t` -- 256 bytes, allocated
+/// once in `install()` -- and a handler loop of 64 iterations instead of 8,
+/// each a load, a compare and at most two `kill(2)` calls. Still no allocation,
+/// no ARC, no locks, and still bounded: exactly as async-signal-safe as 8 was.
+///
+/// The full-registry behaviour is deliberately UNCHANGED: refuse, kill, fail
+/// the launch. Raising the number buys headroom; it must never be read as
+/// making the refusal unnecessary. Silently dropping a pgid instead would
+/// recreate the orphan bug this file exists to prevent.
+private let maxLiveChildren = 64
 
 /// Fixed-capacity, signal-handler-safe storage for up to `maxLiveChildren`
 /// live child process-group ids, indexed `0..<maxLiveChildren`, each either 0

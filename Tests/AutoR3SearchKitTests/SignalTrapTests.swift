@@ -229,9 +229,12 @@ private func processExists(_ pid: pid_t) -> Bool {
 @Test func noteChildSpawnedRefusesOnceEveryProductionSlotIsFull() throws {
     // `SignalTrap.noteChildSpawned` is, at the trap-armed case, exactly
     // `ChildRegistrySlots.claim` against its own process-wide buffer sized
-    // `SignalTrap.capacity` (8) -- so filling an identically-sized LOCAL
-    // buffer via the same claim function binds "returns false once full" at
-    // the exact size production actually uses, without arming the trap.
+    // `SignalTrap.capacity` -- so filling an identically-sized LOCAL buffer
+    // via the same claim function binds "returns false once full" at the exact
+    // size production actually uses, without arming the trap. Deliberately
+    // reads the constant rather than hard-coding it: the size is a decision
+    // that has already changed once (see `theRegistryHasRealHeadroomOverTheConcurrency…`),
+    // and the refusal behaviour must hold at whatever it is.
     let capacity = SignalTrap.capacity
     let slots = UnsafeMutablePointer<sig_atomic_t>.allocate(capacity: capacity)
     slots.initialize(repeating: 0, count: capacity)
@@ -245,6 +248,32 @@ private func processExists(_ pid: pid_t) -> Bool {
         every one of SignalTrap's \(capacity) production slots is full; one more claim must \
         be refused, matching exactly what noteChildSpawned returns to Subprocess.runRaw and \
         Sampler.profile once the registry is exhausted.
+        """)
+}
+
+/// The capacity is a MEASURED decision, and this is what holds it in place.
+///
+/// The registry was sized 8 by reasoning about production alone -- `eval` holds
+/// one child at a time, `profile` two. Instrumenting `noteChildSpawned` /
+/// `noteChildReaped` with a high-water counter across a full `swift test` run
+/// measured a PEAK OF 10 concurrently live children, on macOS and on Linux
+/// alike, on a 10-core machine: swift-testing runs the whole suite in one
+/// process with case-level parallelism that scales with the core count, and
+/// most cases spawn `git`. 8 was below that, and the only reason nothing broke
+/// is that no test arms the trap.
+///
+/// So this is not a tautology about a constant. It fails if anyone puts the
+/// capacity back under the concurrency this project's own suite demonstrably
+/// reaches -- at which point an armed trap would make `noteChildSpawned`
+/// refuse, `Subprocess.runRaw` kill the child it had just spawned, and the
+/// failure read like yet another mysterious intermittent.
+@Test func theRegistryHasRealHeadroomOverTheConcurrencyTheSuiteActuallyReaches() {
+    let measuredPeakConcurrentChildren = 10
+    #expect(SignalTrap.capacity >= 4 * measuredPeakConcurrentChildren, """
+        SignalTrap.capacity is \(SignalTrap.capacity), against a measured peak of \
+        \(measuredPeakConcurrentChildren) concurrently live children in a full swift test run \
+        on a 10-core machine. That is not headroom -- it is the same mistake sized 8 made, and \
+        a bigger machine runs more cases in parallel, not fewer.
         """)
 }
 
