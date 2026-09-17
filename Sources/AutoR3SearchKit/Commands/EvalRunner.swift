@@ -641,6 +641,106 @@ public enum EvalRunner {
         return nil
     }
 
+    // MARK: - The build cache, which no inventory can cover
+
+    /// Everything under `.build/` that is COMPILED OUTPUT, as opposed to the
+    /// resolved dependency state that `checkoutSHA256` verifies and that
+    /// re-creating would need the network.
+    ///
+    /// Deleting exactly this set gives a cold build WITHOUT a re-resolve:
+    /// `checkouts/`, `repositories/` and `artifacts/` survive, so SwiftPM does
+    /// not clone anything, and every object, binary and plugin is rebuilt from
+    /// sources gates 2a-2d have verified.
+    static let buildOutputSubpaths = [
+        ".build/out", ".build/debug", ".build/release", ".build/plugins",
+        ".build/manifest.pif",
+    ]
+
+    /// Where SwiftPM keeps compiled build-tool plugins and the sources they
+    /// generate. `cache/` holds Mach-O executables -- verified with `file`:
+    /// `.build/plugins/cache/BenchmarkPlugin: Mach-O 64-bit executable arm64`
+    /// -- and `outputs/` holds generated Swift that is compiled into the
+    /// benchmark.
+    static let pluginCacheSubpath = ".build/plugins"
+
+    /// Deletes `subpaths` under `directory`, returning the failure to answer
+    /// with or `nil`. A path that is not there is success: the point is that it
+    /// is absent afterwards.
+    ///
+    /// FAIL-CLOSED. A deletion that cannot be performed is a refusal, not a
+    /// warning: continuing would build with exactly the cached artifact the
+    /// deletion exists to discard, which is the one outcome worse than not
+    /// measuring at all.
+    static func purge(
+        _ subpaths: [String], in directory: URL, reason: String, what: String, where description: String
+    ) -> GateFailure? {
+        for subpath in subpaths {
+            let url = directory.appendingPathComponent(subpath)
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            do {
+                try FileManager.default.removeItem(at: url)
+            } catch {
+                return GateFailure(reason: reason, detail: """
+                    \(what) could not be removed from \(description): \(subpath) (\(error)). \
+                    Failing closed -- building on top of it would use exactly the cached artifact \
+                    this deletion exists to discard.
+                    """)
+            }
+        }
+        return nil
+    }
+
+    /// Deletes the compiled build-tool plugins before a build, so they are
+    /// recompiled from checkout sources gate 2d has just verified.
+    ///
+    /// WHY THIS IS NOT COVERED BY ANY INVENTORY. Gate 2d hashes
+    /// `.build/checkouts`, which is where a plugin's SOURCE lives. But SwiftPM
+    /// compiles that source once and caches the RESULT here, and llbuild
+    /// decides whether to recompile from recorded input signatures -- so a
+    /// tampered `.build/plugins/cache/BenchmarkPlugin`, whose sources have not
+    /// changed, is reused. That binary is executed during the build, after
+    /// every integrity gate has passed. Deleting it is the cheap, sound answer:
+    /// it needs no hash of a 397 MB tree and it cannot be fooled by whatever
+    /// llbuild happens to key on.
+    ///
+    /// MEASURED, on `Fixtures/DemoPackage` (two `swift build -c release
+    /// --product` invocations, the pair an eval runs per side):
+    ///
+    /// ```
+    /// warm, plugins kept      1.673 / 1.677 / 1.845 s
+    /// .build/plugins deleted  2.527 / 2.478 / 2.491 s
+    /// ```
+    ///
+    /// ~0.81 s per side, ~1.62 s per eval across both, against a ~39 s eval:
+    /// about 4%. The whole directory is removed rather than just `cache/`
+    /// (which measured 2.27 s, ~0.22 s cheaper) because `outputs/` holds
+    /// plugin-GENERATED Swift that is compiled into the benchmark, and relying
+    /// on SwiftPM to regenerate it after only `cache/` is cleared would make
+    /// the guarantee depend on a caching detail rather than on absence.
+    static func purgePluginCache(in directory: URL, where description: String) -> GateFailure? {
+        purge([pluginCacheSubpath], in: directory, reason: "plugin_cache_not_purged",
+              what: "the compiled build-tool plugin cache", where: description)
+    }
+
+    /// Environment override for the build-output purge, until the config field
+    /// lands (see the README note: `purge_build_output`).
+    ///
+    /// AN OVERRIDE THAT CAN ONLY TIGHTEN. This switch turns the purge ON and
+    /// has no way to turn anything off, which is what makes it safe to read
+    /// from the environment at all: in many deployments the agent under
+    /// measurement is the process that invokes `eval`, so an environment
+    /// variable that could WEAKEN a gate would be a gate the agent controls.
+    /// Setting this one only costs the agent a cold build.
+    ///
+    /// The plugin-cache purge deliberately has no switch of either kind.
+    public static let purgeBuildOutputEnvKey = "AUTOR3SEARCH_SWIFT_PURGE_BUILD_OUTPUT"
+
+    static func purgeBuildOutputRequested(env: [String: String]) -> Bool {
+        guard let raw = env[purgeBuildOutputEnvKey]?.trimmingCharacters(in: .whitespaces).lowercased()
+        else { return false }
+        return ["1", "true", "yes", "on"].contains(raw)
+    }
+
     /// Runs one experiment end to end and returns its verdict.
     ///
     /// Throws only on a genuine harness failure (the executable turns that
@@ -695,7 +795,7 @@ public enum EvalRunner {
         do {
             verdict = try evaluate(
                 repo: repo, git: git, home: home, tag: tag, runDir: runDir,
-                stopRequested: stopRequested, source: source)
+                stopRequested: stopRequested, source: source, env: env)
         } catch {
             // A harness failure still earns a row. `results.tsv` is the
             // human's morning log of what an unattended agent did overnight,
@@ -756,7 +856,7 @@ public enum EvalRunner {
     /// never do.
     private static func evaluate(
         repo: URL, git: Git, home: StateHome, tag: String, runDir: URL,
-        stopRequested: Bool, source: (any MetricSource)?
+        stopRequested: Bool, source: (any MetricSource)?, env: [String: String]
     ) throws -> Verdict {
         // Every gate rejection goes through here, so all of them look the same
         // to the agent: kind `.fail` (exit 2), the machine-readable `reason` in
@@ -1003,6 +1103,46 @@ public enum EvalRunner {
         // branched on `timedOut`, never on an exit code -- a signalled child
         // reports 128 + signal, so no specific code identifies a kill.
         let swift = URL(fileURLWithPath: "/usr/bin/swift")
+
+        // ---- Gate 4b: discard the caches no inventory can vouch for ----
+        //
+        // Gate 2d hashes `.build/checkouts`, which is where a build-tool
+        // plugin's SOURCE lives. SwiftPM compiles that source once and caches
+        // the RESULT in `.build/plugins`, and llbuild decides whether to
+        // recompile from recorded input signatures -- so a tampered
+        // `.build/plugins/cache/BenchmarkPlugin` (verified with `file` to be a
+        // Mach-O executable) whose sources have not changed is REUSED, and it
+        // is executed during the build below, after every integrity gate has
+        // passed. No inventory can close that: the artifact is legitimately
+        // rewritten by every build.
+        //
+        // So it is deleted instead, on both sides, every eval. Measured at
+        // ~0.81 s per side on the demo package -- about 4% of a ~39 s eval --
+        // against a cold build of the whole output tree at ~18 s per side.
+        // See `purgePluginCache`.
+        let purgeOutput = purgeBuildOutputRequested(env: env)
+        for (directory, description) in [(repo, "the candidate repository"),
+                                         (try home.worktreeURL(tag: tag),
+                                          "the pinned measurement worktree")] {
+            if purgeOutput {
+                // OPT-IN, default off. Deletes every compiled artifact, not
+                // just the plugins, so the measured binaries are built entirely
+                // from verified sources. `checkouts/`, `repositories/` and
+                // `artifacts/` survive, so this is a cold BUILD and not a
+                // re-resolve: no network, nothing re-cloned. Measured at
+                // ~18 s per side on the demo package, which roughly doubles
+                // the cost of an experiment -- which is why it is not the
+                // default and why the residual is documented instead.
+                if let failure = purge(
+                    buildOutputSubpaths, in: directory, reason: "build_output_not_purged",
+                    what: "the compiled build output", where: description) {
+                    return fail(failure)
+                }
+            } else if let failure = purgePluginCache(in: directory, where: description) {
+                return fail(failure)
+            }
+        }
+
         let timeout = TimeInterval(config.timeoutSeconds)
 
         let build = try Subprocess.run(swift, ["build", "-c", "release"], cwd: repo, timeout: timeout)
