@@ -127,3 +127,110 @@ func drainStaysBoundedWhenADescendantEscapesTheProcessGroup() throws {
     #expect(elapsed < 5.0,
             "run() blocked for \(elapsed)s draining a descendant that escaped the process group")
 }
+
+// MARK: - Linux portability: descriptor hygiene, ETXTBSY, and a late reader
+
+/// A spawned child must inherit fd 0/1/2 AND NOTHING ELSE.
+///
+/// This is not tidiness. `posix_spawn` forks, and the fork inherits every
+/// descriptor this process has open that is not close-on-exec -- including one
+/// another thread opened for WRITING moments earlier. On Linux the kernel then
+/// refuses to `execve` that file for as long as the child lives: ETXTBSY,
+/// "Text file busy". The harness builds `BenchmarkTool` and immediately spawns
+/// it, so a leaked writable descriptor turns into a failed measurement launch.
+///
+/// `/dev/fd/N` exists on both macOS (devfs) and Linux (a symlink to
+/// `/proc/self/fd`) exactly while fd N is open, so the child can report the
+/// answer itself with no platform-specific probe. The descriptor is moved to a
+/// deliberately high number first, so a number `sh` happens to open for its own
+/// purposes cannot be mistaken for the one under test.
+@Test func aSpawnedChildInheritsNoDescriptorAboveStderr() throws {
+    let marker = tmp.appendingPathComponent("fd-leak-\(UUID().uuidString).txt")
+    defer { try? FileManager.default.removeItem(at: marker) }
+    FileManager.default.createFile(atPath: marker.path, contents: Data())
+
+    let opened = open(marker.path, O_WRONLY)
+    try #require(opened >= 0, "could not open the marker file for writing")
+    let probeFD: Int32 = 33
+    try #require(dup2(opened, probeFD) == probeFD, "could not move the descriptor to \(probeFD)")
+    close(opened)
+    defer { close(probeFD) }
+
+    let r = try Subprocess.run(
+        sh, ["-c", "if [ -e /dev/fd/\(probeFD) ]; then echo INHERITED; else echo CLEAN; fi"],
+        cwd: tmp, env: nil, timeout: 30, outputCapBytes: 1 << 20)
+
+    #expect(r.exitCode == 0, "probe failed: \(r.stderr)")
+    #expect(r.stdout.contains("CLEAN"),
+            "the child inherited fd \(probeFD), open for WRITING in the parent: \(r.stdout)")
+}
+
+/// The reader must still drain the pipe when libdispatch did not schedule it
+/// until long after the child was reaped.
+///
+/// This is the mechanism behind a zero-byte `git show` that returns exit 0:
+/// under a saturated global queue the drain block can sit unstarted for longer
+/// than `drainGracePeriod`, and a grace deadline anchored at reap time would
+/// already have expired before the reader ran a single `poll`. The loop would
+/// return having read nothing, and the caller would receive an EMPTY stdout
+/// carrying the child's real, successful exit status -- silent data loss that
+/// the truncation guard in `Git.fileContents` cannot see, because nothing was
+/// truncated: nothing was read.
+///
+/// Driven against a plain pipe rather than a real child so the late start is
+/// staged exactly instead of hoped for: the bytes are already buffered and the
+/// write end already closed, so a correct reader has no excuse to return empty.
+@Test(.timeLimit(.minutes(1)))
+func aReaderScheduledLateStillDrainsWhatTheChildAlreadyWrote() throws {
+    var fds: [Int32] = [-1, -1]
+    try #require(pipe(&fds) == 0, "pipe() failed")
+    defer { close(fds[0]) }
+
+    let payload = Data(repeating: 0x78, count: 4096)  // "x" * 4096, as GitTests writes
+    let written = payload.withUnsafeBytes { raw in
+        write(fds[1], raw.baseAddress, raw.count)
+    }
+    try #require(written == payload.count, "short write staging the pipe")
+    close(fds[1])  // EOF is already available; every byte is already buffered.
+
+    let buffers = OutputBuffers(cap: 4 << 20)
+    buffers.requestStop()  // the child has been reaped, as in `runRaw`
+
+    // Four times the grace period: a deadline started by `requestStop` is long
+    // gone by the time this reader gets to run.
+    Subprocess.drainLoop(fd: fds[0], stream: .out, into: buffers,
+                         startDelay: Subprocess.drainGracePeriod * 4)
+
+    let drained = buffers.snapshot().out
+    #expect(drained == payload,
+            "a late-scheduled reader returned \(drained.count) of \(payload.count) bytes")
+}
+
+#if os(Linux)
+/// Linux only, because only Linux enforces ETXTBSY.
+///
+/// Staged the one way that is deterministic: this process itself holds a
+/// writable descriptor on the executable, so the first `execve` is guaranteed
+/// to be refused. A second thread closes that descriptor shortly afterwards,
+/// which is the real-world shape of the problem -- a writer that is about to
+/// finish, not one that never will. Without the bounded ETXTBSY retry in
+/// `POSIXSpawn.spawn` the launch throws; with it, the spawn waits the window
+/// out and the child runs.
+@Test(.timeLimit(.minutes(1)))
+func aSpawnRefusedWithETXTBSYIsRetriedUntilTheWriterFinishes() throws {
+    let script = tmp.appendingPathComponent("etxtbsy-\(UUID().uuidString).sh")
+    defer { try? FileManager.default.removeItem(at: script) }
+    try "#!/bin/sh\necho ran\n".write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+    let holder = open(script.path, O_WRONLY)
+    try #require(holder >= 0, "could not hold the script open for writing")
+
+    DispatchQueue(label: "etxtbsy-writer").asyncAfter(deadline: .now() + 0.1) { close(holder) }
+
+    let r = try Subprocess.run(script, [], cwd: tmp, env: nil, timeout: 30,
+                               outputCapBytes: 1 << 20)
+    #expect(r.exitCode == 0)
+    #expect(r.stdout.contains("ran"))
+}
+#endif

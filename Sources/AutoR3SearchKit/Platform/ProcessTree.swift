@@ -71,6 +71,15 @@ public enum SpawnError: Error, CustomStringConvertible {
 /// no `/usr/bin/setsid`, so the child would share *our* process group and
 /// `kill(-pgid)` would signal the wrong tree.)
 public enum POSIXSpawn {
+    /// How many times a spawn that failed with ETXTBSY -- and ONLY ETXTBSY --
+    /// is retried, and how long to wait between attempts. The product is the
+    /// whole extra latency this can ever add to a launch (250 ms), and it is
+    /// only ever paid on Linux and only when the exec was actually refused.
+    /// Small enough that a genuinely stuck writer still surfaces as a launch
+    /// failure with the real errno rather than as an unexplained hang.
+    static let etxtbsyMaxRetries = 10
+    static let etxtbsyRetryInterval: TimeInterval = 0.025
+
     public static func spawn(
         executable: URL,
         args: [String],
@@ -130,7 +139,10 @@ public enum POSIXSpawn {
         checked("posix_spawnattr_setsigmask", posix_spawnattr_setsigmask(&attr, &empty))
         flags |= Int16(POSIX_SPAWN_SETSIGMASK)
 
-        checked("posix_spawnattr_setflags", posix_spawnattr_setflags(&attr, flags))
+        // NOTE: `posix_spawnattr_setflags` is deliberately NOT called here --
+        // the descriptor-hygiene branch further down adds one more flag on
+        // Darwin, so installing `flags` before that point would silently drop
+        // it. It is installed once, after that branch.
 
         // stdin from /dev/null: a measurement child must never block reading our
         // terminal, and must never steal keystrokes from the harness.
@@ -146,14 +158,40 @@ public enum POSIXSpawn {
             "posix_spawn_file_actions_adddup2(stderr)",
             posix_spawn_file_actions_adddup2(&fileActions, errFDs[1], STDERR_FILENO)
         )
-        // Close the inherited copies so the child holds only fd 0/1/2. Guarded on
-        // `> STDERR_FILENO` so we can never close the dup2 target we just made.
-        for fd in [outFDs[0], outFDs[1], errFDs[0], errFDs[1]] where fd > STDERR_FILENO {
-            checked(
-                "posix_spawn_file_actions_addclose(\(fd))",
-                posix_spawn_file_actions_addclose(&fileActions, fd)
-            )
-        }
+        // THE CHILD MUST INHERIT NOTHING ABOVE fd 2. Closing only OUR four pipe
+        // ends is not enough, and the gap is not cosmetic: `posix_spawn` forks,
+        // and the fork inherits EVERY descriptor this process has open at that
+        // instant that is not marked close-on-exec -- including a descriptor
+        // another thread opened for WRITING a moment earlier.
+        //
+        // On Linux that is a functional bug, not just untidiness. The kernel
+        // enforces ETXTBSY: `execve` of a file that any process holds open for
+        // writing fails with "Text file busy". So a child spawned while some
+        // other thread happens to be writing `.build/release/BenchmarkTool`
+        // keeps a writable descriptor to that inode for its whole lifetime, and
+        // the NEXT spawn of that binary -- the measurement itself -- fails to
+        // launch. `String.write(to:atomically:)` does not save us: it writes a
+        // temporary file and renames it over the target, so the leaked
+        // descriptor points at the very inode the path now names. Darwin does
+        // not enforce ETXTBSY, which is exactly why this was invisible until
+        // the package was run on Linux.
+        //
+        // Both branches below express the same intent -- "the child gets fd
+        // 0/1/2 and nothing else" -- through each platform's own mechanism.
+        // The explicit file actions above are still honoured: they are applied
+        // in order, before the closefrom, and CLOEXEC_DEFAULT is an exec-time
+        // property that leaves file-action processing alone.
+        #if canImport(Darwin)
+        flags |= Int16(POSIX_SPAWN_CLOEXEC_DEFAULT)
+        #else
+        checked(
+            "posix_spawn_file_actions_addclosefrom_np(\(STDERR_FILENO + 1))",
+            posix_spawn_file_actions_addclosefrom_np(&fileActions, STDERR_FILENO + 1)
+        )
+        #endif
+        // `setflags` is called AFTER the platform branch above so a flag added
+        // there is actually in `flags` when it is installed.
+        checked("posix_spawnattr_setflags", posix_spawnattr_setflags(&attr, flags))
         checked(
             "posix_spawn_file_actions_addchdir_np(\(cwd.path))",
             posix_spawn_file_actions_addchdir_np(&fileActions, cwd.path)
@@ -170,10 +208,30 @@ public enum POSIXSpawn {
         let envp = environment.map { "\($0.key)=\($0.value)" }
 
         var pid: pid_t = 0
-        let rc = withCStringArray(argv) { cArgv in
-            withCStringArray(envp) { cEnvp in
-                posix_spawn(&pid, executable.path, &fileActions, &attr, cArgv, cEnvp)
+        var rc: Int32 = 0
+        var etxtbsyAttempts = 0
+        while true {
+            rc = withCStringArray(argv) { cArgv in
+                withCStringArray(envp) { cEnvp in
+                    posix_spawn(&pid, executable.path, &fileActions, &attr, cArgv, cEnvp)
+                }
             }
+            // ETXTBSY ONLY, and bounded. The closefrom/CLOEXEC_DEFAULT above
+            // removes THIS process as a source of the writable descriptor that
+            // makes Linux refuse the exec, but it cannot remove every source:
+            // `swift build` itself, an editor, or an indexer may still hold the
+            // freshly linked binary open for a few milliseconds after the build
+            // command exits, and build-then-immediately-exec is exactly what
+            // the measurement pipeline does. This waits that window out.
+            //
+            // It is deliberately NOT a general spawn retry. ENOENT, EACCES and
+            // ENOEXEC are real, permanent answers about the binary we were
+            // asked to run, and retrying them would turn a clear failure into a
+            // slow, confusing one. Anything other than ETXTBSY still fails on
+            // the first attempt, exactly as before.
+            guard rc == ETXTBSY, etxtbsyAttempts < etxtbsyMaxRetries else { break }
+            etxtbsyAttempts += 1
+            Thread.sleep(forTimeInterval: etxtbsyRetryInterval)
         }
 
         // The parent keeps only the read ends; holding a write end open would mean

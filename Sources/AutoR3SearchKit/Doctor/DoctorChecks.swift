@@ -814,11 +814,27 @@ public enum DoctorChecks {
     /// Falls back to `FileManager.attributesOfFileSystem` if the resource
     /// value is unavailable (some volume types do not report the
     /// "important usage" key).
+    ///
+    /// `volumeAvailableCapacityForImportantUsage` is DARWIN-ONLY: neither
+    /// `URLResourceKey.volumeAvailableCapacityForImportantUsageKey` nor the
+    /// matching `URLResourceValues` property exists in
+    /// swift-corelibs-foundation, so the unguarded form is a COMPILE ERROR on
+    /// Linux, not a runtime degradation. It is kept on Darwin rather than
+    /// dropped for both platforms because it is the only API that accounts
+    /// for purgeable space, so on macOS it reports what a build can actually
+    /// use; `systemFreeSize` there over-reports. The `statfs`-backed
+    /// `attributesOfFileSystem` fallback below is the portable path and is
+    /// what Linux takes -- it is the SAME fallback Darwin already uses when
+    /// the volume does not report the "important usage" key, so the Linux
+    /// branch is a path this code exercised before Linux was in scope, not a
+    /// new untested one.
     private static func probeFreeBytes(at path: URL) -> Int64? {
+        #if canImport(Darwin)
         if let values = try? path.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
            let capacity = values.volumeAvailableCapacityForImportantUsage {
             return capacity
         }
+        #endif
         if let attrs = try? FileManager.default.attributesOfFileSystem(forPath: path.path),
            let free = attrs[.systemFreeSize] as? NSNumber {
             return free.int64Value

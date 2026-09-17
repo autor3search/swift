@@ -214,7 +214,7 @@ public enum Subprocess {
         // a quiet pipe ends it immediately, and a *noisy* one ends it at the grace
         // deadline. Without the second bound a runaway escapee keeps `poll` ready
         // forever and the harness hangs instead of reporting `timedOut`.
-        buffers.requestStop(grace: drainGracePeriod)
+        buffers.requestStop()
         drains.wait()
         close(child.stdoutFD)
         close(child.stderrFD)
@@ -273,46 +273,85 @@ public enum Subprocess {
         group.enter()
         DispatchQueue.global(qos: .userInitiated).async {
             defer { group.leave() }
-            let capacity = 64 * 1024
-            let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
-            defer { buffer.deallocate() }
+            drainLoop(fd: fd, stream: stream, into: buffers)
+        }
+    }
 
-            while true {
-                let stop = buffers.stopState()
-                // Hard wall-clock bound, checked *before* readability. A descendant
-                // that escaped the process group can keep this pipe permanently
-                // readable; without this check the reader would never reach the
-                // quiet-pipe test below and `run` would never return.
-                if stop.graceExpired { return }
+    /// The reader loop itself, factored out of `drain` so it can be driven
+    /// directly against a plain pipe in a test -- including with a
+    /// `startDelay` standing in for the thing that is otherwise impossible to
+    /// stage deterministically: a reader that libdispatch did not schedule
+    /// until long after the child had already been reaped.
+    ///
+    /// THE GRACE DEADLINE IS THIS READER'S OWN, started the first time THIS
+    /// reader observes the stop request -- NOT a deadline started by
+    /// `requestStop` on the reaping thread. That distinction is the whole
+    /// point. Under a saturated global queue the drain block can sit unstarted
+    /// for longer than the grace period, and a deadline started at reap time
+    /// would already have expired before the reader ran a single `poll`: the
+    /// loop would return having read nothing, and `run` would hand back an
+    /// EMPTY stdout with the child's REAL exit status 0. That is silent data
+    /// loss wearing a success code -- a `git show` of a 4 KiB blob returning
+    /// zero bytes and being believed. Anchoring the deadline here means a
+    /// late-scheduled reader still gets its full grace to drain, while a
+    /// genuinely runaway pipe (a descendant that escaped the tree kill and
+    /// keeps writing) is still bounded: the reader gives up `drainGracePeriod`
+    /// after it notices, instead of never.
+    static func drainLoop(
+        fd: Int32,
+        stream: OutputBuffers.Stream,
+        into buffers: OutputBuffers,
+        startDelay: TimeInterval = 0
+    ) {
+        if startDelay > 0 { Thread.sleep(forTimeInterval: startDelay) }
+        let capacity = 64 * 1024
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
+        defer { buffer.deallocate() }
 
-                var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
-                let ready = poll(&descriptor, 1, 50)
-                if ready < 0 {
-                    if errno == EINTR { continue }
-                    return
-                }
-                if ready == 0 {
-                    // Nothing available for 50 ms. Anything the child buffered has
-                    // been read by now, so it is safe to honour a stop request.
-                    if stop.requested { return }
-                    continue
-                }
-                let count = read(fd, buffer, capacity)
-                if count > 0 {
-                    buffers.append(buffer, count: count, to: stream)
-                } else if count == 0 {
-                    return  // EOF: every write end is closed.
-                } else {
-                    if errno == EINTR || errno == EAGAIN { continue }
-                    return
-                }
+        var graceDeadline: Date?
+
+        while true {
+            let stopRequested = buffers.stopRequested()
+            if stopRequested, graceDeadline == nil {
+                graceDeadline = Date().addingTimeInterval(drainGracePeriod)
+            }
+            // Hard wall-clock bound, checked *before* readability. A descendant
+            // that escaped the process group can keep this pipe permanently
+            // readable; without this check the reader would never reach the
+            // quiet-pipe test below and `run` would never return.
+            if let graceDeadline, Date() >= graceDeadline { return }
+
+            var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&descriptor, 1, 50)
+            if ready < 0 {
+                if errno == EINTR { continue }
+                return
+            }
+            if ready == 0 {
+                // Nothing available for 50 ms. Anything the child buffered has
+                // been read by now, so it is safe to honour a stop request.
+                if stopRequested { return }
+                continue
+            }
+            let count = read(fd, buffer, capacity)
+            if count > 0 {
+                buffers.append(buffer, count: count, to: stream)
+            } else if count == 0 {
+                return  // EOF: every write end is closed.
+            } else {
+                if errno == EINTR || errno == EAGAIN { continue }
+                return
             }
         }
     }
 }
 
 /// Capped, lock-guarded accumulation of the two streams.
-private final class OutputBuffers: @unchecked Sendable {
+///
+/// Internal rather than private so `Subprocess.drainLoop` can be exercised
+/// directly against a plain pipe -- see that function's note on the
+/// late-scheduled reader.
+final class OutputBuffers: @unchecked Sendable {
     enum Stream { case out, err }
     struct Snapshot { let out: Data; let err: Data; let truncated: Bool }
 
@@ -321,9 +360,11 @@ private final class OutputBuffers: @unchecked Sendable {
     private var out = Data()
     private var err = Data()
     private var truncated = false
-    /// nil until `requestStop`; afterwards, the instant the readers must give up
-    /// even if the pipe is still readable.
-    private var graceDeadline: Date?
+    /// False until `requestStop`. It records only that the child has been
+    /// reaped -- the deadline that follows from it belongs to each reader, and
+    /// is started when that reader first SEES this, not when it was set. See
+    /// `Subprocess.drainLoop`.
+    private var stopWasRequested = false
 
     init(cap: Int) { self.cap = max(0, cap) }
 
@@ -347,19 +388,17 @@ private final class OutputBuffers: @unchecked Sendable {
         if taken < count { truncated = true }
     }
 
-    func requestStop(grace: TimeInterval) {
+    func requestStop() {
         lock.lock()
-        graceDeadline = Date().addingTimeInterval(grace)
+        stopWasRequested = true
         lock.unlock()
     }
 
-    /// `requested`: the child has been reaped, so a quiet pipe means we are done.
-    /// `graceExpired`: give up now regardless of how much is still arriving.
-    func stopState() -> (requested: Bool, graceExpired: Bool) {
+    /// The child has been reaped, so a quiet pipe means we are done.
+    func stopRequested() -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard let graceDeadline else { return (false, false) }
-        return (true, Date() >= graceDeadline)
+        return stopWasRequested
     }
 
     func snapshot() -> Snapshot {
