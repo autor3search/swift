@@ -521,6 +521,126 @@ public enum EvalRunner {
             """)
     }
 
+    /// Gate 2d. The dependency sources SwiftPM is about to compile must be the
+    /// ones `Package.resolved` pins.
+    ///
+    /// `.build/` is exempt from the out-of-scope inventory
+    /// (`neverWalkedDirectories`), exempt from the dirty-tree gate
+    /// (`isHarnessOutput`), and git collapses it to one `!!` record. That
+    /// blanket exemption was the hole: `.build/checkouts` is not build output.
+    /// It is SOURCE, it is inside the repository under test, SwiftPM does not
+    /// re-verify it once a checkout exists, and it holds build-tool PLUGINS
+    /// that the build EXECUTES. Measured before this gate existed, with a
+    /// comment-only commit and one `sed` into a dependency's benchmark timer:
+    /// `rc 0, verdict keep, ratio 0.0099977, warnings []`.
+    ///
+    /// Checked on BOTH sides, because both get compiled: the candidate
+    /// repository at gate 5, and the pinned worktree at the baseline-side
+    /// build. Baseline recorded one merged map because the two are the same
+    /// checkouts of the same pinned revisions -- measured byte-identical, 803
+    /// files.
+    ///
+    /// THE MISSING-IS-FINE RULE, and why it is not a hole. A whole dependency
+    /// absent from `.build/checkouts` is allowed: SwiftPM re-clones it at the
+    /// revision `Package.resolved` names, that file's bytes are hashed by gate
+    /// 2a, and git's content addressing means a checkout that IS at that
+    /// revision has the real source. So `rm -rf .build` stays a legal thing
+    /// for an agent or an operator to do. What is refused is a dependency that
+    /// is PRESENT and no longer matches -- a file edited, added or removed
+    /// inside it -- because SwiftPM will not repair that, and it is exactly
+    /// what changes the compiled result.
+    ///
+    /// PURE READ, and placed with the other pure reads so that it runs before
+    /// gate 3 writes a byte and, far more importantly, before gate 5 starts a
+    /// build that would execute a plugin out of this tree.
+    static func checkoutIntegrityFailure(
+        repo: URL, worktree: URL, record: BaselineRecord
+    ) -> GateFailure? {
+        guard let recorded = record.checkoutSHA256 else {
+            return GateFailure(reason: "baseline_predates_tree_inventory", detail: """
+                this baseline record has no inventory of the dependency checkouts under \
+                \(BaselineRunner.checkoutsSubpath), because it was written by a version of \
+                autor3search-swift from before that existed. That tree is exempt from the \
+                out-of-scope inventory and from the dirty-tree gate -- .build/ is excluded from \
+                both -- but SwiftPM COMPILES it and does not re-verify it, and a build-tool \
+                plugin living there is EXECUTED during the build. Without the inventory a single \
+                edit to a dependency's source wins a measurement outright.
+
+                Re-run `autor3search-swift baseline` under a NEW tag to establish one. Results \
+                from this run were measured without that protection and should not be mixed with \
+                the new run's.
+                """)
+        }
+
+        for (label, directory) in [("the candidate repository", repo),
+                                   ("the pinned measurement worktree", worktree)] {
+            let live: [String: String]
+            do {
+                live = try BaselineRunner.checkoutInventory(in: directory)
+            } catch {
+                return GateFailure(reason: "dependency_checkout_modified", detail: """
+                    could not inventory the dependency checkouts in \(label) at \
+                    \(directory.path): \(error). Failing closed -- a check that cannot run is not \
+                    a check that passed.
+                    """)
+            }
+            guard !live.isEmpty else { continue }
+            if recorded.isEmpty {
+                return GateFailure(reason: "dependency_checkout_modified", detail: """
+                    \(label) has dependency checkouts under \(BaselineRunner.checkoutsSubpath), \
+                    but baseline recorded none, so there is nothing to verify them against. \
+                    Refusing rather than compiling unverified dependency source: that tree holds \
+                    build-tool plugins the build executes. Re-run `baseline` under a new tag.
+                    """)
+            }
+
+            // Grouped by dependency, so a WHOLE missing checkout is tolerated
+            // (SwiftPM re-clones it from the pin) while a present-but-altered
+            // one is refused.
+            let present = Set(live.keys.compactMap { BaselineRunner.checkoutDependency(of: $0) })
+            var lines: [String] = []
+            for path in live.keys.sorted() where recorded[path] == nil {
+                lines.append("  added:    \(path) (baseline recorded no such file)")
+            }
+            for path in recorded.keys.sorted() {
+                guard let dependency = BaselineRunner.checkoutDependency(of: path),
+                      present.contains(dependency) else { continue }
+                if let now = live[path] {
+                    if now != recorded[path] {
+                        lines.append("  modified: \(path) (now \(now), baseline recorded \(recorded[path]!))")
+                    }
+                } else {
+                    lines.append("  removed:  \(path) (baseline recorded \(recorded[path]!))")
+                }
+            }
+            guard lines.isEmpty else {
+                return GateFailure(reason: "dependency_checkout_modified", detail: """
+                    the dependency sources in \(label) are no longer the ones \(Lockfile.name) \
+                    pins:
+
+                    \(String(lines.joined(separator: "\n").prefix(4000)))
+
+                    \(BaselineRunner.checkoutsSubpath) is SOURCE, not build output. It is exempt \
+                    from the out-of-scope inventory and from the dirty-tree gate -- .build/ is \
+                    excluded from both, and git collapses it to a single ignored record -- but \
+                    SwiftPM compiles it, and does not restore or re-verify it once the checkout \
+                    exists. Editing a dependency's benchmark timer there wins a measurement with \
+                    a comment-only commit, and a build-tool plugin in that tree is EXECUTED \
+                    during the build, so this is also an arbitrary-code-execution surface.
+
+                    Deleting a whole dependency's checkout is fine and is NOT what this is \
+                    reporting: SwiftPM re-clones it at the revision \(Lockfile.name) pins, and \
+                    that file's own bytes are hashed by gate 2. To recover, delete the affected \
+                    checkout (or all of \(BaselineRunner.checkoutsSubpath)) and let SwiftPM \
+                    restore it from the pin; the next build will do so automatically. If the \
+                    change was intended, it belongs in a dependency version bump, which is a \
+                    human decision and requires a new baseline.
+                    """)
+            }
+        }
+        return nil
+    }
+
     /// Runs one experiment end to end and returns its verdict.
     ///
     /// Throws only on a genuine harness failure (the executable turns that
@@ -821,6 +941,22 @@ public enum EvalRunner {
             return fail(failure)
         }
 
+        // ---- Gate 2d: the dependency sources about to be compiled ----
+        //
+        // The same root cause a third time, through the one door the two
+        // inventories above deliberately leave shut: `.build/`. That
+        // exemption is right for build OUTPUT and wrong for
+        // `.build/checkouts`, which is dependency SOURCE that SwiftPM
+        // compiles, never re-verifies, and -- in the case of a build-tool
+        // plugin -- EXECUTES. See `checkoutIntegrityFailure`.
+        //
+        // Before gate 3's first write and, critically, before gate 5's build.
+        let pinnedWorktree = try home.worktreeURL(tag: tag)
+        if let failure = checkoutIntegrityFailure(
+            repo: repo, worktree: pinnedWorktree, record: record) {
+            return fail(failure)
+        }
+
         // ---- Gates 3 and 4: restore frozen files, reject new ones ----
         //
         // The manifest is LOADED from what baseline persisted -- never
@@ -915,7 +1051,7 @@ public enum EvalRunner {
         // A single `Worktree.verify` is the complete gate: it checks HEAD
         // identity AND cleanliness (Task 7's ruling), so a worktree at the
         // right commit but locally modified fails closed here.
-        let worktree = try home.worktreeURL(tag: tag)
+        let worktree = pinnedWorktree
         guard try Worktree.verify(at: worktree, expectedCommit: record.measurementCommit) else {
             return fail(GateFailure(reason: "worktree_integrity", detail: """
                 the pinned measurement worktree at \(worktree.path) is not a clean checkout of \
@@ -925,6 +1061,89 @@ public enum EvalRunner {
         }
 
         var warnings: [String] = []
+
+        // ---- Gate 7b: and `verify` asks GIT, so RESTORE rather than trust ----
+        //
+        // `Worktree.verify` reads `git status`, which is the same oracle the
+        // rest of this file has now stopped trusting three times over. The
+        // agent can reach this worktree with a shell:
+        //
+        //     git -C <worktree> update-index --assume-unchanged <a helper>
+        //     <edit it: the benchmark's workload 1750 -> 17500>
+        //
+        // `status` is then empty, `verify` returns true, and the baseline-side
+        // build below compiles the edit -- so the BASELINE is made slower and a
+        // comment-only commit measures as a win. Measured: `rc 0, keep,
+        // ratio 0.09997`. The README presented gate 7 as an integrity check, so
+        // either it does its job or the claim goes.
+        //
+        // The answer here is not another detector. This worktree is
+        // harness-owned state whose correct contents are known exactly -- it is
+        // a checkout of `measurementCommit` and nothing else -- so it is simply
+        // RESTORED, unconditionally, every eval, before the build that reads
+        // it. `restoreToPin` clears the index flags first (measured: `checkout
+        // --force` alone does NOT undo `--skip-worktree`) and then forces the
+        // checkout. Repairing rather than refusing also denies the agent a
+        // one-line denial of service; the cleared paths become a warning a
+        // human sees.
+        //
+        // NO STALE-BINARY REGRESSION. This restores SOURCE and leaves `.build`
+        // alone (`clean -fd`, never `-fdx`), and the per-eval baseline-side
+        // rebuild immediately below still runs, by product name, exactly as
+        // before. A forced checkout of the commit already checked out rewrites
+        // nothing, so the warm cache stays valid; if the worktree HAD been
+        // tampered with, the restore changes the source back and the rebuild
+        // below recompiles it. Either way the binary measured is the binary of
+        // `measurementCommit`.
+        do {
+            let flagged = try Worktree.restoreToPin(
+                git: git, at: worktree, to: record.measurementCommit)
+            if !flagged.isEmpty {
+                warnings.append("""
+                    the pinned measurement worktree had \(flagged.count) path(s) marked \
+                    --assume-unchanged or --skip-worktree in its index, which hides edits to them \
+                    from `git status` and therefore from the worktree-integrity gate, while the \
+                    baseline-side build still compiles them: \
+                    \(flagged.map { "\($0.tag) \($0.path)" }.prefix(20).joined(separator: ", ")). \
+                    The flags were cleared and the worktree was restored to \
+                    \(record.measurementCommit) before anything was built or measured, so this \
+                    experiment's numbers are sound -- but nothing legitimate sets those flags on \
+                    a harness-owned worktree, and it is worth finding out what did.
+                    """)
+            }
+        } catch {
+            return fail(GateFailure(reason: "worktree_integrity", detail: """
+                the pinned measurement worktree at \(worktree.path) could not be restored to \
+                \(record.measurementCommit) before measuring: \(error). Failing closed -- the \
+                baseline side is what every ratio is divided by, so measuring against a worktree \
+                whose contents cannot be established is worse than not measuring at all.
+                """))
+        }
+        // An ignored file planted in the worktree survives `clean -fd`, and
+        // `.git/info/exclude` is SHARED between the main repository and its
+        // worktrees -- so the agent can write the rule without touching any
+        // file the worktree contains. Unlike the repository under test, this
+        // directory has an exactly-known legitimate content: a checkout plus
+        // the harness's own `.build`. Anything else ignored here is a refusal,
+        // with no inventory needed.
+        if let entries = try? Git(repo: worktree).status(includingIgnored: true) {
+            let strays = entries.filter {
+                $0.isIgnored && !BaselineRunner.isHarnessOutput($0.path)
+            }
+            guard strays.isEmpty else {
+                return fail(GateFailure(reason: "worktree_integrity", detail: """
+                    the pinned measurement worktree at \(worktree.path) contains files that an \
+                    ignore rule hides from git and that the harness did not put there: \
+                    \(strays.map(\.path).joined(separator: ", ")). `git clean -fd` does not \
+                    remove ignored files and `-fdx` would delete the warm build cache, so these \
+                    are refused rather than swept away. Note that .git/info/exclude is SHARED \
+                    between a repository and its worktrees, so the rule may not live in any file \
+                    this worktree contains. The only ignored paths expected here are the \
+                    harness's own: \
+                    \(BaselineRunner.harnessOutputDirectories.map { $0 + "/" }.joined(separator: ", ")).
+                    """))
+            }
+        }
 
         // The baseline SIDE must be built too, every eval. `Worktree.repoint`
         // moves the pinned checkout after each KEEP but leaves its `.build`

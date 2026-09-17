@@ -255,8 +255,17 @@ extension Verdict {
             if d.significantAtAlpha && !d.significantAtCorrected {
                 note = "  (significant at alpha, did not clear the Bonferroni-corrected threshold)"
             }
+            // `p=%.3g`, not `%.5f`, for the same reason `Verdict` and
+            // `ConfigValidation` were changed: a real p-value here is routinely
+            // far below 1e-5 (the floor at count 10 is 1.0825e-5, and a decisive
+            // win reports exactly that), and `%.5f` renders every one of them as
+            // a flat `0.00000`. This is the human-readable half of the agent's
+            // only reporting channel; a report that prints "p=0.00000" for every
+            // result it ever produces is telling the reader nothing and looks
+            // like a harness bug. `%.4f` on the ratio is kept: ratios live near
+            // 1 and a fixed-point ratio is easier to scan down a column.
             lines.append(String(
-                format: "  %@  %.0f -> %.0f ns  ratio %.4f  p=%.5f%@",
+                format: "  %@  %.0f -> %.0f ns  ratio %.4f  p=%.3g%@",
                 locale: posix,
                 d.benchmark, d.baselineMedian, d.candidateMedian, d.ratio, d.pValue, note
             ))

@@ -112,6 +112,11 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
     /// apparent removal and a planted one into an apparent nothing.
     case ignoredInventoryFailed(String)
 
+    /// The dependency-checkout inventory could not be built. Fatal for the
+    /// same reason the others are, and with a sharper edge: the tree it covers
+    /// contains build-tool plugins, which SwiftPM EXECUTES during the build.
+    case checkoutInventoryFailed(String)
+
     public var description: String {
         switch self {
         case .dirtyTree:
@@ -235,6 +240,18 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
             which the pinned measurement worktree can never contain and which would therefore \
             manufacture a win on every later experiment. Recording an empty inventory because the \
             walk could not run would erase that distinction in the dangerous direction.
+            """
+        case .checkoutInventoryFailed(let why):
+            return """
+            refusing to establish a baseline: could not inventory the dependency checkouts under \
+            \(BaselineRunner.checkoutsSubpath) (\(why)).
+
+            That tree is SOURCE, not build output: SwiftPM compiles it and does not re-verify it \
+            once a checkout exists, and a build-tool plugin living there is EXECUTED during the \
+            build. baseline records its hashes so eval can tell whether the dependency sources \
+            that will be compiled are still the ones Package.resolved pins. Recording an empty \
+            inventory because the walk could not run would leave that tree exempt from every \
+            gate, which is the hole this closes.
             """
         }
     }
@@ -485,6 +502,95 @@ public enum BaselineRunner {
             inventory[relative] = try treeEntryDigest(item)
         }
         return inventory
+    }
+
+    // =====================================================================
+    // MARK: - The dependency checkout inventory
+    // =====================================================================
+
+    /// Where SwiftPM puts each dependency's source: one git checkout per
+    /// dependency, at the revision `Package.resolved` pins.
+    static let checkoutsSubpath = ".build/checkouts"
+
+    /// Every file SwiftPM will COMPILE out of `<directory>/.build/checkouts`,
+    /// as a path relative to that directory (`benchmark/Sources/...`) ->
+    /// digest. Each checkout's own `.git` is skipped: it is not compiled, it
+    /// is a third of the tree, and git rewrites it.
+    ///
+    /// THE BLANKET EXEMPTION WAS THE BUG. `.build/` is excluded from the
+    /// out-of-scope inventory (`neverWalkedDirectories`) and from the
+    /// dirty-tree gate (`isHarnessOutput`), and git collapses the whole thing
+    /// to a single `!!` record. But `.build/checkouts` is not build output --
+    /// it is SOURCE, it is INSIDE the repository under test, and SwiftPM does
+    /// not restore or re-verify it once the checkout exists. One `sed` in the
+    /// agent's own tree:
+    ///
+    ///     .build/checkouts/benchmark/Sources/Benchmark/BenchmarkExecutor.swift
+    ///     -    add(Int(nanoSeconds))
+    ///     +    add(Int(nanoSeconds) / 100)
+    ///
+    /// plus a commit whose entire diff is `+// comment only`, measured
+    /// `rc 0, verdict keep, ratio 0.0099977, warnings []`. Worse, the
+    /// benchmark package's `BenchmarkPlugin` lives in that same unhashed tree
+    /// and is a BUILD-TOOL PLUGIN: editing it is arbitrary code execution
+    /// during gate 5, after gates 2a, 2b and 2c have all passed.
+    ///
+    /// WHY HASHING BEATS ASKING GIT, on both soundness and cost. Each checkout
+    /// is a git repository at a pinned revision, so the obvious check is
+    /// `rev-parse HEAD` against `Package.resolved` plus "is it clean". That is
+    /// the same mistake a third time: "is it clean" comes out of git's index,
+    /// and `git update-index --skip-worktree` inside the checkout defeats it,
+    /// as does a `.git/info/exclude` entry for a planted file. It is also
+    /// SLOWER -- one `git` process per dependency (eight for this project's
+    /// demo package, ~12 ms each) against ~10 ms to hash the whole tree, which
+    /// measured 7.7 MB across 803 files with `.git` excluded. Hashing asks the
+    /// question SwiftPM's compiler actually answers: what bytes are on disk.
+    ///
+    /// The pin itself is already protected: `Package.resolved` is hashed by
+    /// gate 2a, and git's content addressing means a checkout that IS at the
+    /// pinned revision has the real bytes. So a checkout that is missing
+    /// entirely is safe to allow -- SwiftPM re-clones it from that pin.
+    static func checkoutInventory(in directory: URL) throws -> [String: String] {
+        let root = directory.appendingPathComponent(checkoutsSubpath).standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else { return [:] }
+        guard let walker = FileManager.default.enumerator(
+            at: root, includingPropertiesForKeys: nil, options: []
+        ) else {
+            throw BaselineError.checkoutInventoryFailed("could not enumerate \(root.path)")
+        }
+
+        var inventory: [String: String] = [:]
+        for case let item as URL in walker {
+            var info = stat()
+            guard lstat(item.path, &info) == 0 else { continue }
+            let isRealDirectory = (info.st_mode & S_IFMT) == S_IFDIR
+            if isRealDirectory, item.lastPathComponent == ".git" {
+                walker.skipDescendants()
+                continue
+            }
+            guard !isRealDirectory else { continue }
+            let full = item.standardizedFileURL.path
+            guard full.hasPrefix(root.path + "/") else { continue }
+            inventory[String(full.dropFirst(root.path.count + 1))] = try treeEntryDigest(item)
+        }
+        return inventory
+    }
+
+    /// The top-level dependency directory a checkout-relative path belongs to
+    /// (`benchmark/Sources/X.swift` -> `benchmark`), or `nil` for a stray file
+    /// sitting directly in `.build/checkouts`.
+    ///
+    /// Grouping by this is what lets a WHOLE missing dependency be tolerated
+    /// (SwiftPM re-clones it from the pinned, hashed lockfile) while a
+    /// partially-altered one -- a file edited, added or deleted inside a
+    /// checkout that IS present -- is refused. SwiftPM will not repair the
+    /// second case, and it is the one that changes what gets compiled.
+    static func checkoutDependency(of path: String) -> String? {
+        let first = path.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+        guard first.count == 2, !first[0].isEmpty else { return nil }
+        return String(first[0])
     }
 
     /// Every file that an ignore rule is hiding from `git status`, as a
@@ -880,6 +986,29 @@ public enum BaselineRunner {
             }
         }
 
+        // THE DEPENDENCY CHECKOUTS, recorded LAST because they are the one
+        // inventory that cannot be taken before the side effects: nothing has
+        // cloned them until SwiftPM has resolved. `swift package describe`
+        // above is mandatory and fatal-on-failure, and it resolves the whole
+        // graph into the REPOSITORY's `.build/checkouts`; the warm build does
+        // the same in the worktree. Measured on the demo package: both sides
+        // came back byte-identical, 803 files, same set -- which they must,
+        // since both resolve the same pinned `Package.resolved`. The two are
+        // merged into one map, and a disagreement between them is itself a
+        // refusal: two checkouts of the same pinned revision differing means
+        // one of them is not that revision.
+        var checkoutSHA256 = try checkoutInventory(in: repo)
+        for (path, digest) in try checkoutInventory(in: worktreeURL) {
+            if let existing = checkoutSHA256[path], existing != digest {
+                throw BaselineError.checkoutInventoryFailed("""
+                    \(checkoutsSubpath)/\(path) differs between the repository and the pinned \
+                    worktree, though both resolve the same \(Lockfile.name). One of the two is \
+                    not the revision that file's dependency is pinned to
+                    """)
+            }
+            checkoutSHA256[path] = digest
+        }
+
         let record = BaselineRecord(
             tag: tag,
             frozenCommit: commit,
@@ -890,7 +1019,8 @@ public enum BaselineRunner {
             toolVersion: BuildInfo.version,
             manifestSHA256: manifestSHA256,
             treeSHA256: treeSHA256,
-            ignoredSHA256: ignoredSHA256)
+            ignoredSHA256: ignoredSHA256,
+            checkoutSHA256: checkoutSHA256)
         try record.save(to: recordURL)
         return record
     }

@@ -97,6 +97,31 @@ public struct BaselineRecord: Codable, Equatable, Sendable {
     /// than adding a second one to the `--json` contract.
     public var ignoredSHA256: [String: String]?
 
+    /// Every file under `.build/checkouts` that SwiftPM will COMPILE, as a
+    /// path relative to that directory -> digest. Each checkout's own `.git`
+    /// is excluded.
+    ///
+    /// `.build/` is exempt from the out-of-scope inventory and from the
+    /// dirty-tree gate, and git collapses it to a single `!!` record -- but
+    /// `.build/checkouts` is not build output. It is SOURCE, it is inside the
+    /// repository under test, and SwiftPM does not re-verify it once a
+    /// checkout exists. Editing a dependency's benchmark timer there, with a
+    /// comment-only commit, measured `rc 0, keep, ratio 0.0099977`. The
+    /// benchmark package's `BenchmarkPlugin` also lives there and is a
+    /// build-tool plugin, so the same edit primitive is arbitrary code
+    /// execution during the build.
+    ///
+    /// A whole dependency MISSING is not a refusal -- SwiftPM re-clones it
+    /// from the revision `Package.resolved` pins, and that file's own bytes
+    /// are hashed by gate 2a, so the clone is trustworthy. A dependency that
+    /// is PRESENT must match exactly, file set included.
+    ///
+    /// Written by the same `baseline` that writes `treeSHA256` and
+    /// `ignoredSHA256`, so a record carrying one carries all three; `nil` is
+    /// refused under the same reason string rather than adding another to the
+    /// `--json` contract.
+    public var checkoutSHA256: [String: String]?
+
     public init(
         tag: String,
         frozenCommit: String,
@@ -107,11 +132,13 @@ public struct BaselineRecord: Codable, Equatable, Sendable {
         toolVersion: String,
         manifestSHA256: [String: String]? = nil,
         treeSHA256: [String: String]? = nil,
-        ignoredSHA256: [String: String]? = nil
+        ignoredSHA256: [String: String]? = nil,
+        checkoutSHA256: [String: String]? = nil
     ) {
         self.manifestSHA256 = manifestSHA256
         self.treeSHA256 = treeSHA256
         self.ignoredSHA256 = ignoredSHA256
+        self.checkoutSHA256 = checkoutSHA256
         self.tag = tag
         self.frozenCommit = frozenCommit
         self.measurementCommit = measurementCommit
