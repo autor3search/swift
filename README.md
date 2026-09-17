@@ -109,7 +109,10 @@ repository under test; anything it can write, it will eventually write. If the
 frozen snapshots, the baseline record or the pinned worktree lived in-repo,
 tampering with them would make every experiment return KEEP. So they live under
 the platform cache directory, in a directory named by a SHA-256 of the
-repository's absolute path:
+repository's absolute path — **which moves them out of the agent's stated working
+set, not out of its reach.** They are plain files owned by the same user; read
+[the threat model](#the-harness-defends-against-an-agent-that-edits-the-repository-not-against-one-that-edits-the-harnesss-own-state)
+before you treat that as a security boundary.
 
 ```
 ~/Library/Caches/autor3search-swift/fbff97c237a80426/readme/
@@ -363,7 +366,8 @@ built or measured — a `FAIL` from them costs seconds, not minutes.
 | 1 | **Scope.** Every path changed between `frozenCommit` and `HEAD` must match a `scope` glob. Any change to `Package.swift` or `Package.resolved` is rejected outright, regardless of scope. | `out_of_scope`, `manifest_change_rejected` |
 | 2 | **Config integrity.** SHA-256 of `.autor3search/config.yaml` must equal what `baseline` recorded. | `config_hash_mismatch` |
 | 2a | **Manifest integrity, by hash.** `Package.swift` and `Package.resolved` *as they are on disk*, plus every manifest in the recorded inventory (nested `Sub/Package.swift`, `Package@swift-6.0.swift`, anything under `.swiftpm/`), must hash to what `baseline` recorded — and a manifest *appearing* where baseline recorded none is itself a mismatch. | `manifest_change_rejected`, `baseline_predates_manifest_inventory` |
-| 2b | **Clean working tree**, as `git status --porcelain` defines clean. `eval` builds and measures the *working tree*, while gate 1 inspects *commits*. An uncommitted edit would be measured but never gated. **`--porcelain` omits ignored files**, so a source file matched by a `.gitignore` rule is not reported, compiles, and is measured. | `dirty_working_tree` |
+| 2b | **Clean working tree**, read with `git status --porcelain --ignored` — ignored files included, because plain `--porcelain` omits them and a planted gitignored source compiles and is measured. `eval` builds and measures the *working tree*, while gate 1 inspects *commits*. Ignored files are **recorded at baseline, not banned**: one that was already there is part of the honest starting point, and only one that **appears, changes or disappears after the freeze** is refused — the pinned worktree is a checkout of a *commit* and can never contain it, so it exists on the candidate side alone. The harness's own outputs (`.build/`, `results.tsv`, `run.log`, `.autor3search/profiles/`) are excluded; they change every eval by design. | `dirty_working_tree` |
+| 2c | **Out-of-scope files, by content.** Every file outside `scope` is hashed at baseline and re-walked here. Gate 1 asks git what changed; gate 2c asks the disk. | `out_of_scope`, `baseline_predates_tree_inventory` |
 | 3 | **Restore frozen files.** Every file in every frozen test and benchmark target is restored from the snapshot, byte for byte. | `frozen_restore_refused` |
 | 4 | **Reject new files** appearing in any frozen target directory. | `new_test_or_benchmark_file` |
 | 5 | **Release build.** `swift build -c release`, plus the benchmark target and `BenchmarkTool` by name. | `build_failed`, `build_timed_out` |
@@ -372,17 +376,30 @@ built or measured — a `FAIL` from them costs seconds, not minutes.
 | 8 | **Measure.** Interleaved, `count` rounds per side, baseline and candidate alternating, one discarded warm-up sample per side. | — |
 | 9 | **Score.** The three-part rule below. | `no_significant_improvement`, `improvement_below_min_effect`, `significant_regression` |
 
-Gate 2a is not redundant with gates 1 and 2b. Both of those read the git index,
-so `git update-index --assume-unchanged Package.swift` hides a rewrite from
-both — while `swift build`, which reads the file on disk, still compiles it. The
-prize is `-Ounchecked`: a "win" with bounds checking turned off rather than
-faster code. A hash cannot be talked out of noticing.
+**Gates 2a and 2c exist because git's view of a repository is not the disk, and
+the adversary owns git's view.** Gate 1 derives what changed from
+`git diff --name-only`; `swift build` compiles what is on the filesystem. Every
+way of separating those two is a bypass, and three were demonstrated: an ignored
+file git does not list, an `.git/info/exclude` rule with no repository file at
+all, and `git update-index --assume-unchanged` on a tracked file so git keeps
+reporting the old bytes. So the path-based checks are now a **first-line
+filter**, not the boundary. The boundary is content: gate 2a hashes every
+manifest on disk, gate 2c hashes every file outside `scope`, and gate 2b reads
+the ignored set as well as the untracked one. **A hash cannot be talked out of
+noticing.**
+
+`scope` still says what the agent may change. It is no longer asked to say what
+*did* change.
 
 Gate 3's snapshot and restore both `lstat` every path. A symlinked file is
 refused at snapshot time and at restore time, loudly, rather than written
 through; paths are normalized and rejected if absolute or containing `..`.
 Without that, an agent that plants a symlink mid-run converts an unattended
-restore into an arbitrary-file-overwrite primitive on your machine.
+restore into an arbitrary-file-overwrite primitive on your machine. Restore also
+verifies every stored file against the hash the baseline manifest recorded, as a
+separate pass over the whole manifest before the first byte is written — so a
+tampered file discovered halfway through cannot leave the first half of the
+frozen set already restored from a source the harness does not trust.
 
 ## What the harness enforces
 
@@ -398,8 +415,11 @@ Every row is a way to make the number go down without making the code faster.
 | Plant a *nested* manifest git never saw | Gate 2a's inventory refuses a manifest appearing where baseline recorded none. |
 | Move the dependency pin | `Package.resolved` is in the same rejection as `Package.swift`; `init` refuses to configure a repository whose lockfile is gitignored. |
 | Edit `.autor3search/config.yaml` — widen scope, drop a benchmark, lower `min_effect_pct` | Gate 2 compares its SHA-256 against the baseline record. |
-| Measure an uncommitted edit | Gate 2b refuses a tree that `git status --porcelain` reports as dirty. That listing **omits ignored files**, so a source file matching a `.gitignore` rule is not reported, compiles, and is measured. Untracked-but-not-ignored files *are* caught. |
-| Tamper with the frozen snapshot, the baseline record, or the pinned worktree | They live outside the repository, so the *scope gate* does not apply to them — **that is a boundary, not a defence.** See [the threat model](#what-the-harness-does-not-defend-against). |
+| Measure an uncommitted edit | Gate 2b reads `git status --porcelain --ignored`, so it sees ignored files as well as untracked ones. |
+| Plant a source file that a `.gitignore` rule hides from `git status` | Gate 2b, against an ignored-file inventory taken at baseline: a file that **appears or changes after the freeze** is refused. Plain `--porcelain` omits ignored files, and a committed `Sources/Demo/.gitignore` containing `*.gen.swift` is an in-scope, non-manifest change gate 1 waves through — measured, that bought `keep` at ratio 0.11298 on a planted file. `.git/info/exclude` does the same with no repository file at all, and is caught the same way. |
+| Hide a change to an **out-of-scope** file from git (`--assume-unchanged`) | **Gate 2c**, an on-disk inventory of every file outside `scope`, hashed at baseline and re-walked every eval. Gate 1 could not: it asks git what changed, and the agent owns git's view of its own repository. Measured before the fix: a **comment-only** commit returning `keep`, rc 0, **ratio 0.000737**, because an out-of-scope benchmark helper's `repeatCount` had been edited from 1750 to 1 behind git's back. |
+| Tamper with the **stored** frozen files | Gate 3 verifies every file in the store against the SHA-256 the baseline manifest recorded, across the whole manifest, before writing a byte. Measured before the fix: one `sed -i` on the stored benchmark made `eval` install it into the repository and then measure it — `keep`, rc 0, **ratio 0.000717**. |
+| Tamper with `baseline.json` or `frozen-manifest.json` themselves | **Nothing.** They are unauthenticated JSON, same directory, same uid. This is the stated boundary, not an oversight — see [the threat model](#the-harness-defends-against-an-agent-that-edits-the-repository-not-against-one-that-edits-the-harnesss-own-state). |
 | Swap a frozen file for a symlink so the restore overwrites something else | Gate 3 refuses, records `frozen_restore_refused`, and taints the run so every later eval refuses until a human clears it. |
 | Coast on an earlier win | The measurement point advances on KEEP. See [The two commits](#the-two-commits). |
 | Conditionally skip a test from optimizable code | `doctor` scans for `.enabled(if:)`, `.disabled(if:)`, `XCTSkip` and `ConditionTrait`, in test targets *and* in non-test sources. **This one is not closed.** See [limitation 1](#1-gate-6-runs-your-tests-and-that-is-the-softest-link-in-the-chain). |
@@ -411,28 +431,66 @@ Everything above is about a **commit**. That is the boundary, and it is worth
 stating where it ends rather than letting an absence of discussion read as a
 guarantee.
 
-**The harness assumes the agent runs as a process that does not attack the
-machine it runs on.** The frozen snapshot, the baseline record and the pinned
-worktree live under `~/Library/Caches/autor3search-swift/…` (or
-`AUTOR3SEARCH_SWIFT_STATE_HOME`). They are *plain files, owned by the same user
-as the agent*, and `baseline.json` is unauthenticated JSON. Being outside the
-repository puts them outside the scope gate — nothing more. Anything that can
-write as that user can edit `measurementCommit` in `baseline.json` and reproduce
-the coasting bug the two-commit design exists to prevent; nothing in the harness
-would notice, and the gate list above does not claim otherwise.
+### The harness defends against an agent that edits the repository, not against one that edits the harness's own state
 
-**The reason this is a boundary and not a hole to be plugged:** the same process
-can also rewrite the tool's own binary, the toolchain, or the benchmark's
-`.build` directory. A MAC over the baseline record would have to be keyed by
-something that process cannot read, and there is nowhere to put such a key that
-the agent's own user cannot reach. Signing state against an attacker who already
-runs as you is theatre.
+That is the boundary. It is one sentence, it is load-bearing, and everything
+else in this section is why it cannot be moved.
+
+The frozen snapshot, the baseline record and the pinned worktree live under
+`~/Library/Caches/autor3search-swift/…` (or `AUTOR3SEARCH_SWIFT_STATE_HOME`).
+They are **plain files, mode `0644`, owned by the same user as the agent**.
+Being outside the repository puts them outside the *scope gate* — nothing more.
+
+One hole here has been closed. `FrozenSnapshot.restore` used to copy stored bytes
+into your repository without ever comparing them to the SHA-256 the baseline
+manifest had already recorded for them, so a single `sed -i` on the *stored*
+benchmark made `eval` install the attacker's benchmark into the repository and
+then measure it — **rc 0, `keep`, ratio 0.000717**, on a benchmark the repository
+itself never contained. Restore now verifies the whole manifest against the
+recorded hashes *before writing a single byte*, and refuses with
+`frozen_restore_refused`.
+
+**What that does not close, and cannot be closed cheaply:**
+
+- `frozen-manifest.json` holds the very hashes that check compares against, in
+  the same directory, same user, same mode. An attacker who edits the stored file
+  **and** its recorded hash passes.
+- `baseline.json` is plain JSON in the same place. Editing `measurementCommit`
+  back to `frozenCommit` reproduces the coasting bug outright — every later no-op
+  scored against the run's original slow binary.
+
+**Why there is no cheap fix.** Any MAC needs a key the attacker cannot read, and
+the attacker runs as the same uid with a shell. A key stored beside the data is
+readable; a key derived from the data is forgeable; a self-hash is theatre. The
+same process can also rewrite the tool's own binary, the toolchain, and the
+`.build` directory it measures. There is no version of this that is solved in
+software on the agent's own account.
+
+**The real fixes are operational, and they are the operator's job.** If the
+assumption above is wrong for your deployment — if the agent is genuinely
+untrusted rather than merely fallible — run the harness under a **different
+uid**, or make the state root **read-only to the agent's uid**, and point
+`AUTOR3SEARCH_SWIFT_STATE_HOME` at it. The harness will not do this for you and
+does not pretend to.
 
 So: run this against code you are willing to have compiled and executed, in a
 directory you are willing to have written to, by an agent you are supervising to
 the degree the work deserves. What the gates give you is that **the commit that
 gets kept is the commit that was measured**, on criteria that did not move while
-it was measured. That is a real property and it is not this one.
+it was measured. That is a real property. It is not this one.
+
+### Re-baselining is required after upgrading
+
+A `baseline.json` written before the out-of-scope tree inventory existed has no
+`treeSHA256`, and `eval` refuses it with **`baseline_predates_tree_inventory`**
+rather than skipping the check. Run `baseline` again under a new tag.
+
+That refusal is deliberate and is the same rule as
+`baseline_predates_manifest_inventory`: *"there is no record"* must never be
+allowed to read as *"there is nothing to check"*. Silently accepting an old
+record would restore exactly the hole the inventory closes. It is stated here
+because an upgrade that starts refusing every eval is an unpleasant surprise to
+diagnose from the reason string alone.
 
 A benchmark's **ratio** is `candidateMedian / baselineMedian` — below 1.0 is
 faster. The **score** is the geometric mean of the per-benchmark ratios.
@@ -643,7 +701,13 @@ source file, commits *that one path*, runs `eval`, classifies by exit code, and
 resets. Any KEEP is a false positive by construction. `count` was the shipped
 default of 10 in both arms and was deliberately not tuned.
 
-| Arm | Scale | Spurious KEEPs | 95% Clopper-Pearson CI |
+> **These 200 trials were run at the PREVIOUS defaults — `alpha: 0.05`,
+> `min_effect_pct: 1.0`.** They are not a measurement of what ships today.
+> **No false-KEEP rate has been measured at the current defaults**
+> (`alpha: 0.005`, `min_effect_pct: 3.0`). Read every figure in this section
+> with that attached.
+
+| Arm (at `alpha: 0.05`, `min_effect_pct: 1.0` — the **old** defaults) | Scale | Spurious KEEPs | 95% Clopper-Pearson CI |
 |---|---|---|---|
 | **A** — the shipped fixture, input repeated 1750× | ~3.60 ms / iteration | **0 / 100** | **0.00% – 3.62%** |
 | **B** — the identical code, input repeated 25× | ~54 µs / iteration | **1 / 100** | **0.03% – 5.45%** |
@@ -665,16 +729,20 @@ warning, on a commit whose only change was one comment line. Largest excursion
 **3.215%**, mean ratio **0.99835** — *biased* toward the candidate, not noise
 about 1.0.
 
-**Both arms were run at the previous defaults** (`alpha: 0.05`,
-`min_effect_pct: 1.0`), and the numbers above are that run, unedited. It is
-worth reading them against today's defaults, because they are *why* the defaults
-moved: arm B's false KEEP at `p = 0.03546` does not clear `alpha = 0.005`, and
-its `ratio 0.98853` — a 1.15% "win" — does not clear a 3.0% effect floor either.
-Both criteria now reject it, independently. That is a statement about what the
-shipped rule would have done to one measured observation, not a claim of a new
-measured rate: **no false-KEEP rate has been measured at the new defaults.** The
-0/100 and 1/100 above remain the only measured figures this README has, and they
-describe the old rule.
+**What today's defaults would have done to that one false KEEP.** Arm B's
+`p = 0.03546` does not clear `alpha = 0.005`, and its `ratio 0.98853` — a 1.15%
+"win" — does not clear a 3.0% effect floor either. Both criteria reject it, and
+independently. The same is true of arm A's two near-misses (`p 0.03546` and
+`p 0.02881`, both above 0.005).
+
+**That is an argument, not a measurement, and the distinction matters here.**
+Every KEEP the new rule admits is one the old rule also admitted — the new
+thresholds are strictly tighter on both criteria — so the true rate at the new
+defaults *cannot be higher* than the rate above. But "cannot be higher than a
+figure whose own 95% upper bound is 3.62%" is a much weaker statement than a
+measured rate, and it is the only one this README is entitled to make. **The
+0/100 and 1/100 remain the only measured false-KEEP figures here, and they
+describe the old rule.**
 
 **The false-KEEP rate is not a constant of the tool.** It is a property of the
 tool *and* the benchmark you point it at. A benchmark that runs in tens of
@@ -771,22 +839,30 @@ not more.
 ### 3. Freeze detection keys on the `Benchmark` product dependency
 
 A benchmark *helper* target that does not itself depend on the `Benchmark`
-product is **not frozen**. Keeping it out of `scope` is the mitigation, and
-earlier versions of this README said `scope` *closed* the hole. It does not.
+product is **not frozen**. Earlier versions of this README said `scope` closed
+the resulting hole. **That was false, and it was demonstrated false.**
 
-Gate 1 compares the paths git reports as changed between `frozenCommit` and
+Gate 1 compares the paths *git reports* as changed between `frozenCommit` and
 `HEAD`. `git update-index --assume-unchanged <helper>` makes git stop reporting
-that file, so an edit to an out-of-scope helper is invisible to gate 1 — and
-gate 2b, which reads `git status --porcelain`, does not see it either. The file
-is still on disk and is still compiled into the benchmark. Gate 2a closes this
-for *manifests*, because it hashes the bytes on disk rather than asking git; no
-equivalent inventory exists for source files.
+that file, so an edit to an out-of-scope helper was invisible to gate 1 — and to
+gate 2b, which was reading `git status --porcelain`. The file stayed on disk and
+was still compiled into the benchmark. Measured on the real binary: editing an
+out-of-scope helper's `benchmarkRepeatCount` from 1750 to 1 behind git's back,
+then committing **one comment line** to an in-scope file, returned `keep` with
+**rc 0 and ratio 0.000737**.
 
-So the honest statement is: **out-of-scope benchmark support code is neither
-frozen nor reliably gated.** If you have benchmark fixtures in their own target,
-the real mitigations are to fold them into the frozen benchmark target (give
-that target the `Benchmark` product dependency) or to review the helper by hand
-before trusting a run. `scope` narrows the attack; it does not end it.
+**What closes it is gate 2c, not `scope`:** an on-disk inventory of every file
+outside `scope`, hashed when `baseline` runs and re-walked on every eval. Any
+out-of-scope file that is added, modified or removed is refused as `out_of_scope`
+regardless of what git says about it. The same attack now returns rc 2, `fail`,
+`k: 0`, naming the helper and both hashes.
+
+So the honest statement is: **`scope` declares what the agent may change; it is
+no longer trusted to detect what did change.** Out-of-scope helpers are still not
+*frozen* — nothing restores them, and a legitimate edit to one requires a new
+baseline — but they can no longer be edited without the harness noticing. If you
+want a helper genuinely frozen and restored, fold it into the benchmark target
+so it carries the `Benchmark` product dependency.
 
 ### 4. Manifest protection: what is and is not covered
 
@@ -804,6 +880,14 @@ recorded none. Not covered:
 - The inventory is recorded at `frozenCommit` and **never refreshed on KEEP**.
   That is deliberate: it must not advance. It also means a *legitimate* manifest
   change requires a new baseline.
+
+One case that *was* open here is now covered from the other direction. Gate 2a's
+"is this a manifest" test is deliberately case-**sensitive**, which is right for
+paths git reports — but APFS is case-insensitive, so SwiftPM honours
+`PACKAGE@SWIFT-6.4.SWIFT` as a real version-specific manifest while that test
+does not match the spelling. Gate 2c does not care what a file is called: it is
+outside `scope`, so it appears as an extra file and is refused on that basis.
+Two gates asking different questions is what catches it; neither would alone.
 
 ### 5. A deliberate new false-positive surface
 
