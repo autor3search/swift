@@ -75,11 +75,25 @@ private final class CommitAwareSource: MetricSource, @unchecked Sendable {
     // A genuine win is kept; the measurement point must move to it.
     try makeInScopeCommit(repo, "fast")
     let kept = try git.head()
-    _ = try EvalRunner.run(repo: repo, env: env,
-                           source: CommitAwareSource(originalCommit: record.frozenCommit),
-                           now: Date.init)
+    // THE VERDICT IS KEPT AND REPORTED, not discarded. This test binds the
+    // project's signature property, and when it failed intermittently under a
+    // full parallel suite the only thing anyone had was its NAME: the advance
+    // happens only on KEEP, so any gate refusing for an unrelated reason fails
+    // the assertion below while saying nothing about why. A test that cannot
+    // explain its own failure cannot be diagnosed from a CI log.
+    let verdict = try EvalRunner.run(repo: repo, env: env,
+                                     source: CommitAwareSource(originalCommit: record.frozenCommit),
+                                     now: Date.init)
+    #expect(verdict.kind == .keep, """
+        the eval did not KEEP, so the advance below could not happen: \
+        verdict=\(verdict.kind.rawValue) reason=\(verdict.reason ?? "nil") \
+        warnings=\(verdict.warnings.map { String($0.prefix(300)) })
+        """)
     let after = try BaselineRecord.load(home.baselineRecordURL(tag: "t"))
-    #expect(after.measurementCommit == kept, "measurement baseline did not advance on KEEP")
+    #expect(after.measurementCommit == kept, """
+        measurement baseline did not advance on KEEP (verdict=\(verdict.kind.rawValue) \
+        reason=\(verdict.reason ?? "nil"))
+        """)
     #expect(after.frozenCommit == record.frozenCommit,
             "the frozen commit must NEVER advance: moving the measurement point must not move the success criteria")
 }

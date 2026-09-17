@@ -237,8 +237,14 @@ private func scratch() throws -> URL {
     let v = try EvalRunner.run(repo: repo, env: env, source: CountingStub(), now: Date.init)
     #expect(v.reason != "worktree_integrity",
             "a dirty worktree must be repaired, not refused forever: \(v.reason ?? "nil")")
-    #expect(try String(contentsOf: helper, encoding: .utf8) == original,
-            "and the repair must actually have happened")
+    // The verdict is quoted here too. When this failed intermittently alongside
+    // `measurementCommitAdvancesAfterAKeep` under a full parallel suite, the
+    // second assertion carried no diagnostics at all, so a red CI log said only
+    // that two strings differed.
+    #expect(try String(contentsOf: helper, encoding: .utf8) == original, """
+        the repair did not happen: verdict=\(v.kind.rawValue) reason=\(v.reason ?? "nil") \
+        warnings=\(v.warnings.map { String($0.prefix(300)) })
+        """)
 }
 
 private final class CountingStub: MetricSource, @unchecked Sendable {
