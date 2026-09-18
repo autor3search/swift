@@ -68,14 +68,41 @@ private func execRepo() throws -> URL {
 /// deliberate edit to a test rather than a quiet change, and so the keys that
 /// CANNOT be denied stay written down next to the ones that can.
 @Test func theExecutionDenialListCoversTheDocumentedKeys() {
+    // EXHAUSTIVE, NOT A SAMPLE. This pinned 17 of the 21 keys and therefore did
+    // not do the one job it exists for: four could have been dropped silently,
+    // and the count in the prose had already drifted from the code. Equality
+    // against the whole set means adding or removing a key is a deliberate edit
+    // in two places.
+    let expected: Set<String> = [
+        // Hooks, and the file-system monitor that is not a hook.
+        "core.hooksPath", "core.fsmonitor",
+        // Programs git runs for refs, transport and credentials.
+        "core.alternateRefsCommand", "core.sshCommand", "core.gitProxy",
+        "core.askPass", "credential.helper",
+        // Programs git runs to show a human something. Never reached without a
+        // tty, which is exactly why they are easy to forget.
+        "core.pager", "core.editor", "sequence.editor",
+        // External diff.
+        "diff.external", "interactive.diffFilter",
+        // Signing, reachable if a repository sets `commit.gpgSign`.
+        "gpg.program", "gpg.openpgp.program", "gpg.x509.program", "gpg.ssh.program",
+        "gpg.ssh.defaultKeyCommand",
+        // Maintenance and server-side hooks ordinary commands can trigger.
+        "gc.recentObjectsHook", "uploadpack.packObjectsHook",
+        // Not execution themselves, but the out-of-tree door to the filter and
+        // ignore machinery that is.
+        "core.attributesFile", "core.excludesFile",
+    ]
+    #expect(expected.count == 21, "the pinned set is itself the wrong size")
     let denied = Set(Git.executionDenialKeys)
-    for key in ["core.hooksPath", "core.fsmonitor", "core.alternateRefsCommand",
-                "core.sshCommand", "core.gitProxy", "core.askPass", "credential.helper",
-                "core.pager", "core.editor", "sequence.editor", "diff.external",
-                "interactive.diffFilter", "gpg.program", "gc.recentObjectsHook",
-                "uploadpack.packObjectsHook", "core.attributesFile", "core.excludesFile"] {
-        #expect(denied.contains(key), "\(key) is no longer denied")
-    }
+    #expect(denied == expected, """
+        the denial list changed without this test changing. \
+        added=\(denied.subtracting(expected).sorted()) \
+        removed=\(expected.subtracting(denied).sorted())
+        """)
+    #expect(Git.executionDenialKeys.count == 21,
+            "duplicate keys would make the set match while the list differs")
+
     // And the honest other half: per-name keys a `-c` cannot reach.
     #expect(Git.undeniableWildcardFamilies.contains("filter.<name>.clean"))
     #expect(Git.undeniableWildcardFamilies.contains("diff.<name>.textconv"))

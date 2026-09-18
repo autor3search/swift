@@ -887,16 +887,24 @@ public enum EvalRunner {
         }
     }
 
-    /// The four executables gate 8 launches: the benchmark target and
-    /// `BenchmarkTool`, on each side.
+    /// The two executables gate 8 launches out of ONE side: the benchmark
+    /// target and `BenchmarkTool`.
+    ///
+    /// Per-side, because each side is snapshotted immediately after ITS OWN
+    /// build and the two builds are far apart in the gate chain -- gate 5 for
+    /// the candidate, gate 7 for the baseline -- with `swift test` in between.
+    static func measuredBinaries(in directory: URL, benchmarkTarget: String) -> [URL] {
+        [benchmarkTarget, "BenchmarkTool"].map {
+            directory.appendingPathComponent(".build/release/\($0)")
+        }
+    }
+
+    /// The four executables gate 8 launches, both sides.
     static func measuredBinaries(
         baselineWorktree: URL, candidateWorktree: URL, benchmarkTarget: String
     ) -> [URL] {
-        [baselineWorktree, candidateWorktree].flatMap { directory in
-            [benchmarkTarget, "BenchmarkTool"].map {
-                directory.appendingPathComponent(".build/release/\($0)")
-            }
-        }
+        measuredBinaries(in: baselineWorktree, benchmarkTarget: benchmarkTarget)
+            + measuredBinaries(in: candidateWorktree, benchmarkTarget: benchmarkTarget)
     }
 
     /// Deletes the measured binaries on both sides, so a poisoned one cannot
@@ -1411,6 +1419,43 @@ public enum EvalRunner {
             return fail(failure)
         }
 
+        // ---- THE CANDIDATE SIDE IS SNAPSHOTTED HERE, BEFORE GATE 6 ----
+        //
+        // Round 9 moved the snapshot to sit immediately after the last BASELINE
+        // build, on the principle that nothing able to run a program may sit
+        // between a build and the snapshot that vouches for it. That principle
+        // was applied to one side only, and the other side had a bigger hole:
+        // gate 6 below runs `swift test`, which is THE AGENT'S CODE BY
+        // CONSTRUCTION, and the candidate's binaries were not snapshotted until
+        // long after it.
+        //
+        // Measured 4/4 at shipped defaults, with an in-scope commit whose
+        // `countWords` is the byte-identical quadratic original plus a lazy
+        // global that fires only when `argv[0]` is not under `/release/` -- i.e.
+        // during the test phase -- and copies a pre-staged fast `Bench` over
+        // `<repo>/.build/release/Bench`:
+        //
+        //     rc 0  keep  k 1  ratio 0.11086  p 1.0825e-05  warnings []
+        //
+        // The guard then hashed the SWAPPED binary and adopted it as its own
+        // reference, so every per-sample check matched. The tree was byte-clean
+        // and all nine gates passed.
+        //
+        // `purge_build_output` did not close it and could not: it purges at
+        // gate 4b, BEFORE the build, so it discards a poisoned artifact from a
+        // previous eval and has nothing to say about one written during this
+        // one.
+        //
+        // Snapshotting here rather than re-verifying after the tests: the two
+        // detect the same thing, but this way each side's reference is taken at
+        // the only moment it is known good -- the instant its build finished --
+        // and there is one rule for both sides instead of a rule and an
+        // exception. Nothing legitimately rewrites these two files between here
+        // and gate 8: `swift test` builds DEBUG products, and the only other
+        // builds are the baseline side's, in a different directory.
+        let candidateDigests = MeasuredBinaryGuard.digests(
+            of: measuredBinaries(in: repo, benchmarkTarget: config.benchmarkTarget))
+
         let tests = try Subprocess.run(swift, ["test"], cwd: repo,
                                        env: SanitizedEnvironment.forTools(), timeout: timeout)
         if tests.timedOut {
@@ -1586,9 +1631,14 @@ public enum EvalRunner {
         // reports rather than a value it adopts. Same rule as round 5, applied
         // to the snapshot instead of the check: take it after the last thing
         // that legitimately changes it, not after the last thing that happens.
-        let measuredBinaryDigests = MeasuredBinaryGuard.digests(
-            of: measuredBinaries(baselineWorktree: worktree, candidateWorktree: repo,
-                                 benchmarkTarget: config.benchmarkTarget))
+        //
+        // SYMMETRY: the candidate's half was taken at gate 5, the instant ITS
+        // build finished and before `swift test` ran the agent's code. Only the
+        // baseline's half is taken here, and the two are combined. Re-hashing
+        // the candidate here instead would re-adopt whatever gate 6 left
+        // behind, which is exactly the sixteenth vector.
+        let measuredBinaryDigests = candidateDigests + MeasuredBinaryGuard.digests(
+            of: measuredBinaries(in: worktree, benchmarkTarget: config.benchmarkTarget))
 
         // SwiftPM can leave files outside `.build` behind (a freshly written
         // `Package.resolved` for a package with a source-control dependency),

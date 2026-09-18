@@ -247,6 +247,68 @@ private func scratch() throws -> URL {
         """)
 }
 
+/// THE SIXTEENTH, in miniature: the candidate's reference must be taken when
+/// ITS build finished, not after gate 6 has run the agent's `swift test`.
+///
+/// Measured end to end before this was symmetric, 3/3 at shipped defaults, with
+/// an in-scope commit whose `countWords` was the byte-identical quadratic
+/// original plus a lazy global firing only in the test runner:
+/// `rc 0 keep ratio 0.11710`, and the post-eval `shasum` of the candidate's
+/// `Bench` equal to a pre-staged fast binary. The guard had hashed the SWAPPED
+/// file and adopted it as its own reference.
+///
+/// `purge_build_output` did not close it and could not: it purges at gate 4b,
+/// BEFORE the build, so it has nothing to say about a write made after it.
+@Test func aCandidateBinarySwappedAfterItsBuildIsCaughtNotAdopted() throws {
+    let baseline = try scratch(), candidate = try scratch()
+    defer {
+        try? FileManager.default.removeItem(at: baseline)
+        try? FileManager.default.removeItem(at: candidate)
+    }
+    _ = try fakeBinaries(baseline, target: "Bench", bytes: "baseline")
+    let victim = try fakeBinaries(candidate, target: "Bench", bytes: "honest candidate")[0]
+
+    // The reference for the candidate side is taken HERE -- the instant its
+    // build finished -- exactly as gate 5 now does.
+    let candidateDigests = EvalRunner.MeasuredBinaryGuard.digests(
+        of: EvalRunner.measuredBinaries(in: candidate, benchmarkTarget: "Bench"))
+    #expect(candidateDigests.count == 2)
+
+    // ...then gate 6 runs the agent's tests, which swap the binary.
+    try "PRE-STAGED FAST BINARY".write(to: victim, atomically: true, encoding: .utf8)
+
+    // ...and only then is the baseline side snapshotted and the guard built.
+    let baselineDigests = EvalRunner.MeasuredBinaryGuard.digests(
+        of: EvalRunner.measuredBinaries(in: baseline, benchmarkTarget: "Bench"))
+    let guardian = EvalRunner.MeasuredBinaryGuard(
+        wrapping: NeverSampled(), digests: candidateDigests + baselineDigests)
+
+    let offender = guardian.check()
+    #expect(offender?.contains(victim.path) == true, """
+        the swapped candidate binary was ADOPTED rather than detected: \(offender ?? "no mismatch")
+        """)
+    #expect(throws: EvalRunner.MeasuredBinaryTampered.self) {
+        _ = try guardian.sample(benchmark: "A", in: candidate, config: makeConfig())
+    }
+}
+
+/// ...and re-hashing the candidate at the later point instead is exactly the
+/// bug: the reference taken after the swap matches the swap.
+@Test func snapshottingTheCandidateAfterTheTestsWouldAdoptTheSwap() throws {
+    let candidate = try scratch()
+    defer { try? FileManager.default.removeItem(at: candidate) }
+    let victim = try fakeBinaries(candidate, target: "Bench", bytes: "honest candidate")[0]
+    try "PRE-STAGED FAST BINARY".write(to: victim, atomically: true, encoding: .utf8)
+
+    let late = EvalRunner.MeasuredBinaryGuard.digests(
+        of: EvalRunner.measuredBinaries(in: candidate, benchmarkTarget: "Bench"))
+    let guardian = EvalRunner.MeasuredBinaryGuard(wrapping: NeverSampled(), digests: late)
+    #expect(guardian.check() == nil, """
+        THE PREMISE of the fix: a reference taken after the swap agrees with the swap, which is \
+        why the candidate must be snapshotted before gate 6 rather than re-hashed after it
+        """)
+}
+
 private final class CountingStub: MetricSource, @unchecked Sendable {
     func sample(benchmark: String, in worktree: URL, config: Config) throws -> Double { 100.0 }
 }
