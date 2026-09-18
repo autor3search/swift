@@ -364,11 +364,12 @@ agent's loop should treat them as "something is wrong with the setup", not
 "that idea did not work".
 
 `eval --json`'s `reason` is a stable, machine-readable string. The full set is
-in the gate table below; five are worth calling out because they are newer than
+in the gate table below; six are worth calling out because they are newer than
 the rest and an agent loop keyed on the older ones will not recognise them:
 
 | `reason` | What it means |
 |---|---|
+| `head_moved_during_eval` | `HEAD` is not the commit gate 1 judged — `swift test`, or a benchmark binary at gate 8, committed during the eval. Refused at gate 6b before any baseline build or sample, so `measurementCommit` never adopts it. |
 | `measured_binary_changed` | One of the four executables gate 8 launches changed its SHA-256 mid-measurement. The eval refuses, **both sides' measured binaries are deleted** so nothing poisoned survives into the next experiment, and the run is tainted until a human clears `run.tainted`. |
 | `dependency_checkout_modified` | A file under `.build/checkouts/` does not match the revision `Package.resolved` pins. |
 | `plugin_cache_not_purged` | `.build/plugins` could not be deleted. **Fail-closed**: a cache that cannot be discarded is a cache that will be reused. |
@@ -398,8 +399,10 @@ built or measured — a `FAIL` from them costs seconds, not minutes.
 | 4b | **Discard the caches no inventory can vouch for.** `.build/plugins` is deleted before every build, on both sides, always: a build-tool plugin is *executed* during the build, and llbuild will reuse a cached one whose sources did not change. `purge_build_output: true` deletes the rest of the build output too. | `plugin_cache_not_purged`, `build_output_not_purged` |
 | 5 | **Release build.** `swift build -c release`, plus the benchmark target and `BenchmarkTool` by name. | `build_failed`, `build_timed_out` |
 | 6 | **Tests.** `swift test` — which builds and runs in **debug**, while everything measured is **release**. See [limitation 9](#9-gate-6-tests-a-debug-build-the-binary-that-is-measured-and-kept-is-release). | `tests_failed`, `tests_timed_out` |
+| 6b | **Re-validate everything gate 6 could have changed.** `swift test` is the agent's code, so every read-only check above runs again here: HEAD equality, `.build/checkouts` on **both** sides, root-manifest hashes, the manifest inventory, the dirty tree, the out-of-scope inventory, and tracked content against HEAD's blobs — then the plugin cache is re-purged on both sides, because gate 4b purged *before* the tests and the worktree's plugins are executed by the gate-7 build. See [the root cause](#the-root-cause-in-one-sentence). | `head_moved_during_eval`, and the reasons of every gate it repeats |
 | 7 | **Worktree integrity.** Checks the pinned worktree is at `measurementCommit` and that git reports it clean, then **restores it unconditionally** before the baseline-side build — clearing any `--assume-unchanged`/`--skip-worktree` flags first, in *separate* `update-index` calls (both in one call exits 0 and does nothing; a forced checkout does not undo `--skip-worktree`). Flags are re-read **after** the checkout, not only before, and contents are then verified by hashing every file against the blob ids the commit records, **not** by asking `git status` — a `.gitattributes` filter driver can make `git status` report a rewritten file as unchanged. Restoring rather than refusing is deliberate: the correct contents are known exactly, and refusing would let one `touch` stop every experiment. Cleared flags surface as a warning; a restore that cannot complete is `worktree_integrity`. | `worktree_integrity` |
 | 8 | **Measure.** Interleaved, `count` rounds per side, baseline and candidate alternating, one discarded warm-up sample per side. | — |
+| 8b | **HEAD again.** The measurement itself runs the agent's benchmark, and a benchmark binary was observed committing during gate 8 — which is what made a poisoned baseline self-renewing. | `head_moved_during_eval` |
 | 9 | **Score.** The three-part rule below. | `no_significant_improvement`, `improvement_below_min_effect`, `significant_regression` |
 
 **Gates 2a and 2c exist because git's view of a repository is not the disk, and
@@ -434,6 +437,86 @@ What remains unhashed is `.build`'s build **output** — `out/`, `plugins/`,
 rebuilt by gate 5. See
 [the build cache](#the-build-cache-is-not-verified) for what that leaves open.
 
+### The root cause, in one sentence
+
+Nine reviews produced nineteen bypasses. Most of the later ones are the same
+defect wearing different faces, and it is worth stating before any of the
+individual stories:
+
+> **A check performed before gate 6 vouches for state consumed after gate 6.**
+> Gate 6 runs `swift test`, which is the agent's code by construction.
+
+Every read-only gate — scope, config, manifests, the dirty tree, the
+out-of-scope inventory, the dependency checkouts — runs before gate 6. Several of
+the things they vouch for are then *used* after it: the baseline side is built at
+gate 7 from checkouts verified at gate 2d, `measurementCommit` is set from a HEAD
+read after measuring, the worktree's build-tool plugins are executed by the gate-7
+build. Between the check and the use sits an execution of arbitrary agent code.
+
+**And the window is wider than gate 6.** Instrumenting one reproduction showed
+the payload firing from two `argv[0]`s — `swiftpm-testing-helper` (gate 6) **and
+`Bench` (gate 8, the measurement itself)**. The gate-8 firing is what made a
+poisoned baseline *self-renewing*: once the pinned worktree held the payload
+commit, the **baseline binary** re-committed the poisoned benchmark on every
+later experiment. That is why the HEAD check runs twice — at **6b** and again at
+**8b**.
+
+#### Why not just move gate 6?
+
+The obvious fix is to reorder, and it does not work — for structural reasons, not
+incidental ones:
+
+- **`swift test` must run *after* gate 3's frozen restore.** Before it, the tests
+  on disk are the candidate's own, and a candidate that weakens its own tests
+  passes a test gate that means nothing. That is the entire purpose of freezing
+  them.
+- **Every read-only integrity gate must run *before* gate 3**, because gate 3 is
+  the first thing in the chain that *writes* to the repository. Checking after it
+  would be checking the harness's own restore.
+
+So gate 6 is pinned between the checks and the state they vouch for. Moving it
+*later* does not help either: it would still precede the advance, so HEAD adoption
+survives, and the baseline binary would by then have been built from whatever the
+tests left behind. **The window can only be closed by re-checking** — which is
+gate **6b**, running immediately after the test phase and re-running HEAD
+equality, `.build/checkouts` on both sides, root-manifest hashes, the manifest
+inventory, the dirty tree, the out-of-scope inventory, and tracked content
+against HEAD's blobs, then re-purging the plugin cache on both sides.
+
+#### What is re-checked, what is not, and why
+
+A published list of what is *not* covered is worth more than a claim that
+everything is. Every pre-gate-6 check, its subject, and whether that subject can
+still move:
+
+| Check | Subject | Mutable after gate 6? | Consumed after gate 6? | Covered by |
+|---|---|---|---|---|
+| run claim (flock) | the lock file | yes, but harness-owned and single-writer | no | n/a |
+| **1** scope, `frozen..HEAD` | HEAD's commit set | **yes** — `swift test` *and* the gate-8 binaries can commit | yes, by the advance | gate 6b + gate 8b + `headUnderTest` |
+| **2** config hash | `config.yaml` bytes | yes | no — values are held in memory | *incidental* (tracked content at 6b) |
+| **2a** root manifests | `Package.swift`, `Package.resolved`, `.swiftpm` | yes | **yes** — the gate-7 build resolves them | re-checked at 6b |
+| **2a** manifest inventory | every manifest in the tree | yes | yes, same | re-checked at 6b |
+| **2b** dirty tree + ignored record | working tree, ignored files | yes | **yes** — the next eval starts here | re-checked at 6b |
+| **2c** out-of-scope inventory | files outside `scope` | yes | repo copy already compiled at gate 5 | re-checked at 6b |
+| **2e** tracked content vs blobs | repo tracked files | yes | as above | re-checked at 6b |
+| **2d** `.build/checkouts`, both sides | dependency sources | **yes** | **yes — the worktree's copy is compiled at gate 7** | re-checked at 6b |
+| **3** frozen restore | frozen files in the repo | yes | already compiled and run by gates 5 and 6 | *repo copy: by 2c/2e at 6b* |
+| **4** new files | files the candidate added | yes | as above | as above |
+| **4b** plugin purge, both sides | `.build/plugins` | **yes** | **yes — executed by the gate-7 build** | re-purged at 6b |
+| **5** build + binary snapshot | the four measured binaries | yes | yes | snapshot moved per side + per-sample guard |
+
+**Two rows are deliberately left alone, and the reasons matter more than the
+rows.**
+
+- **The config hash.** The config is parsed once and the *parsed values* are used.
+  Re-reading it after gate 6 would mean **re-deciding the rules mid-experiment**,
+  which is worse than the thing it would catch. Its bytes are still tracked
+  content, so a mid-eval edit is caught by the tracked-content re-check anyway.
+- **The frozen restore and the new-file scan.** The repository's copy has already
+  been compiled by gate 5 and run by gate 6 by the time 6b could look, so
+  re-checking would report a fact about a build that has finished. The
+  *worktree's* copy is handled by `restoreToPin`, which already runs after gate 6.
+
 ### Two checks that do not depend on any list being complete
 
 Read this before the enumeration below, because it is the reason the tool is
@@ -462,6 +545,14 @@ The rule generalising both: **prefer a check whose correctness does not depend o
 an enumeration you maintain.** Where you cannot have one, keep the list — but
 know what it is worth.
 
+**File mode is not a defence**, and it is worth one line because it looks like
+one. The attack on the worktree's dependency checkouts did not reproduce at
+first: SwiftPM leaves checkout *files* at `0444`, so a plain write fails with
+`EACCES`. But their *directories* stay `0755` — so one `chmod`, or simply an
+atomic write that renames over the read-only file from the writable directory,
+defeats it entirely. Nothing in this harness claims read-only permissions as a
+control, and nothing should.
+
 **And when you get a principle right, check whether you applied it everywhere.**
 The snapshot-placement rule above was established for the baseline side and then
 left unapplied to the candidate side, which had the larger hole — the same shape
@@ -480,7 +571,7 @@ principle can be half-applied and look finished.
 This is the most transferable thing in the project, and it is worth more than
 any individual gate above.
 
-**Sixteen bypasses have been found across eight reviews — fourteen closed, two
+**Nineteen bypasses have been found across nine reviews — seventeen closed, two
 open and named — and the later ones all came from regions that had been
 *exempted* from a check for good reasons** — `.build/` because hashing it is
 expensive, the pinned worktree because it is the harness's own, `.git/` because
@@ -715,7 +806,7 @@ Every row is a way to make the number go down without making the code faster.
 |---|---|
 | Weaken or delete a frozen test | Gate 3 restores every frozen file before gate 6 runs the suite. With test directories outside `scope`, gate 1 rejects it even earlier. |
 | Add a new, easier test file | Gate 4 rejects any new file in a frozen target directory. |
-| **Rewrite the benchmark to measure less** | Benchmarks are an executable target, and they are frozen alongside the tests. Gate 3 restores them; gate 1 usually rejects first. |
+| **Rewrite the benchmark to measure less** | Benchmarks are an executable target, frozen alongside the tests. Gate 1 usually rejects first, and gate 3 restores the **repository's** copy. That was once the whole answer and it was wrong: the *pinned worktree's* copy is restored by `restoreToPin`, which restores it **to whatever commit the record names** — so a commit made during the test phase, adopted as `measurementCommit`, got its poisoned benchmark faithfully restored on every later eval. The HEAD check at gates 6b and 8b is what closes that; see [the root cause](#the-root-cause-in-one-sentence). |
 | **Change compile flags instead of code** | `swiftSettings` and `unsafeFlags` live in `Package.swift`, and any change to `Package.swift` is rejected — regardless of scope, and by hash as well as by path. |
 | Hide the manifest edit from git (`update-index --assume-unchanged`, `--skip-worktree`) | Gate 2a hashes the bytes on disk, not the index. |
 | Plant a *nested* manifest git never saw | Gate 2a's inventory refuses a manifest appearing where baseline recorded none. |
@@ -736,6 +827,9 @@ Every row is a way to make the number go down without making the code faster.
 | …but have the benchmark call `setsid()` for itself first | **Not closed.** A process that creates its own session is not in the one being swept. See [the residual](#boundary-1--the-agents-benchmark-runs-unsandboxed). |
 | Run the machine hot during the candidate's own sample so the baseline sample that follows is throttled | **Not closed, and not measured.** Nothing is spawned, written, or changed; the state is left in the silicon. See [the thirteenth](#boundary-1--the-agents-benchmark-runs-unsandboxed). |
 | Point `core.fsmonitor` at a program that swaps the baseline binary during the harness's own `git status` | Every git call the harness makes denies **twenty-one** config keys that name a program, `core.fsmonitor` among them — *and*, independently, the binary-hash snapshot moved to immediately after the last build, so those `git` calls are downstream of it. Measured before: **3/3 KEEP** at 0.05014 / 0.04957 / 0.05013, baselines ~72 ms, the fsmonitor firing **11× per eval** and swapping the binary every time. After: **3/3 discard** at 1.00028 / 1.00650 / 1.01029, baselines ~3.6 ms, fired **0×**. |
+| Commit from inside `swift test`, so the advance adopts a commit no gate inspected | Gates **6b** and **8b** compare `HEAD` against the commit gate 1 judged, and the advance credits *that* commit rather than a fresh read. Measured before, 3/3: a genuine 8× optimization plus a lazy global committing the benchmark at `count: 35000` got `keep` at 0.11286 / 0.11365 / 0.11765 — and then the **next** eval, on a tree reset to `frozenCommit` with **one comment line on the original quadratic code** and the payload absent entirely, was **KEPT** at 0.45364 / 0.43430 / 0.44575, `warnings []`, tree clean. After: `rc 2`, `head_moved_during_eval`, refused before any baseline build or sample. |
+| Patch the **worktree's** `.build/checkouts` between gate 2d and gate 7 | Gate 6b re-checks both sides. Found by attacking this README's own claim that gate 2d covers "both sides" — true, but it ran too early to protect the experiment it belonged to. Measured before, 3/3: the **unmodified quadratic** `countWords` plus a rewrite of the worktree's `blackHole` returned `keep` at 0.05069 / 0.05095 / 0.04992, every gate passing. After: `dependency_checkout_modified`, every time. |
+| Patch the **worktree's** `.build/plugins`, executed by the gate-7 build | The same structural change: gate 6b re-purges the plugin cache on both sides. **Closed by construction rather than by demonstration** — this one was not attacked. |
 | Swap the **candidate** binary from inside `swift test`, after gate 5 built it | Each side's binaries are hashed immediately after **its own** build — candidate at gate 5, *before* the tests; baseline at gate 7 — so a swap during the test phase is a mismatch rather than the reference. Measured before: an in-scope commit whose `countWords` was the **byte-identical** quadratic original returned `keep`, rc 0, at ratios 0.11710 / 0.12203 / 0.12292, `warnings: []`, with the post-eval binary's SHA-256 equal to the staged fast one. **`purge_build_output=1` did not stop it** (`keep`, 0.11489). |
 | Commit `.gitattributes` with a `clean` filter that always emits the committed bytes, and leave the fast code uncommitted in the working tree | Gate 2b no longer asks git whether tracked files changed — it hashes them against the commit's own blob ids. Measured before: `git status --porcelain` empty, the only commit a `.gitattributes`, **`rc 0`, `keep`, ratio 0.11637**. After: `rc 2`, `dirty_working_tree`, `k 0`. |
 | Coast on an earlier win | The measurement point advances on KEEP. See [The two commits](#the-two-commits). |
@@ -850,7 +944,7 @@ the test phase was **adopted by the guard as its own reference** rather than
 detected. An in-scope commit whose `countWords` was the **byte-identical**
 quadratic original, plus a lazy global firing only inside the test runner,
 returned `keep` with `rc 0` at ratios 0.11710 / 0.12203 / 0.12292 and
-`warnings: []`, with a byte-clean tree and all nine gates passing. **Each side is
+`warnings: []`, with a byte-clean tree and every gate passing. **Each side is
 now snapshotted immediately after its own build** — candidate at gate 5, before
 the tests; baseline at gate 7 — so neither reference can be taken after a swap.
 
@@ -914,6 +1008,16 @@ directory you are willing to have written to, by an agent you are supervising to
 the degree the work deserves. What the gates give you is that **the commit that
 gets kept is the commit that was measured**, on criteria that did not move while
 it was measured. That is a real property, and it is narrower than it sounds.
+
+**That sentence was false for a while, and it is worth knowing how.** It was
+asserted rather than enforced: `measurementCommit` was set from a fresh
+`git.head()` read *after* measuring, so a commit created during the test phase —
+inspected by no gate — was adopted as the new baseline. It is now **enforced**:
+the commit gate 1 judged is captured once and carried through, the advance
+credits *that* commit, and `HEAD` is re-compared at gates 6b and 8b. If it has
+moved, the eval refuses with `head_moved_during_eval` before anything is built or
+sampled. The property holds because a check makes it hold, not because the code
+had no other way to behave.
 
 ### The build cache is not verified
 
@@ -1010,6 +1114,39 @@ and a real optimization still reaches KEEP (measured after the last round of
 hardening at ratio **0.11265**). If your repository has one of the layouts above,
 expect the friction and budget for the re-baseline; it is accepted cost, not an
 undiscovered bug.
+
+### An agent can stop your overnight run in one line
+
+A residual created by the fixes above, and a deliberate trade rather than an
+oversight. Once a poisoned dependency checkout is detected, **every later eval
+refuses with `dependency_checkout_modified` until a human deletes the affected
+checkout** and lets SwiftPM re-clone it from the pin. That is correct and safe —
+the alternative is measuring against a checkout nobody vouches for — but it means
+an agent that writes one byte into `.build/checkouts` can **halt an unattended run
+until a person intervenes.** Detection converts a silent false KEEP into a loud
+stop, and a loud stop is still a stop.
+
+**This is inconsistent with the precedent set elsewhere in the harness**, and the
+inconsistency is worth naming rather than defending. For harness-owned state the
+rule is *repair, don't refuse*: gate 7 restores the pinned worktree rather than
+refusing it, precisely so one `touch` cannot end a night's work. The consistent
+fix here is the same — delete the worktree's checkout and let SwiftPM re-clone it
+from the revision `Package.resolved` pins, since the correct contents are known
+exactly. **It is not implemented.** Note the asymmetry it would need: the
+*candidate* side must still refuse, because a candidate whose dependency sources
+were tampered with is a candidate under test, not harness state to be repaired.
+
+**Two narrower residuals from the same area**, stated because they are the edges
+of what was actually tested:
+
+- **The `.build/checkouts` re-check covers files SwiftPM has already checked
+  out.** A mid-eval *deletion* followed by a re-clone from a tampered
+  `repositories/` cache is **untested**. The lockfile hash makes it narrow; narrow
+  is not closed.
+- **Gate 6b costs two extra inventory passes per eval, and that cost was not
+  measured.** Every other cost in this README is a number taken from a run; this
+  one is not, and is not being presented as free. On a large repository, budget
+  for it until someone measures it.
 
 ### Re-baselining is required after upgrading
 
@@ -1573,7 +1710,7 @@ are yours to read.
 
 ### 11. Platform and environment
 
-**macOS** is the developed and measured platform: `swift test` is **332 of 332**,
+**macOS** is the developed and measured platform: `swift test` is **335 of 335**,
 and every timing in this README was taken there.
 
 **But it is not reliably green, and an earlier revision of this section implied
@@ -1707,7 +1844,7 @@ swift build -c release
 swift test
 ```
 
-The test suite is **332 tests on macOS**, all passing, and takes several minutes:
+The test suite is **335 tests on macOS**, all passing, and takes several minutes:
 a good part of it builds and measures the real fixture package with the real
 benchmark harness, because the things worth testing here are the ones that only
 fail for real. On Linux it is **328 tests with 8 issues** — see
