@@ -2,18 +2,13 @@ class Autor3searchSwift < Formula
   desc "Autonomous AI-driven performance optimization for any Swift repository"
   homepage "https://github.com/autor3search/swift"
   url "https://github.com/autor3search/swift/archive/refs/tags/v0.1.0.tar.gz"
-  # PLACEHOLDER -- NOT A REAL HASH, AND THIS FORMULA CANNOT INSTALL UNTIL IT IS ONE.
-  #
-  # There is no v0.1.0 tag and no release tarball yet, so this value cannot be
-  # computed. It is the one number in this repository that does not correspond to
-  # a measurement, and it is spelled so that it cannot be mistaken for one: a real
-  # sha256 is 64 lowercase hex characters, and this is not.
-  #
-  # At tag time, replace it with the output of:
+  # Computed from the v0.1.0 release tarball, not copied and not invented:
   #   curl -sL https://github.com/autor3search/swift/archive/refs/tags/v0.1.0.tar.gz | shasum -a 256
-  # Do not invent it, and do not copy one from another formula to "make brew stop
-  # complaining" -- a wrong hash is a download nobody verified.
-  sha256 "REPLACE_WITH_REAL_SHA256_OF_THE_RELEASE_TARBALL"
+  # Verified against the downloaded archive (361,625 bytes, 126 entries) before
+  # being written here. A wrong hash is a download nobody verified, so if this
+  # ever stops matching, do not "fix" it by pasting whatever brew reports --
+  # find out why the tarball changed.
+  sha256 "7b57684bbdad8e81940be84fbcc2ce16e0c180d86ac6f3a8e68bf9ce35b2620b"
   license "MIT"
 
   # Package.swift declares `swift-tools-version: 6.0`, and Swift 6.0 first shipped
