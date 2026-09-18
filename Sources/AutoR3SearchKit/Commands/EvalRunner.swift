@@ -815,15 +815,15 @@ public enum EvalRunner {
     /// about to be taken is taken against bytes that were just verified.
     ///
     /// COST, measured: the four binaries total 17.2 MB on the demo package and
-    /// hash in 5.4 ms, so `count: 10` with one benchmark -- 20 counted samples
-    /// plus 2 warm-ups, 22 checks -- costs about 119 ms against a ~39 s eval,
-    /// or 0.3%. No compromise on the interval was needed.
+    /// hash in 5.91 ms (median), so `count: 10` with one benchmark -- 20
+    /// counted samples plus 2 warm-ups, 22 checks -- costs about 130 ms against
+    /// a ~39 s eval, or 0.33%. No compromise on the interval was needed.
     ///
     /// ALL FOUR BINARIES ON EVERY CHECK, not just the side about to run.
     /// Checking only the sampled side would be sound given the interleave, and
-    /// half the cost; at 119 ms the simpler invariant -- "nothing that will be
+    /// half the cost; at 130 ms the simpler invariant -- "nothing that will be
     /// measured has changed since measurement began" -- is worth more than the
-    /// 60 ms.
+    /// 65 ms.
     ///
     /// A binary that is ABSENT at snapshot time is not recorded, which keeps
     /// every test that injects its own `MetricSource` working (they have no
@@ -976,6 +976,109 @@ public enum EvalRunner {
             """)
     }
 
+    /// Refuses if HEAD is no longer the commit every gate judged.
+    ///
+    /// Called TWICE -- after gate 6 and after gate 8 -- because both of those
+    /// steps run code the candidate wrote, and both were observed moving HEAD
+    /// while the seventeenth vector's reproduction was being built. `during`
+    /// names which window this call is closing, so the refusal tells a human
+    /// where to look rather than only that something moved.
+    static func headMovementFailure(
+        git: Git, headUnderTest: String, during window: String
+    ) -> GateFailure? {
+        let headNow = (try? git.head()) ?? ""
+        guard headNow != headUnderTest else { return nil }
+        return GateFailure(reason: "head_moved_during_eval", detail: """
+            HEAD moved while this experiment was being evaluated: it was \(headUnderTest) when the \
+            gates judged it and is \(headNow.isEmpty ? "unreadable" : headNow) now. It moved \
+            during \(window).
+
+            Every gate above judged \(headUnderTest). A commit created mid-eval has been inspected \
+            by none of them -- not for scope, not for manifest or dependency integrity, not for \
+            the frozen tests -- and until this check existed such a commit was adopted as the new \
+            measurement point and the pinned baseline worktree was checked out at it. Measured, on \
+            a package whose benchmark that commit rewrote to do 20x the work: the next experiment \
+            was a single added comment on the ORIGINAL unoptimised code, and it was KEPT, at \
+            ratio 0.45 against a baseline the agent had written itself -- and it kept again, and \
+            again, because the pinned worktree's own benchmark binary re-committed the payload \
+            every time it was measured.
+
+            The commit that gets kept must be the commit that was measured. If a test or a \
+            benchmark in this repository commits on purpose, it must stop: `eval` evaluates one \
+            commit, and that commit is chosen before any of the candidate's code runs.
+            """)
+    }
+
+    /// THE AUTHORITATIVE INTEGRITY PASS. Runs immediately after gate 6 and
+    /// re-checks everything that was checked before it and is still trusted
+    /// afterwards.
+    ///
+    /// THE GENERAL DEFECT, stated once so it stops being rediscovered: a check
+    /// performed before gate 6 vouches for state consumed after gate 6, and
+    /// GATE 6 RUNS `swift test`, WHICH IS THE AGENT'S CODE BY CONSTRUCTION.
+    /// Every pre-gate-6 check is therefore a statement about a moment that has
+    /// passed. Round 11 closed that for the candidate's two binaries by moving
+    /// their snapshot; this closes it for the rest, in one place, rather than
+    /// one vector at a time.
+    ///
+    /// The two that were demonstrated:
+    ///
+    /// - **HEAD.** The advance used to call `git.head()` AFTER measuring, so a
+    ///   commit created during the test phase became `measurementCommit` and
+    ///   the worktree was repointed to it. Measured: `rc 0 keep ratio 0.23331`,
+    ///   and then a bare comment on the original quadratic kept FOREVER at
+    ///   `ratio 0.21187` against a 16.9 ms baseline, because the pinned
+    ///   worktree now held a benchmark at `count: 35000`. That falsifies the
+    ///   headline property -- the commit that gets kept is the commit that was
+    ///   measured -- and it is why `headUnderTest` is captured at gate 1 and
+    ///   compared here.
+    /// - **`.build/checkouts` in the WORKTREE.** Gate 2d checks both sides
+    ///   before gate 6, but the worktree's copy is COMPILED at gate 7, after
+    ///   it. Patching the dependency's `Blackhole.swift` during `swift test`
+    ///   measured `rc 0 keep ratio 0.19806` against an 18.7 ms baseline, with a
+    ///   byte-clean tree and all nine gates passing. The binary guard does not
+    ///   help: its baseline reference is taken after that build, so it adopts
+    ///   the sabotage.
+    ///
+    /// A THIRD, not demonstrated but the same shape and closed here too: gate
+    /// 4b purges `.build/plugins` on both sides BEFORE gate 6, and the
+    /// worktree's plugins are executed by the baseline build AFTER it. So the
+    /// purge is repeated here rather than trusted.
+    ///
+    /// WHY NOT REORDER GATE 6 INSTEAD. It cannot move. It must run after gate
+    /// 3, or the tests that run are the agent's rather than the frozen ones --
+    /// which is the whole point of freezing them. And every integrity check
+    /// must run before gate 3, because gate 3 is the first write. Gate 6 is
+    /// structurally sandwiched between the checks and the state they vouch for,
+    /// so the window can only be closed by re-checking, not by moving it.
+    static func postTestRevalidation(
+        repo: URL, worktree: URL, git: Git, record: BaselineRecord, config: Config,
+        headUnderTest: String
+    ) -> GateFailure? {
+        // HEAD first: everything else is judged relative to the commit under
+        // test, so a moved HEAD makes the other answers meaningless.
+        if let failure = headMovementFailure(git: git, headUnderTest: headUnderTest, during: """
+            gate 6. `swift test` runs the candidate's own tests, and a test can commit
+            """) {
+            return failure
+        }
+        // The dependency sources the BASELINE build is about to compile, and
+        // the repository's, re-checked because gate 2d ran before the tests.
+        if let failure = checkoutIntegrityFailure(repo: repo, worktree: worktree, record: record) {
+            return failure
+        }
+        // Manifests decide how the baseline side is compiled.
+        if let failure = manifestIntegrityFailure(repo: repo, record: record) { return failure }
+        if let failure = manifestInventoryFailure(repo: repo, record: record) { return failure }
+        // The working tree, by git's view and by content.
+        if let failure = dirtyTreeFailure(git: git, repo: repo, record: record) { return failure }
+        if let failure = treeInventoryFailure(repo: repo, record: record, scope: config.scope) {
+            return failure
+        }
+        if let failure = trackedContentFailure(git: git, repo: repo) { return failure }
+        return nil
+    }
+
     /// Runs one experiment end to end and returns its verdict.
     ///
     /// Throws only on a genuine harness failure (the executable turns that
@@ -1123,6 +1226,12 @@ public enum EvalRunner {
         // Compared against `frozenCommit`, never `measurementCommit`: moving
         // the measurement point must not move what counts as in-scope.
         let changed = try git.changedPaths(since: record.frozenCommit)
+        // THE COMMIT UNDER TEST, captured once. Every gate below judges THIS
+        // commit; the advance at the bottom must credit THIS commit and no
+        // other. Re-asking git for HEAD after the measurement -- which is what
+        // this used to do -- adopts whatever HEAD happens to be then, and
+        // `swift test` can commit. See `postTestRevalidation`.
+        let headUnderTest = try git.head()
         let configURL = repo.appendingPathComponent(".autor3search/config.yaml")
         let config: Config
         do {
@@ -1470,6 +1579,31 @@ public enum EvalRunner {
                                     detail: String(tests.stdout.suffix(4000))))
         }
 
+        // ---- Gate 6b: THE AUTHORITATIVE INTEGRITY PASS ----
+        //
+        // Everything checked before `swift test` was checked before the agent's
+        // own code ran. Re-check it here, where the answer is still true when it
+        // is used. The full argument -- including the two measured bypasses this
+        // closes and why gate 6 cannot simply be moved -- is on
+        // `postTestRevalidation`.
+        if let failure = postTestRevalidation(
+            repo: repo, worktree: pinnedWorktree, git: git, record: record, config: config,
+            headUnderTest: headUnderTest) {
+            return fail(failure)
+        }
+        // Gate 4b purged the plugin caches BEFORE the tests ran, and the
+        // worktree's plugins are executed by the baseline-side build BELOW.
+        // Same window, same answer: purge again rather than trust the earlier
+        // purge. A cache the tests re-planted would otherwise be reused by that
+        // build -- SwiftPM keys these artifacts on input signatures, so an
+        // executable dropped here is not rebuilt away.
+        for (directory, description) in [(repo, "the candidate repository"),
+                                         (pinnedWorktree, "the pinned measurement worktree")] {
+            if let failure = purgePluginCache(in: directory, where: description) {
+                return fail(failure)
+            }
+        }
+
         // ---- Gate 7: worktree integrity ----
         //
         // RESTORE FIRST, THEN VERIFY -- the reverse of what this was, and the
@@ -1754,6 +1888,34 @@ public enum EvalRunner {
             return measuredBinaryTampering(tampering.detail)
         }
 
+        // ---- Gate 8b: HEAD again, because gate 8 RUNS THE AGENT'S CODE ----
+        //
+        // Gate 6b checks HEAD after `swift test`. That is not the last thing in
+        // this function that can move it: gate 8 launches four executables built
+        // from the candidate's sources and from the pinned worktree's, and those
+        // are the agent's code as surely as its tests are.
+        //
+        // Not a hypothetical. Building the seventeenth's reproduction showed the
+        // payload firing from BOTH -- once inside `swiftpm-testing-helper` at
+        // gate 6, and then once per sample inside the benchmark binary at gate 8
+        // (argv[0] is the bare string "Bench" there, which is how the rig's own
+        // "am I the release binary?" guard let it through). The gate-8 firing is
+        // the one that made the fake baseline SELF-RENEWING: once the pinned
+        // worktree held the payload commit, the BASELINE binary re-committed the
+        // poisoned benchmark on every later experiment.
+        //
+        // The advance already credits `headUnderTest`, so a commit made here
+        // cannot become the measurement point. This refuses it outright anyway:
+        // the sample-by-sample binary guard exists because what runs during
+        // measurement is not trusted, and a measurement whose subject committed
+        // to the repository mid-flight is not a measurement anyone should score.
+        if let failure = headMovementFailure(git: git, headUnderTest: headUnderTest, during: """
+            the measurement itself. Gate 8 executes the benchmark binaries built from the \
+            candidate's sources and from the pinned worktree's; both are the agent's code
+            """) {
+            return fail(failure)
+        }
+
         // ---- Gate 9: score ----
         var verdict = Scoring.decide(samples: samples, config: config,
                                      unsafeHits: scan.hits, stopRequested: stopRequested)
@@ -1766,8 +1928,21 @@ public enum EvalRunner {
         // coast to KEEP forever, because "baseline" silently stays at the
         // run's starting commit. `frozenCommit` is deliberately untouched:
         // moving the measurement point must never move the success criteria.
+        //
+        // AND IT CREDITS `headUnderTest`, NOT A FRESH `git.head()`. This used
+        // to ask git for HEAD here, after the measurement -- so a commit that
+        // `swift test` made during gate 6 became the measurement point and the
+        // pinned worktree was repointed to it, while every gate above had
+        // judged a different commit entirely. Measured: a genuine optimisation
+        // plus a lazy global that committed a benchmark at `count: 35000`
+        // during the test phase kept at `ratio 0.23331`, after which a
+        // comment-only change on the ORIGINAL quadratic code kept at
+        // `ratio 0.21187` against a 16.9 ms baseline, and kept again, forever.
+        // Gate 6b now refuses a moved HEAD outright; crediting the captured
+        // commit is the second half of the same rule -- the commit that gets
+        // kept is the commit that was measured.
         if verdict.kind == .keep {
-            let kept = try git.head()
+            let kept = headUnderTest
             try Worktree.repoint(git: git, at: worktree, to: kept)
             record.measurementCommit = kept
             try record.save(to: try home.baselineRecordURL(tag: tag))

@@ -756,3 +756,132 @@ private func addNestedManifest(_ repo: URL, body: String) throws -> String {
     #expect(failure?.reason == "manifest_change_rejected")
     #expect(failure?.detail.contains("missing") == true)
 }
+
+// MARK: - Gate 6b: the authoritative integrity pass
+//
+// `swift test` is the agent's code, and it runs in the MIDDLE of the gate
+// chain. Everything checked before it is a statement about a moment that has
+// passed; these bind the re-check that makes those statements true again at the
+// point they are used.
+
+/// THE SEVENTEENTH VECTOR, as a unit assertion. `evaluate` used to ask git for
+/// HEAD after the measurement, so a commit made during gate 6 became the
+/// measurement point.
+@Test func postTestRevalidationRefusesAHeadThatMovedDuringTheEval() throws {
+    let (repo, git) = try makeGitFixture()
+    let env = isolatedStateEnv()
+    defer { cleanUpFixture(repo: repo, env: env) }
+    let record = try BaselineRunner.run(repo: repo, tag: "t", env: env)
+    let home = try StateHome(repo: repo, env: env)
+    let worktree = try home.worktreeURL(tag: "t")
+    let config = try Config.load(repo.appendingPathComponent(".autor3search/config.yaml"))
+    let headUnderTest = try git.head()
+
+    #expect(EvalRunner.postTestRevalidation(
+        repo: repo, worktree: worktree, git: git, record: record, config: config,
+        headUnderTest: headUnderTest) == nil,
+        "an untouched repository must pass the re-check, or every honest eval fails")
+
+    // What `swift test` can do: commit.
+    try makeInScopeCommit(repo, "committed by the test phase")
+    let failure = EvalRunner.postTestRevalidation(
+        repo: repo, worktree: worktree, git: git, record: record, config: config,
+        headUnderTest: headUnderTest)
+    #expect(failure?.reason == "head_moved_during_eval")
+    #expect(failure?.detail.contains(headUnderTest) == true,
+            "the refusal must name the commit that was actually judged")
+}
+
+/// THE EIGHTEENTH VECTOR, as a unit assertion. Gate 2d checks `.build/checkouts`
+/// on both sides at step 11; the WORKTREE's copy is not compiled until gate 7,
+/// after `swift test` has run.
+@Test func postTestRevalidationRefusesATamperedWorktreeCheckout() throws {
+    let (repo, git) = try makeGitFixture()
+    let env = isolatedStateEnv()
+    defer { cleanUpFixture(repo: repo, env: env) }
+    let record = try BaselineRunner.run(repo: repo, tag: "t", env: env)
+    let home = try StateHome(repo: repo, env: env)
+    let worktree = try home.worktreeURL(tag: "t")
+    let config = try Config.load(repo.appendingPathComponent(".autor3search/config.yaml"))
+    let headUnderTest = try git.head()
+
+    // The fixture has no dependencies, so any checkout at all is one baseline
+    // never recorded -- which is exactly the shape of a planted one.
+    let planted = worktree.appendingPathComponent(".build/checkouts/benchmark/Sources/Benchmark")
+    try FileManager.default.createDirectory(at: planted, withIntermediateDirectories: true)
+    try "public func blackHole(_: some Any) { while true {} }\n".write(
+        to: planted.appendingPathComponent("Blackhole.swift"), atomically: true, encoding: .utf8)
+
+    let failure = EvalRunner.postTestRevalidation(
+        repo: repo, worktree: worktree, git: git, record: record, config: config,
+        headUnderTest: headUnderTest)
+    #expect(failure?.reason == "dependency_checkout_modified")
+    #expect(failure?.detail.contains("pinned measurement worktree") == true,
+            "the WORKTREE side is the one gate 2d's timing left open")
+}
+
+/// Commits into the repository the first time it is asked for a sample, then
+/// reports the candidate as twice as fast so the eval reaches the advance.
+private final class CommittingSource: MetricSource, @unchecked Sendable {
+    let repo: URL
+    let baselineCommit: String
+    private var committed = false
+    init(repo: URL, baselineCommit: String) {
+        self.repo = repo
+        self.baselineCommit = baselineCommit
+    }
+    func sample(benchmark: String, in worktree: URL, config: Config) throws -> Double {
+        if !committed {
+            committed = true
+            try? "public func f() -> Int { 1 }  // planted mid-measurement\n".write(
+                to: repo.appendingPathComponent("Sources/Lib/Lib.swift"),
+                atomically: true, encoding: .utf8)
+            _ = try? Subprocess.run(URL(fileURLWithPath: "/bin/sh"),
+                                    ["-c", "git add -A && git commit -q -m planted"],
+                                    cwd: repo, env: nil, timeout: 60)
+        }
+        let head = (try? Git(repo: worktree).head()) ?? ""
+        return head == baselineCommit ? 100.0 : 50.0
+    }
+}
+
+/// The other half of the seventeenth, and the window gate 6b does NOT cover.
+///
+/// Gate 8 launches the benchmark binaries, which are built from the candidate's
+/// own sources. Building the seventeenth's reproduction showed the payload
+/// firing there as well as inside `swift test` -- and the gate-8 firing was the
+/// one that made the fake baseline self-renewing, because the PINNED worktree's
+/// binary re-committed the payload on every later experiment.
+@Test func aCommitMadeDuringMeasurementIsRefusedAndNeverBecomesTheBaseline() throws {
+    let (repo, git) = try makeGitFixture()
+    let env = isolatedStateEnv()
+    defer { cleanUpFixture(repo: repo, env: env) }
+    let record = try BaselineRunner.run(repo: repo, tag: "t", env: env)
+    let home = try StateHome(repo: repo, env: env)
+    let before = try BaselineRecord.load(home.baselineRecordURL(tag: "t"))
+
+    try makeInScopeCommit(repo, "fast")
+    let headUnderTest = try git.head()
+    let verdict = try EvalRunner.run(
+        repo: repo, env: env,
+        source: CommittingSource(repo: repo, baselineCommit: record.frozenCommit),
+        now: Date.init)
+    let laterHead = try git.head()
+    #expect(laterHead != headUnderTest,
+            "the rig did not manage to move HEAD; the test proves nothing")
+
+    #expect(verdict.kind == .fail, """
+        a measurement whose own binaries committed to the repository mid-flight was scored: \
+        verdict=\(verdict.kind.rawValue) reason=\(verdict.reason ?? "nil")
+        """)
+    #expect(verdict.reason == "head_moved_during_eval")
+
+    let after = try BaselineRecord.load(home.baselineRecordURL(tag: "t"))
+    #expect(after.measurementCommit == before.measurementCommit, """
+        the measurement point moved to \(after.measurementCommit), which no gate has judged; \
+        it was \(before.measurementCommit) and the experiment was refused
+        """)
+    #expect(try Worktree.verify(at: home.worktreeURL(tag: "t"),
+                                expectedCommit: before.measurementCommit),
+            "the pinned worktree must still be the commit it was pinned to")
+}
