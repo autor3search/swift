@@ -1,0 +1,539 @@
+import Foundation
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+/// The outcome of one child process run.
+///
+/// A non-zero `exitCode` is *data*: a benchmark that fails is a verdict input, not
+/// a harness crash. Only a failure to launch throws.
+public struct ProcessResult: Sendable {
+    public let exitCode: Int32
+    public let stdout: String
+    public let stderr: String
+    public let timedOut: Bool
+    public let outputTruncated: Bool
+
+    public init(exitCode: Int32, stdout: String, stderr: String, timedOut: Bool, outputTruncated: Bool) {
+        self.exitCode = exitCode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timedOut = timedOut
+        self.outputTruncated = outputTruncated
+    }
+}
+
+/// The outcome of one child process run, with stdout returned as raw bytes
+/// instead of a UTF-8-repaired `String`.
+///
+/// `ProcessResult.stdout` goes through `String(decoding:as:)`, which
+/// silently replaces any invalid byte sequence with U+FFFD — fine for text
+/// output a caller only inspects, wrong for a caller that must round-trip
+/// exact bytes (e.g. `Git.fileContents`, reading an arbitrary blob that may
+/// be binary or saved in a non-UTF-8 encoding). `stderr` is still decoded as
+/// `String` here: it is always a diagnostic message, never data a caller
+/// round-trips.
+public struct ProcessDataResult: Sendable {
+    public let exitCode: Int32
+    public let stdout: Data
+    public let stderr: String
+    public let timedOut: Bool
+    public let outputTruncated: Bool
+
+    public init(exitCode: Int32, stdout: Data, stderr: String, timedOut: Bool, outputTruncated: Bool) {
+        self.exitCode = exitCode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.timedOut = timedOut
+        self.outputTruncated = outputTruncated
+    }
+}
+
+public enum SubprocessError: Error, CustomStringConvertible {
+    case launchFailed(String)
+
+    public var description: String {
+        switch self {
+        case .launchFailed(let message): return "launch failed: \(message)"
+        }
+    }
+}
+
+/// The environment the harness hands to the tools it runs.
+///
+/// THE ROOT CAUSE, ONE STEP ON. Every earlier bypass answered "does the
+/// COMPILER read it?" -- git's index, ignore rules, the out-of-scope tree, the
+/// dependency checkouts. This one is about what the HARNESS ITSELF RUNS. Both
+/// questions have to be asked of every exempt region now.
+///
+/// `Subprocess.run(..., env: nil)` inherits the parent environment whole, and
+/// in many deployments the agent under measurement is the process that invokes
+/// `eval`. So the environment is adversary-controlled input, and it reaches:
+///
+///   - **git**, via `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`,
+///     which can set `core.hooksPath` with NOTHING written under `.git/` at
+///     all. The harness's own `git checkout --detach --force` inside
+///     `Worktree.restoreToPin` then fires an attacker's `post-checkout` hook.
+///     Measured: `rc 0, keep, ratio 0.09985, warnings: []`.
+///   - **the Swift toolchain**, via `SWIFT_EXEC`, `TOOLCHAINS`, `DEVELOPER_DIR`,
+///     `SDKROOT`, `CC`, `CXX`, `DYLD_INSERT_LIBRARIES` and friends. A wrapper
+///     named by any of these sees the working directory of each invocation and
+///     can therefore tell the candidate side from the baseline side, compiling
+///     one honestly and the other with different flags.
+///
+/// ALLOWLIST, NOT DENYLIST, and the choice is not close. A denylist has to
+/// enumerate every variable of two separately-evolving tools; git alone added
+/// `GIT_CONFIG_COUNT` in 2.31, and being one release behind is a hole. An
+/// allowlist is wrong in the safe direction: the failure mode is a tool that
+/// cannot find something it needs, which is loud and immediate, not a silent
+/// bypass. What the allowlist contains was established BY RUNNING the tools,
+/// not by guessing -- see `docs/run-log.md` for the transcript.
+public enum SanitizedEnvironment {
+    /// The variables that survive, for every tool the harness runs.
+    ///
+    /// Each is here for a reason, and nothing is here "just in case":
+    ///
+    /// - `PATH` -- the toolchain shells out (`/bin/sh` for plugins, linker
+    ///   drivers, `xcrun`). Measured: `swift build` succeeds under `env -i` on
+    ///   this machine, so this is for packages whose builds invoke external
+    ///   tools, not for ours. It stays a residual: see the note below.
+    /// - `HOME` -- SwiftPM's shared caches (`~/.swiftpm`,
+    ///   `~/Library/Caches/org.swift.swiftpm`) and, for `swift package
+    ///   resolve`, git credential helpers and `~/.netrc` for private
+    ///   dependencies. Dropping it builds fine and re-downloads everything.
+    /// - `TMPDIR` -- honouring the platform's temp location rather than
+    ///   silently falling back to `/tmp`, which on macOS is a different
+    ///   filesystem with different permissions.
+    /// - `USER`, `LOGNAME`, `SHELL` -- identity and shell selection some build
+    ///   scripts read; harmless and cheap to keep.
+    /// - `LANG`, `LC_ALL`, `LC_CTYPE`, `TERM`, `__CF_USER_TEXT_ENCODING` --
+    ///   text encoding and terminal handling. Dropping the locale makes
+    ///   diagnostics with non-ASCII paths mangle.
+    ///
+    /// EVERYTHING ELSE IS DROPPED, and these in particular: `SWIFT_EXEC`,
+    /// `SWIFT_DRIVER_*`, `SWIFTPM_*`, `SWIFT_DETERMINISTIC_HASHING`,
+    /// `TOOLCHAINS`, `DEVELOPER_DIR`, `SDKROOT`, `CC`, `CXX`, `CFLAGS`,
+    /// `CXXFLAGS`, `LDFLAGS`, `MACOSX_DEPLOYMENT_TARGET`, `DYLD_*`,
+    /// `LD_LIBRARY_PATH`, `GIT_*` in full.
+    ///
+    /// AN OPERATOR WHO NEEDS A NON-DEFAULT TOOLCHAIN must select it with
+    /// `xcode-select`, or by placing it on `PATH` -- not with `TOOLCHAINS` or
+    /// `DEVELOPER_DIR`, because a per-process toolchain override IS the
+    /// discriminating primitive this closes. That is a deliberate behaviour
+    /// change and is stated in the run log.
+    public static let allowed: Set<String> = [
+        "PATH", "HOME", "TMPDIR",
+        "USER", "LOGNAME", "SHELL",
+        "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+        "__CF_USER_TEXT_ENCODING",
+    ]
+
+    /// `inherited`, reduced to `allowed`.
+    ///
+    /// Exact-name matching only -- no prefixes, no globs. A prefix rule would
+    /// have to be read as "and everything that starts like this", which is how
+    /// `GIT_CONFIG_COUNT` would sneak back in beside a `GIT_CONFIG` someone
+    /// allowed for a good reason.
+    public static func filtered(
+        _ inherited: [String: String], allowing allowed: Set<String> = SanitizedEnvironment.allowed
+    ) -> [String: String] {
+        inherited.filter { allowed.contains($0.key) }
+    }
+
+    /// The environment for every tool the harness runs, built from the real
+    /// one at the moment of the call.
+    public static func forTools() -> [String: String] {
+        filtered(ProcessInfo.processInfo.environment)
+    }
+}
+
+public enum Subprocess {
+    /// How long the readers may keep draining after the child has been reaped.
+    /// Bounds `run` even when a descendant escaped the tree kill and is still
+    /// writing to the inherited pipe.
+    static let drainGracePeriod: TimeInterval = 0.25
+
+    /// Runs `executable` to completion, or kills its whole process tree at `timeout`.
+    ///
+    /// - Parameter outputCapBytes: per-stream cap. A runaway child cannot exhaust
+    ///   memory; the overflow is discarded (but still drained) and
+    ///   `outputTruncated` is set.
+    public static func run(
+        _ executable: URL,
+        _ args: [String],
+        cwd: URL,
+        env: [String: String]? = nil,
+        timeout: TimeInterval,
+        outputCapBytes: Int = 4 << 20
+    ) throws -> ProcessResult {
+        let raw = try runRaw(executable, args, cwd: cwd, env: env, timeout: timeout, outputCapBytes: outputCapBytes)
+        return ProcessResult(
+            exitCode: raw.exitCode,
+            stdout: String(decoding: raw.stdout, as: UTF8.self),
+            stderr: String(decoding: raw.stderr, as: UTF8.self),
+            timedOut: raw.timedOut,
+            outputTruncated: raw.outputTruncated
+        )
+    }
+
+    /// Like `run`, but returns stdout as the raw `Data` the child wrote,
+    /// undecoded. See `ProcessDataResult` for why this exists alongside
+    /// `run` rather than replacing it — `run`'s signature and behavior are
+    /// unchanged, and eleven existing call sites keep working exactly as
+    /// before.
+    public static func runData(
+        _ executable: URL,
+        _ args: [String],
+        cwd: URL,
+        env: [String: String]? = nil,
+        timeout: TimeInterval,
+        outputCapBytes: Int = 4 << 20
+    ) throws -> ProcessDataResult {
+        let raw = try runRaw(executable, args, cwd: cwd, env: env, timeout: timeout, outputCapBytes: outputCapBytes)
+        return ProcessDataResult(
+            exitCode: raw.exitCode,
+            stdout: raw.stdout,
+            stderr: String(decoding: raw.stderr, as: UTF8.self),
+            timedOut: raw.timedOut,
+            outputTruncated: raw.outputTruncated
+        )
+    }
+
+    /// Shared plumbing behind `run` and `runData`: spawn, drain both pipes
+    /// concurrently, wait (with a tree kill at `timeout`), and hand back
+    /// both streams as raw bytes. `run` and `runData` differ only in how
+    /// they decode `stdout` afterward.
+    private struct RawResult {
+        let exitCode: Int32
+        let stdout: Data
+        let stderr: Data
+        let timedOut: Bool
+        let outputTruncated: Bool
+    }
+
+    private static func runRaw(
+        _ executable: URL,
+        _ args: [String],
+        cwd: URL,
+        env: [String: String]?,
+        timeout: TimeInterval,
+        outputCapBytes: Int
+    ) throws -> RawResult {
+        let child: SpawnedChild
+        do {
+            child = try POSIXSpawn.spawn(executable: executable, args: args, cwd: cwd, env: env)
+        } catch {
+            throw SubprocessError.launchFailed("\(error)")
+        }
+
+        // Publish this child's process group so a SIGTERM from `stop --force`
+        // (or a Ctrl-C) can kill its whole tree before we die -- otherwise the
+        // child, which is its own group leader, is orphaned to init and keeps
+        // burning CPU, corrupting every later measurement on the machine. This
+        // is a no-op unless the executable installed the trap; see
+        // `SignalTrap`. Cleared below once the child has been reaped, so a
+        // later signal can never target a recycled pid.
+        //
+        // `noteChildSpawned` returns `false` only when its fixed-size registry
+        // is completely full -- every slot already holds a live pgid. Rather
+        // than let this child run for its whole lifetime untracked by the
+        // trap (the exact orphan hazard this file exists to prevent), refuse
+        // outright: kill what was just spawned, reap it, and fail the launch.
+        // This should never happen given this project's actual concurrency;
+        // hitting it means something is badly wrong, and a loud failure here
+        // is the only acceptable response to that, not a silent drop.
+        guard SignalTrap.noteChildSpawned(pgid: child.pid) else {
+            throw refuseUntrackedChild(child, executable: executable)
+        }
+        defer { SignalTrap.noteChildReaped(pgid: child.pid) }
+
+        // Drain both pipes concurrently, starting *before* we wait. A child that
+        // fills the 64 KiB pipe buffer would otherwise block on write while we
+        // block on wait — a deadlock that no timeout could distinguish from a slow
+        // benchmark.
+        let buffers = OutputBuffers(cap: outputCapBytes)
+        let drains = DispatchGroup()
+        drain(fd: child.stdoutFD, stream: .out, into: buffers, group: drains)
+        drain(fd: child.stderrFD, stream: .err, into: buffers, group: drains)
+
+        var status: Int32 = 0
+        var timedOut = false
+        var reaped = false
+        let deadline = Date().addingTimeInterval(timeout)
+
+        // Backoff, not a fixed tick: a fixed 10 ms poll would add up to 10 ms of
+        // exit-detection latency to every run, which is pure noise in a timing
+        // harness. Start tight for short children, relax for long ones.
+        var idle: TimeInterval = 0.0005
+        let maxIdle: TimeInterval = 0.02
+
+        while true {
+            let result = waitpid(child.pid, &status, WNOHANG)
+            if result == child.pid { reaped = true; break }
+            if result < 0 {
+                if errno == EINTR { continue }
+                break  // ECHILD and friends: nothing left to reap.
+            }
+            if Date() >= deadline {
+                timedOut = true
+                // pgid == pid: the child was spawned as its own group leader.
+                Platform.processTree.killTree(pgid: child.pid)
+                break
+            }
+            Thread.sleep(forTimeInterval: idle)
+            idle = min(maxIdle, idle * 2)
+        }
+
+        if !reaped {
+            // Blocking reap so no zombie is left behind.
+            while true {
+                let result = waitpid(child.pid, &status, 0)
+                if result == child.pid { reaped = true; break }
+                if result < 0 && errno == EINTR { continue }
+                break
+            }
+        }
+
+        // ---- EVERY RUN ENDS WITH AN EMPTY PROCESS GROUP ----
+        //
+        // Until now `killTree` only fired on a TIMEOUT. A child that exited
+        // normally was reaped and anything it had forked was simply left
+        // running — which is a correctness hole before it is a security one:
+        // `MeasureSession` interleaves baseline and candidate samples precisely
+        // so that each is an independent observation, and a process surviving
+        // between them breaks that whether it is malicious or a leaked helper.
+        //
+        // THE ATTACK IT CLOSES. Round 6 guards the BYTES being measured. This
+        // one changes no bytes: a candidate benchmark whose `countWords` is the
+        // original quadratic implementation spawns background CPU burners that
+        // outlive it, idling while the candidate runs and saturating the
+        // machine during the BASELINE samples that follow. Measured, from a
+        // comment-only commit on top of it: `rc 0 keep ratio 0.51568`, baseline
+        // 7.77 ms against an honest 3.6 ms, with 24 burner processes still
+        // alive when the eval finished. The asymmetry is the whole trick — the
+        // process running the agent's code can leave something behind that
+        // penalises the side it is compared against.
+        //
+        // Killing the group after every run removes the mechanism without
+        // needing to know what the spawned thing does.
+        //
+        // PID REUSE: `kill(-pgid)` after the leader has been reaped could in
+        // principle signal an unrelated group that has since claimed that pid.
+        // The window is the few microseconds between `waitpid` returning and
+        // this line, and wrapping the pid space inside it is not a thing that
+        // happens; the timeout path above has always had the same property.
+        // Preferred over the alternative of killing before reaping, which would
+        // destroy the exit status this function exists to report.
+        Platform.processTree.killTree(pgid: child.pid)
+        // ...and the SESSION, which is the outer guarantee. A process leaves a
+        // group with one `setpgid`, and Foundation's `Process` does that for
+        // every child it spawns, so the group kill above missed the easiest way
+        // to write the attack (measured: `rc 0 keep ratio 0.54278`, twelve
+        // burners still alive). A session can only be left by calling `setsid`.
+        // Gated on `sessionIsolated` because sweeping a session the child never
+        // got would be sweeping OUR OWN, which kills the harness.
+        if child.sessionIsolated {
+            Platform.processTree.killSession(sid: child.pid)
+        }
+
+        // The readers stop on EOF. If something still holds a write end — a broken
+        // tree kill, or a descendant that escaped the group by calling setsid for
+        // itself — EOF never arrives, so the stop request bounds the wait two ways:
+        // a quiet pipe ends it immediately, and a *noisy* one ends it at the grace
+        // deadline. Without the second bound a runaway escapee keeps `poll` ready
+        // forever and the harness hangs instead of reporting `timedOut`.
+        buffers.requestStop()
+        drains.wait()
+        close(child.stdoutFD)
+        close(child.stderrFD)
+
+        let snapshot = buffers.snapshot()
+        return RawResult(
+            exitCode: reaped ? exitCode(from: status) : -1,
+            stdout: snapshot.out,
+            stderr: snapshot.err,
+            timedOut: timedOut,
+            outputTruncated: snapshot.truncated
+        )
+    }
+
+    /// Tears down a child that was just spawned but could not be registered
+    /// with `SignalTrap`'s live-child registry (`noteChildSpawned` returned
+    /// `false`): kills its whole process-group tree, blocking-reaps it so no
+    /// zombie is left behind, closes its pipes, and returns the error to
+    /// throw. Never lets such a child run even briefly untracked by the
+    /// SIGTERM/SIGINT trap -- that is precisely the orphan hazard this
+    /// registry exists to prevent.
+    ///
+    /// Split out from `runRaw` -- not `private` -- so the refusal PATH
+    /// itself (kill, blocking reap, fd cleanup, the specific error) can be
+    /// exercised directly in a test with a real spawned child, independent
+    /// of how a `false` registration outcome was produced. Filling
+    /// `SignalTrap`'s real, process-wide registry to capacity in a test
+    /// would mean arming the trap, which -- see `SignalTrap`'s own tests --
+    /// pollutes every other case spawning through `Subprocess` in parallel;
+    /// calling this directly needs neither.
+    static func refuseUntrackedChild(_ child: SpawnedChild, executable: URL) -> SubprocessError {
+        Platform.processTree.killTree(pgid: child.pid)
+        var reapStatus: Int32 = 0
+        waitpid(child.pid, &reapStatus, 0)
+        close(child.stdoutFD)
+        close(child.stderrFD)
+        return SubprocessError.launchFailed(
+            "SignalTrap's live-child registry is full; refusing to run " +
+            "\(executable.path) untracked by the SIGTERM/SIGINT trap")
+    }
+
+    /// `wait(2)` status decoding; the `W*` macros are not available in Swift.
+    private static func exitCode(from status: Int32) -> Int32 {
+        if status & 0x7f == 0 { return (status >> 8) & 0xff }  // WIFEXITED
+        let signal = status & 0x7f
+        if signal != 0 && signal != 0x7f { return 128 + signal }  // WIFSIGNALED
+        return -1  // stopped, which we never wait for
+    }
+
+    private static func drain(
+        fd: Int32,
+        stream: OutputBuffers.Stream,
+        into buffers: OutputBuffers,
+        group: DispatchGroup
+    ) {
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { group.leave() }
+            drainLoop(fd: fd, stream: stream, into: buffers)
+        }
+    }
+
+    /// The reader loop itself, factored out of `drain` so it can be driven
+    /// directly against a plain pipe in a test -- including with a
+    /// `startDelay` standing in for the thing that is otherwise impossible to
+    /// stage deterministically: a reader that libdispatch did not schedule
+    /// until long after the child had already been reaped.
+    ///
+    /// THE GRACE DEADLINE IS THIS READER'S OWN, started the first time THIS
+    /// reader observes the stop request -- NOT a deadline started by
+    /// `requestStop` on the reaping thread. That distinction is the whole
+    /// point. Under a saturated global queue the drain block can sit unstarted
+    /// for longer than the grace period, and a deadline started at reap time
+    /// would already have expired before the reader ran a single `poll`: the
+    /// loop would return having read nothing, and `run` would hand back an
+    /// EMPTY stdout with the child's REAL exit status 0. That is silent data
+    /// loss wearing a success code -- a `git show` of a 4 KiB blob returning
+    /// zero bytes and being believed. Anchoring the deadline here means a
+    /// late-scheduled reader still gets its full grace to drain, while a
+    /// genuinely runaway pipe (a descendant that escaped the tree kill and
+    /// keeps writing) is still bounded: the reader gives up `drainGracePeriod`
+    /// after it notices, instead of never.
+    static func drainLoop(
+        fd: Int32,
+        stream: OutputBuffers.Stream,
+        into buffers: OutputBuffers,
+        startDelay: TimeInterval = 0
+    ) {
+        if startDelay > 0 { Thread.sleep(forTimeInterval: startDelay) }
+        let capacity = 64 * 1024
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
+        defer { buffer.deallocate() }
+
+        var graceDeadline: Date?
+
+        while true {
+            let stopRequested = buffers.stopRequested()
+            if stopRequested, graceDeadline == nil {
+                graceDeadline = Date().addingTimeInterval(drainGracePeriod)
+            }
+            // Hard wall-clock bound, checked *before* readability. A descendant
+            // that escaped the process group can keep this pipe permanently
+            // readable; without this check the reader would never reach the
+            // quiet-pipe test below and `run` would never return.
+            if let graceDeadline, Date() >= graceDeadline { return }
+
+            var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+            let ready = poll(&descriptor, 1, 50)
+            if ready < 0 {
+                if errno == EINTR { continue }
+                return
+            }
+            if ready == 0 {
+                // Nothing available for 50 ms. Anything the child buffered has
+                // been read by now, so it is safe to honour a stop request.
+                if stopRequested { return }
+                continue
+            }
+            let count = read(fd, buffer, capacity)
+            if count > 0 {
+                buffers.append(buffer, count: count, to: stream)
+            } else if count == 0 {
+                return  // EOF: every write end is closed.
+            } else {
+                if errno == EINTR || errno == EAGAIN { continue }
+                return
+            }
+        }
+    }
+}
+
+/// Capped, lock-guarded accumulation of the two streams.
+///
+/// Internal rather than private so `Subprocess.drainLoop` can be exercised
+/// directly against a plain pipe -- see that function's note on the
+/// late-scheduled reader.
+final class OutputBuffers: @unchecked Sendable {
+    enum Stream { case out, err }
+    struct Snapshot { let out: Data; let err: Data; let truncated: Bool }
+
+    private let lock = NSLock()
+    private let cap: Int
+    private var out = Data()
+    private var err = Data()
+    private var truncated = false
+    /// False until `requestStop`. It records only that the child has been
+    /// reaped -- the deadline that follows from it belongs to each reader, and
+    /// is started when that reader first SEES this, not when it was set. See
+    /// `Subprocess.drainLoop`.
+    private var stopWasRequested = false
+
+    init(cap: Int) { self.cap = max(0, cap) }
+
+    func append(_ bytes: UnsafePointer<UInt8>, count: Int, to stream: Stream) {
+        lock.lock()
+        defer { lock.unlock() }
+        let used = stream == .out ? out.count : err.count
+        let room = cap - used
+        guard room > 0 else {
+            // Keep reading (so the child is never blocked on a full pipe) but throw
+            // the overflow away rather than growing without bound.
+            truncated = true
+            return
+        }
+        let taken = min(room, count)
+        if stream == .out {
+            out.append(bytes, count: taken)
+        } else {
+            err.append(bytes, count: taken)
+        }
+        if taken < count { truncated = true }
+    }
+
+    func requestStop() {
+        lock.lock()
+        stopWasRequested = true
+        lock.unlock()
+    }
+
+    /// The child has been reaped, so a quiet pipe means we are done.
+    func stopRequested() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopWasRequested
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(out: out, err: err, truncated: truncated)
+    }
+}

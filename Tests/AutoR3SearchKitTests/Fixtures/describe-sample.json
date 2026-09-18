@@ -1,0 +1,14 @@
+{
+  "name": "PB",
+  "targets": [
+    { "name": "Lib", "type": "library", "path": "Sources/Lib",
+      "sources": ["Lib.swift"], "product_dependencies": [] },
+    { "name": "LibTests", "type": "test", "path": "Tests/LibTests",
+      "sources": ["LibTests.swift"], "product_dependencies": [] },
+    { "name": "OddTests", "type": "test", "path": "elsewhere/OddTests",
+      "sources": ["Odd.swift"], "product_dependencies": [] },
+    { "name": "Bench", "type": "executable", "path": "Benchmarks/Bench",
+      "sources": ["Bench.swift"],
+      "product_dependencies": ["Benchmark", "BenchmarkPlugin"] }
+  ]
+}
