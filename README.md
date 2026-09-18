@@ -208,7 +208,7 @@ purge_build_output: false
 | `min_effect_pct` | `3.0` | A win must be at least this large. See [Scoring](#scoring) — this floor does more work than anything else in the rule. |
 | `max_regress_pct` | `3.0` | A benchmark regressing beyond this, significantly, is an outright refusal. Equal to `min_effect_pct` on purpose. |
 | `timeout_seconds` | `600` | Per build / test / measurement step. |
-| `purge_build_output` | `false` | Delete every compiled artifact under `.build` before each side is built, so the measured binaries come only from sources the gates hashed. Off because it costs a measured **+33.6 s** per eval. Optional in the file: a `config.yaml` written before this key existed still loads, and still matches the SHA-256 `baseline` pinned for it. See [the build cache](#the-build-cache-is-not-verified). |
+| `purge_build_output` | `false` | Delete every compiled artifact under `.build` **before** each side is built, so each eval starts from artifacts rebuilt out of sources the gates hashed. It addresses a *stale* poisoned artifact left by a previous eval; it does **not** address one written *during* an eval — see [the build cache](#the-build-cache-is-not-verified). Off because it costs a measured **+33.6 s** per eval. Optional in the file: a `config.yaml` written before this key existed still loads, and still matches the SHA-256 `baseline` pinned for it. |
 
 ### Why these defaults, and what they were before
 
@@ -364,7 +364,7 @@ agent's loop should treat them as "something is wrong with the setup", not
 "that idea did not work".
 
 `eval --json`'s `reason` is a stable, machine-readable string. The full set is
-in the gate table below; four are worth calling out because they are newer than
+in the gate table below; five are worth calling out because they are newer than
 the rest and an agent loop keyed on the older ones will not recognise them:
 
 | `reason` | What it means |
@@ -462,12 +462,25 @@ The rule generalising both: **prefer a check whose correctness does not depend o
 an enumeration you maintain.** Where you cannot have one, keep the list — but
 know what it is worth.
 
+**And when you get a principle right, check whether you applied it everywhere.**
+The snapshot-placement rule above was established for the baseline side and then
+left unapplied to the candidate side, which had the larger hole — the same shape
+of attack, the same fix, missed because the work stopped when the first side was
+done. In the implementer's words:
+
+> *Round 9 established the principle and I applied it to one side. Assume the
+> same question is worth asking of anything else that has two sides.*
+
+That generalises further than binaries. Anything with a symmetry — two sides, two
+platforms, two directions, a before and an after — is somewhere a correct
+principle can be half-applied and look finished.
+
 ### Every exemption from an integrity check is a candidate bypass
 
 This is the most transferable thing in the project, and it is worth more than
 any individual gate above.
 
-**Fifteen bypasses have been found across seven reviews — thirteen closed, two
+**Sixteen bypasses have been found across eight reviews — fourteen closed, two
 open and named — and the later ones all came from regions that had been
 *exempted* from a check for good reasons** — `.build/` because hashing it is
 expensive, the pinned worktree because it is the harness's own, `.git/` because
@@ -606,7 +619,7 @@ one.
 ### Git config that runs programs: what is denied, and what cannot be
 
 `core.hooksPath` was never the only key that makes git execute something. Every
-git call the harness makes now denies **twenty** keys, taken from `git config`'s
+git call the harness makes now denies **twenty-one** keys, taken from `git config`'s
 documentation for the installed version (git 2.54.0) rather than from the attacks
 already found, and each one checked against the commands this harness actually
 runs:
@@ -722,7 +735,8 @@ Every row is a way to make the number go down without making the code faster.
 | Spawn a process that burns CPU through the baseline samples, changing no bytes | Every spawned child gets **its own session** (`POSIX_SPAWN_SETSID`), and each subprocess run ends by sweeping that session — a process cannot leave a session with `setpgid`, which is how the first version of this was escaped. Measured before: **3/3 KEEP**, ratios 0.54935 / 0.56069 / 0.56485, twelve processes still alive each time. After: **3/3 discard**, 1.02742 / 1.02021 / 1.02803, **0 alive**. |
 | …but have the benchmark call `setsid()` for itself first | **Not closed.** A process that creates its own session is not in the one being swept. See [the residual](#boundary-1--the-agents-benchmark-runs-unsandboxed). |
 | Run the machine hot during the candidate's own sample so the baseline sample that follows is throttled | **Not closed, and not measured.** Nothing is spawned, written, or changed; the state is left in the silicon. See [the thirteenth](#boundary-1--the-agents-benchmark-runs-unsandboxed). |
-| Point `core.fsmonitor` at a program that swaps the baseline binary during the harness's own `git status` | Every git call the harness makes denies **twenty** config keys that name a program, `core.fsmonitor` among them — *and*, independently, the binary-hash snapshot moved to immediately after the last build, so those `git` calls are downstream of it. Measured before: **3/3 KEEP** at 0.05014 / 0.04957 / 0.05013, baselines ~72 ms, the fsmonitor firing **11× per eval** and swapping the binary every time. After: **3/3 discard** at 1.00028 / 1.00650 / 1.01029, baselines ~3.6 ms, fired **0×**. |
+| Point `core.fsmonitor` at a program that swaps the baseline binary during the harness's own `git status` | Every git call the harness makes denies **twenty-one** config keys that name a program, `core.fsmonitor` among them — *and*, independently, the binary-hash snapshot moved to immediately after the last build, so those `git` calls are downstream of it. Measured before: **3/3 KEEP** at 0.05014 / 0.04957 / 0.05013, baselines ~72 ms, the fsmonitor firing **11× per eval** and swapping the binary every time. After: **3/3 discard** at 1.00028 / 1.00650 / 1.01029, baselines ~3.6 ms, fired **0×**. |
+| Swap the **candidate** binary from inside `swift test`, after gate 5 built it | Each side's binaries are hashed immediately after **its own** build — candidate at gate 5, *before* the tests; baseline at gate 7 — so a swap during the test phase is a mismatch rather than the reference. Measured before: an in-scope commit whose `countWords` was the **byte-identical** quadratic original returned `keep`, rc 0, at ratios 0.11710 / 0.12203 / 0.12292, `warnings: []`, with the post-eval binary's SHA-256 equal to the staged fast one. **`purge_build_output=1` did not stop it** (`keep`, 0.11489). |
 | Commit `.gitattributes` with a `clean` filter that always emits the committed bytes, and leave the fast code uncommitted in the working tree | Gate 2b no longer asks git whether tracked files changed — it hashes them against the commit's own blob ids. Measured before: `git status --porcelain` empty, the only commit a `.gitattributes`, **`rc 0`, `keep`, ratio 0.11637**. After: `rc 2`, `dirty_working_tree`, `k 0`. |
 | Coast on an earlier win | The measurement point advances on KEEP. See [The two commits](#the-two-commits). |
 | Conditionally skip a test from optimizable code | `doctor` scans for `.enabled(if:)`, `.disabled(if:)`, `XCTSkip` and `ConditionTrait`, in test targets *and* in non-test sources. **This one is not closed.** See [limitation 1](#1-gate-6-runs-your-tests-and-that-is-the-softest-link-in-the-chain). |
@@ -827,6 +841,27 @@ because `MeasureSession` interleaves the two sides *within* every round, even a
 check after the last candidate sample leaves nine rounds unguarded. The cost is
 **130 ms per eval — 0.33%** of a ~39 s experiment, so no compromise was needed.
 
+**And then the same attack came back on the other side.** The fix above protected
+the *baseline* binary by snapshotting after the build that produces it. The
+*candidate* binary is built at gate 5 — and **gate 6 then runs `swift test`,
+which is the agent's code by construction** — while the snapshot was still not
+taken until after the baseline build, later still. So a binary swapped in during
+the test phase was **adopted by the guard as its own reference** rather than
+detected. An in-scope commit whose `countWords` was the **byte-identical**
+quadratic original, plus a lazy global firing only inside the test runner,
+returned `keep` with `rc 0` at ratios 0.11710 / 0.12203 / 0.12292 and
+`warnings: []`, with a byte-clean tree and all nine gates passing. **Each side is
+now snapshotted immediately after its own build** — candidate at gate 5, before
+the tests; baseline at gate 7 — so neither reference can be taken after a swap.
+
+> **RESIDUAL: the test phase is bounded for binaries, and not otherwise
+> bounded.** `swift test` runs the agent's code, by construction — that is what
+> gate 6 *is*. Nothing stops it doing something other than swapping a binary.
+> Writing the baseline worktree is caught (the guard); spawning survivors is
+> caught (the session sweep); something not yet enumerated is not caught, because
+> it is not yet enumerated. The two binaries on each side are covered. The
+> execution surface they sit on is not.
+
 ### Boundary 2 — the harness's own state files are not authenticated
 
 This one is different in kind: **there is no detection here, and no cheap fix.**
@@ -890,9 +925,31 @@ reused rather than recompiled. `autor3search-swift` deletes the compiled
 build-tool plugins (`.build/plugins`) before every build, because those are
 executed rather than merely linked and the deletion costs about 0.8 s per side;
 it does not delete the rest, which measured ~18 s per side and would roughly
-double the cost of every experiment. Set `purge_build_output` to have every
-artifact rebuilt from verified sources, at that cost. The real remedy is
-operational: run the harness where the agent cannot write `.build`.
+double the cost of every experiment.
+
+> **`purge_build_output` IS NOT A GENERAL REMEDY, and an earlier revision of this
+> section said it was.** It purges at gate 4b, **before** the build — so it
+> discards a **stale** poisoned artifact left by a previous eval, and has nothing
+> whatever to say about one written **during** this one. That was measured, not
+> reasoned: with `AUTOR3SEARCH_SWIFT_PURGE_BUILD_OUTPUT=1` set, an attack that
+> swapped the candidate binary mid-eval still returned **`rc 0`, `keep`, ratio
+> 0.11489**, and the binary's SHA-256 after the eval was byte-identical to the
+> staged poisoned one. The flag did exactly what it says and it was not enough.
+>
+> **What covers a binary written mid-eval is the per-side snapshot**, not the
+> purge: each side's binaries are hashed immediately after **its own** build —
+> the candidate at gate 5, *before* `swift test` runs the agent's code, and the
+> baseline at gate 7 — and re-checked before every sample. Neither side's
+> reference can be taken after a swap. See
+> [boundary 1](#boundary-1--the-agents-benchmark-runs-unsandboxed).
+>
+> So: set `purge_build_output` if you want each eval to start from artifacts
+> rebuilt out of verified sources, at the cost below. Do not set it expecting it
+> to stop a benchmark or a test from writing a binary while the eval is running;
+> that is a different problem with a different answer.
+
+The real remedy for the residual is operational: run the harness where the agent
+cannot write `.build`.
 
 The plugin deletion is **unconditional and is already in the price** you see:
 measured at 1.673 / 1.677 / 1.845 s per side with the plugins kept against
@@ -1516,14 +1573,14 @@ are yours to read.
 
 ### 11. Platform and environment
 
-**macOS** is the developed and measured platform: `swift test` is **330 of 330**,
+**macOS** is the developed and measured platform: `swift test` is **332 of 332**,
 and every timing in this README was taken there.
 
 **But it is not reliably green, and an earlier revision of this section implied
 it was.** Writing this round, one full run came back `rc=1` with two failures —
 `measurementCommitAdvancesAfterAKeep` and
 `aWorktreeGitCanSeeIsDirtyIsRepairedRatherThanBrickingTheRun` — and both passed
-in isolation, with the next full run returning `rc=0, 330 of 330`. That is the
+in isolation, with the next full run returning `rc=0` and every test passing. That is the
 **same test-isolation fragility described under Linux below**: several tests call
 `BaselineRunner.run` concurrently against a SwiftPM cache shared under `HOME`.
 **It is not a Linux-specific problem**, and this README said so only because it
@@ -1650,7 +1707,7 @@ swift build -c release
 swift test
 ```
 
-The test suite is **330 tests on macOS**, all passing, and takes several minutes:
+The test suite is **332 tests on macOS**, all passing, and takes several minutes:
 a good part of it builds and measures the real fixture package with the real
 benchmark harness, because the things worth testing here are the ones that only
 fail for real. On Linux it is **328 tests with 8 issues** — see
