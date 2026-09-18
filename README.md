@@ -101,22 +101,15 @@ Two things worth knowing before you start:
 brew install autor3search/tap/autor3search-swift
 ```
 
-**The tap is not published yet, so that command does not work today.** There is
-now a tagged [v0.1.0 release](https://github.com/autor3search/swift/releases/tag/v0.1.0),
-and the formula at [`Formula/autor3search-swift.rb`](Formula/autor3search-swift.rb)
-carries a real `sha256` computed from its tarball — but `autor3search/tap` does
-not exist, so Homebrew has nowhere to resolve that name from. You can install
-from the formula directly:
+That resolves through [`autor3search/homebrew-tap`](https://github.com/autor3search/homebrew-tap)
+to the tagged [v0.1.0 release](https://github.com/autor3search/swift/releases/tag/v0.1.0).
+The formula's `sha256` was computed from that tarball and verified by `brew fetch`
+before this line was written, so the download is checked rather than trusted.
 
-```sh
-brew install --formula \
-  https://raw.githubusercontent.com/autor3search/swift/main/Formula/autor3search-swift.rb
-```
-
-That URL points at `main`, not at the tag, and deliberately: the `v0.1.0` tarball
-was cut before the hash existed, so the copy of the formula inside it still
-carries the placeholder. The formula on `main` downloads the same immutable
-v0.1.0 tarball and verifies it against the hash computed from it.
+One wrinkle, stated so it does not look like an oversight later: the copy of the
+formula inside the `v0.1.0` tarball still carries the pre-release placeholder
+hash, because the tag was cut before a hash could exist. The tap and `main` carry
+the real one. Install through the tap, not from the tag's copy of the formula.
 
 Or build from source:
 
