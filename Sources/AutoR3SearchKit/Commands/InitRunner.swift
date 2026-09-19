@@ -34,7 +34,7 @@ public enum InitError: Error, CustomStringConvertible {
     /// taking that branch leaves `packageResolvedSHA256` pinning the hash of
     /// zero bytes forever -- the tool's own remedy silently disabling the
     /// dependency pin gate 2 exists to enforce.
-    case lockfileGitIgnored
+    case lockfileGitIgnored(path: String)
 
     /// `swift package resolve` CHANGED an already-tracked `Package.resolved`,
     /// which means the committed lockfile and the manifest disagree. `init`
@@ -42,7 +42,7 @@ public enum InitError: Error, CustomStringConvertible {
     /// is a real dependency change, and quietly committing one under the
     /// banner of "setting up the harness" is precisely the kind of decision
     /// this tool does not make for people.
-    case lockfileOutOfDate
+    case lockfileOutOfDate(path: String)
 
     /// Staging or committing the harness prerequisites failed (no git
     /// identity configured, a hook rejecting the commit, an index lock).
@@ -64,10 +64,12 @@ public enum InitError: Error, CustomStringConvertible {
             Fix whatever stopped the resolve -- network, credentials for a private dependency, \
             an unreachable dependency URL -- and re-run init.
             """
-        case .lockfileGitIgnored:
+        case .lockfileGitIgnored(let path):
             return """
-            refusing to configure this repository: \(Lockfile.name) is excluded by an ignore rule \
-            (check .gitignore).
+            refusing to configure this repository: \(path) is excluded by an ignore rule \
+            (check .gitignore -- a pattern with no leading slash, such as a bare \
+            `\(Lockfile.name)` line, matches at ANY depth and so covers a nested package's \
+            lockfile as well as the root's).
 
             An ignored lockfile cannot be pinned. baseline records its hash so the dependency set \
             cannot move mid-run; ignored, it is absent from frozenCommit, every later worktree \
@@ -75,18 +77,19 @@ public enum InitError: Error, CustomStringConvertible {
             Earlier versions of `autor3search-swift doctor` actively suggested this -- that advice \
             was wrong and has been removed.
 
-            Fix: delete the \(Lockfile.name) line from .gitignore and re-run init.
+            Fix: delete the \(Lockfile.name) line from .gitignore, or add a negation for this \
+            one file (`!\(path)`) if the rest of the rule is wanted, and re-run init.
             """
-        case .lockfileOutOfDate:
+        case .lockfileOutOfDate(let path):
             return """
             refusing to configure this repository: `swift package resolve` rewrote the tracked \
-            \(Lockfile.name), so the committed lockfile and Package.swift disagree.
+            \(path), so the committed lockfile and its Package.swift disagree.
 
             That is a real dependency change, not harness setup, and init will not commit one on \
             your behalf. Review the diff and commit it yourself:
 
-              git diff \(Lockfile.name)
-              git add \(Lockfile.name) && git commit -m "update dependency pins"
+              git diff \(path)
+              git add \(path) && git commit -m "update dependency pins"
 
             Then re-run init.
             """
@@ -128,6 +131,14 @@ public enum InitError: Error, CustomStringConvertible {
             This tool has no other notion of "faster": the verdict is entirely a function of
             the declared benchmarks' timings across a baseline and a candidate. With none
             declared, every candidate would be accepted for no reason or rejected for no reason.
+
+            Both the root Package.swift and a nested Benchmarks/Package.swift were checked (the
+            nested layout -- Benchmarks/Package.swift declaring .package(path: "../") plus
+            ordo-one/package-benchmark, with sources under Benchmarks/Benchmarks/<Target>/ -- is
+            what most adopters use, and init looks there automatically). Neither declares a
+            target depending on the "Benchmark" product. If your benchmark package is somewhere
+            other than Benchmarks/, set benchmark_package_path in .autor3search/config.yaml by
+            hand after creating the config.
 
             To use autor3search-swift on this repository:
 
@@ -276,8 +287,15 @@ public enum InitRunner {
     /// directory is walked directly rather than trusting a manifest-reported file
     /// list that isn't available here. Files are visited in a fixed (sorted) order
     /// so the resulting benchmark list is deterministic across runs.
-    static func discoverBenchmarks(repo: URL, target: SwiftTarget) throws -> [String] {
-        let dir = repo.appendingPathComponent(target.path)
+    ///
+    /// `package` is the directory `swift package describe` was run in, which
+    /// is what `target.path` is relative to. In the nested layout that is
+    /// `<repo>/Benchmarks`, and the target's reported path is
+    /// `Benchmarks/<Target>` -- so joining it to the REPOSITORY would look for
+    /// sources one directory too high and silently discover no benchmarks at
+    /// all, which is the failure this whole feature exists to fix.
+    static func discoverBenchmarks(repo package: URL, target: SwiftTarget) throws -> [String] {
+        let dir = package.appendingPathComponent(target.path)
         guard let enumerator = FileManager.default.enumerator(
             at: dir, includingPropertiesForKeys: [.isRegularFileKey],
             options: [.skipsHiddenFiles]
@@ -490,9 +508,24 @@ public enum InitRunner {
     /// `run` has already succeeded and written the config — a failure here should not
     /// be treated as `init` itself having failed, since the actual work is already
     /// done; see `InitCommand` for how it handles that.
+    ///
+    /// The describe runs in the BENCHMARK PACKAGE (`config.benchmarkPackage(in:)`),
+    /// because that is the package whose manifest declares
+    /// `benchmarkTarget`'s `target_dependencies` -- the root package's
+    /// describe does not know the target exists in the nested layout. The
+    /// paths come back relative to that package and are re-rooted to the
+    /// repository before being compared against `scope`, which is
+    /// repo-relative; comparing the two unrooted would silently find no
+    /// overlap and suppress the warning entirely, which is worse than not
+    /// having it, because a suppressed warning reads as "checked, nothing
+    /// found".
     public static func scopedBenchmarkDependencies(config: Config, repo: URL) throws -> [String] {
-        let helperPaths = try benchmarkHelperPaths(of: config.benchmarkTarget, repo: repo)
-        return scopedBenchmarkDependencyPaths(scope: config.scope, benchmarkHelperPaths: helperPaths)
+        let helperPaths = try benchmarkHelperPaths(
+            of: config.benchmarkTarget, repo: config.benchmarkPackage(in: repo))
+        let rooted = Set(helperPaths.map {
+            BenchmarkPackage.repoRelative($0, under: config.benchmarkPackagePath)
+        })
+        return scopedBenchmarkDependencyPaths(scope: config.scope, benchmarkHelperPaths: rooted)
     }
 
     /// Picks the one target to measure, or refuses. Split out from `run` so the
@@ -613,14 +646,37 @@ public enum InitRunner {
     /// comment is cosmetic; a comment spliced into the wrong line is a corrupt
     /// config.
     static func annotated(_ yaml: String) -> String {
-        let key = "purge_build_output:"
-        let comment = """
+        var text = yaml
+        text = annotating(text, key: "purge_build_output:", with: """
             # Delete every compiled artifact under .build before each side is built, so the
             # measured binaries come only from sources the gates hashed. OFF by default: it
             # roughly doubles the cost of an experiment (measured +33.6s on the demo package).
             # Dependencies are not re-resolved either way -- this is a cold build, not a
             # re-clone. See "The build cache is not verified" in the README.
-            """
+            """)
+        // Only ever present when `init` found the benchmarks in a nested
+        // package. A root-package repository's config.yaml is byte-for-byte
+        // what it was before this key existed, which is what keeps its
+        // baseline-recorded configSHA256 meaningful.
+        text = annotating(text, key: "benchmark_package_path:", with: """
+            # The directory of the SwiftPM package that declares benchmark_target, relative to
+            # the repository root. Omit it entirely for benchmarks in the root package -- that
+            # is what every config written before this key existed means. The benchmark target
+            # and BenchmarkTool are built from this package and measured out of
+            # <path>/.build/release/; `swift test` still runs at the repository root, because
+            # the library's tests are the correctness contract and they live there.
+            """)
+        return text
+    }
+
+    /// Inserts `comment` immediately above the line starting with `key`, or
+    /// returns `yaml` untouched when that key is not in the document.
+    ///
+    /// Split out of `annotated` because there is now more than one optional
+    /// key to annotate, and "return the input unchanged when the key is
+    /// absent" is precisely what makes a key that is only sometimes written
+    /// safe to annotate at all.
+    private static func annotating(_ yaml: String, key: String, with comment: String) -> String {
         var lines = yaml.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         guard let index = lines.firstIndex(where: { $0.hasPrefix(key) }) else { return yaml }
         lines.insert(contentsOf: comment.split(separator: "\n").map(String.init), at: index)
@@ -641,7 +697,8 @@ public enum InitRunner {
     /// Not `private`: the test reaches it through `@testable import`, and a
     /// value this load-bearing being untestable was the defect.
     static func defaultConfig(
-        scope: [String], benchmarkTarget: String, benchmarks: [String]
+        scope: [String], benchmarkTarget: String, benchmarks: [String],
+        benchmarkPackagePath: String? = nil
     ) -> Config {
         Config(
             version: 1,
@@ -652,7 +709,8 @@ public enum InitRunner {
             alpha: defaultAlpha,
             minEffectPct: defaultMinEffectPct,
             maxRegressPct: defaultMaxRegressPct,
-            timeoutSeconds: defaultTimeoutSeconds
+            timeoutSeconds: defaultTimeoutSeconds,
+            benchmarkPackagePath: benchmarkPackagePath
         )
     }
 
@@ -718,6 +776,153 @@ public enum InitRunner {
     public struct Outcome: Sendable {
         public let config: Config
         public let harnessCommit: HarnessCommit?
+
+        /// Things the human needs to read but that are not refusals. Printed
+        /// by `InitCommand` after the summary. Defaulted so existing
+        /// construction sites and tests stay as they are.
+        public var notes: [String] = []
+
+        public init(config: Config, harnessCommit: HarnessCommit?, notes: [String] = []) {
+            self.config = config
+            self.harnessCommit = harnessCommit
+            self.notes = notes
+        }
+    }
+
+    /// Which package `init` decided to measure, and why.
+    struct BenchmarkPackageChoice {
+        /// `nil` for the root package -- the value that goes into
+        /// `benchmark_package_path`, and the value that keeps a root-layout
+        /// repository's config byte-identical to what it was before this
+        /// feature existed.
+        let path: String?
+        /// The describe of the chosen package. `target.path` is relative to
+        /// it, not to the repository.
+        let description: PackageDescription
+        let directory: URL
+        var notes: [String] = []
+    }
+
+    /// Finds the package that declares the benchmark target: the root, or the
+    /// conventional nested one at `Benchmarks/Package.swift`.
+    ///
+    /// ## Why a nested package has to be looked for at all
+    ///
+    /// `init` used to scan the ROOT manifest only. Verified against real
+    /// repositories: `apple/swift-asn1`, `apple/swift-log`,
+    /// `GraphQLSwift/GraphQL` and `CoreOffice/XMLCoder` all use
+    /// `ordo-one/package-benchmark`, all put it in a NESTED package, and NONE
+    /// of them has a benchmark target in its root package. Against
+    /// `apple/swift-asn1` -- seven real benchmarks in the tree -- `init`
+    /// answered "No benchmarks found, so no config was written", rc 1. The
+    /// refusal was correctly worded and completely unhelpful.
+    ///
+    /// ## When both packages declare benchmark targets, the ROOT WINS
+    ///
+    /// Stated plainly because it is a policy choice and not an accident.
+    /// Three reasons, in order of weight:
+    ///
+    /// 1. **It is the no-change branch.** Every repository configured before
+    ///    this feature existed has its benchmark target in the root package.
+    ///    Preferring the nested one would mean that re-running `init --force`
+    ///    on such a repository silently switches WHICH TARGET IS MEASURED --
+    ///    changing the meaning of every number the tool produces, without the
+    ///    human asking for it. This tool does not make that kind of decision
+    ///    on someone's behalf; `multipleBenchmarkTargets` refuses to pick
+    ///    between two targets for exactly the same reason.
+    /// 2. **The nested branch is only needed where the root branch fails.**
+    ///    The measured problem is repositories with NO root benchmark target.
+    ///    Falling back rather than preferring fixes all of them and disturbs
+    ///    none of the working ones.
+    /// 3. **It is the loud direction.** The human is TOLD, in a note `init`
+    ///    prints, that a second candidate exists and how to select it. A
+    ///    wrong choice they can see and correct in one config line beats a
+    ///    right choice they never knew was made.
+    ///
+    /// `init` does NOT hunt for nested packages anywhere but
+    /// `BenchmarkPackage.conventionalDirectory`. A repository can contain many
+    /// nested `Package.swift` files -- vendored sources, sample projects,
+    /// integration fixtures -- and choosing among them by a heuristic is the
+    /// silent guess this file refuses to make everywhere else. An
+    /// unconventional location is configured by hand, and
+    /// `BenchmarkPackage.validate` is what makes that safe.
+    static func locateBenchmarkPackage(repo: URL) throws -> BenchmarkPackageChoice {
+        let rootDescription = try PackageDescribe.describe(repo: repo)
+
+        let nestedPath = BenchmarkPackage.conventionalDirectory
+        let nestedDirectory = repo.appendingPathComponent(nestedPath)
+        let nestedManifest = nestedDirectory.appendingPathComponent("Package.swift")
+        // A describe of the nested package is only attempted when its manifest
+        // is actually there, so a root-layout repository runs exactly the one
+        // `swift package describe` it always ran and pays nothing for this.
+        var nestedDescription: PackageDescription?
+        if FileManager.default.fileExists(atPath: nestedManifest.path) {
+            // Tolerated rather than fatal. A `Benchmarks/Package.swift` that
+            // does not describe -- broken manifest, unreachable dependency --
+            // must not turn a repository whose ROOT benchmarks are perfectly
+            // discoverable into a hard failure. When the root has none either,
+            // the operator gets `noBenchmarks`, whose text now names this
+            // possibility.
+            nestedDescription = try? PackageDescribe.describe(repo: nestedDirectory)
+        }
+
+        let rootHasBenchmarks = !rootDescription.benchmarkTargets.isEmpty
+        let nestedHasBenchmarks = !(nestedDescription?.benchmarkTargets.isEmpty ?? true)
+
+        if rootHasBenchmarks {
+            var notes: [String] = []
+            if nestedHasBenchmarks {
+                let nestedNames = nestedDescription!.benchmarkTargets.map(\.name).sorted()
+                notes.append("""
+                    Both the root package and the nested package at \(nestedPath)/ declare \
+                    benchmark targets. init chose the ROOT package, because that is what every \
+                    configuration written before benchmark_package_path existed means, and \
+                    silently switching which target is measured would change the meaning of \
+                    every number this tool produces without you asking for it.
+
+                    The nested package's benchmark target(s): \
+                    \(nestedNames.joined(separator: ", ")).
+
+                    To measure the nested package instead, add this to \
+                    .autor3search/config.yaml BEFORE running `baseline` (which pins the file's \
+                    hash, after which changing it means re-baselining):
+
+                      benchmark_package_path: \(nestedPath)
+
+                    and set benchmark_target to the nested target you want.
+                    """)
+            }
+            return BenchmarkPackageChoice(
+                path: nil, description: rootDescription, directory: repo, notes: notes)
+        }
+
+        if nestedHasBenchmarks {
+            // Validated before it is written into a config anyone will trust.
+            // `conventionalDirectory` is a constant this file controls, so
+            // this cannot currently fail -- which is exactly why it is checked
+            // here rather than assumed: the one place a path is DERIVED rather
+            // than read from a config is the place a later change would make
+            // it derivable from something else.
+            try BenchmarkPackage.validate(nestedPath, in: repo)
+            return BenchmarkPackageChoice(
+                path: nestedPath, description: nestedDescription!, directory: nestedDirectory,
+                notes: ["""
+                    Benchmarks were found in the nested package at \(nestedPath)/, not in the \
+                    root package, so .autor3search/config.yaml carries \
+                    `benchmark_package_path: \(nestedPath)`. The benchmark target and \
+                    BenchmarkTool are built from that package and measured out of \
+                    \(nestedPath)/.build/release/; `swift test` still runs at the repository \
+                    root, because the library's tests are the correctness contract and they \
+                    live in the root package.
+                    """])
+        }
+
+        // Neither. `selectBenchmarkTarget` on the root description below
+        // produces `noBenchmarks`, which is the right refusal and the right
+        // message; returning the root here keeps one refusal path rather than
+        // two that must be kept saying the same thing.
+        return BenchmarkPackageChoice(
+            path: nil, description: rootDescription, directory: repo, notes: [])
     }
 
     public static func runReportingCommit(repo: URL, force: Bool) throws -> Outcome {
@@ -726,16 +931,30 @@ public enum InitRunner {
             throw InitError.configExists
         }
 
-        let description = try PackageDescribe.describe(repo: repo)
+        // TWO DESCRIBES, TWO QUESTIONS, and they stay distinct all the way
+        // down. The BENCHMARK PACKAGE's describe (`choice.description`)
+        // answers "which target is measured, and what benchmarks does it
+        // declare". The ROOT package's describe (`rootDescription`) answers
+        // "what may the agent edit" -- `deriveScope` builds `scope` out of the
+        // root package's non-test, non-benchmark targets, because the code
+        // under optimisation is the library, and the library is in the root
+        // package. Deriving scope from the benchmark package would produce a
+        // scope covering the benchmark's own sources, which is the one thing
+        // `scope` exists to keep out.
+        let choice = try locateBenchmarkPackage(repo: repo)
+        let description = choice.description
+        let rootDescription = choice.path == nil
+            ? description : try PackageDescribe.describe(repo: repo)
         let chosenTarget = try selectBenchmarkTarget(from: description)
 
-        let names = try discoverBenchmarks(repo: repo, target: chosenTarget)
+        let names = try discoverBenchmarks(repo: choice.directory, target: chosenTarget)
         try validateDiscovered(names)
 
-        let scope = deriveScope(from: description)
+        let scope = deriveScope(from: rootDescription)
 
         let config = defaultConfig(
-            scope: scope, benchmarkTarget: chosenTarget.name, benchmarks: names)
+            scope: scope, benchmarkTarget: chosenTarget.name, benchmarks: names,
+            benchmarkPackagePath: choice.path)
         // Belt-and-suspenders: if `scope` somehow came back empty (e.g. every
         // discovered target is a test or benchmark target), fail loudly here via the
         // same ConfigError the config would fail on at load time, rather than writing
@@ -746,10 +965,34 @@ public enum InitRunner {
         let tag = todayTag()
         let programMDText = ProgramMD.render(config: config, tag: tag)
 
-        // LAST refusal, and still ahead of the first write: resolve the
+        // LAST refusals, and still ahead of the first write: resolve the
         // dependency graph and refuse an ignored or out-of-date lockfile now,
         // while "refusing to configure this repository" is a true statement.
+        //
+        // BOTH PACKAGES, and the nested one is the one that usually has the
+        // dependencies. In the nested layout the ROOT package frequently has
+        // none at all (`apple/swift-asn1` has zero), while the benchmark
+        // package declares `ordo-one/package-benchmark` -- so the lockfile
+        // that must exist before the freeze is `Benchmarks/Package.resolved`,
+        // and the old code never looked at it.
+        //
+        // The brick this prevents is exactly the one this whole file's
+        // lockfile machinery exists for, one directory down. `swift build
+        // --package-path Benchmarks` writes `Benchmarks/Package.resolved`
+        // into that package's root. `baseline` takes its manifest inventory
+        // BEFORE anything builds, and `ScopeGate.isManifestPath` matches
+        // `Package.resolved` on the LAST path component, so a nested lockfile
+        // that does not exist yet is recorded as absent -- and gate 2a then
+        // reports it as a manifest that APPEARED on the first eval, forever,
+        // because frozenCommit never advances.
         let requirement = try resolveLockfile(repo: repo)
+        var pathsToTrack = requirement.pathsToTrack
+        if let benchmarkPackagePath = choice.path {
+            let nested = try resolveLockfile(repo: choice.directory, label: benchmarkPackagePath)
+            if nested == .required {
+                pathsToTrack.append("\(benchmarkPackagePath)/\(Lockfile.name)")
+            }
+        }
 
         try FileManager.default.createDirectory(
             at: configURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -758,9 +1001,9 @@ public enum InitRunner {
             to: repo.appendingPathComponent("program.md"), atomically: true, encoding: .utf8)
         try ensureGitignoreCoversBuildOutput(repo: repo)
         let harnessCommit = try commitHarnessPrerequisites(
-            repo: repo, paths: requirement.pathsToTrack)
+            repo: repo, paths: pathsToTrack)
 
-        return Outcome(config: config, harnessCommit: harnessCommit)
+        return Outcome(config: config, harnessCommit: harnessCommit, notes: choice.notes)
     }
 
     // =====================================================================
@@ -833,10 +1076,18 @@ public enum InitRunner {
     /// created by the `swift package describe` that runs before this. Neither
     /// is part of the "either every file this tool writes appears, or none
     /// does" guarantee the ordering exists to protect.
-    static func resolveLockfile(repo: URL) throws -> LockfileRequirement {
+    ///
+    /// `label` names the package in every refusal this raises. `nil` is the
+    /// repository root and produces the wording this has always produced; a
+    /// non-nil one (a nested benchmark package's directory) makes the
+    /// difference between "fix .gitignore" and "fix .gitignore -- but for
+    /// WHICH Package.resolved?" on a repository that has two.
+    static func resolveLockfile(repo: URL, label: String? = nil) throws -> LockfileRequirement {
+        let lockfilePath = label.map { "\($0)/\(Lockfile.name)" } ?? Lockfile.name
         switch Lockfile.probe(in: repo) {
         case .undetermined(let why):
-            throw InitError.dependencyResolveFailed(why)
+            throw InitError.dependencyResolveFailed(
+                label.map { "in the nested benchmark package at \($0)/: \(why)" } ?? why)
         case .notProduced:
             // No external dependencies anywhere in the graph. SwiftPM has said
             // so itself; there is no lockfile to track and never will be.
@@ -848,8 +1099,19 @@ public enum InitRunner {
         // An ignore rule over the lockfile is fatal, whether or not the file
         // is currently tracked: it is the exact remedy `doctor` used to
         // recommend, and it silently un-pins every dependency.
+        //
+        // Asked with the path as git sees it. `Lockfile.isGitIgnored(repo:)`
+        // runs `git check-ignore -- Package.resolved` with the NESTED
+        // directory as cwd, and `git check-ignore` resolves a relative path
+        // against cwd, so that already answers for the nested file -- but
+        // rules in the repository's ROOT .gitignore apply to it too. A
+        // pattern with no leading slash, such as the bare `Package.resolved`
+        // line in `apple/swift-asn1`'s root .gitignore, matches at ANY depth,
+        // so the nested lockfile is ignored by a rule written for the root
+        // package's. That is refused here for the same reason the root's is:
+        // an ignored lockfile leaves the dependency set un-pinned.
         if Lockfile.isGitIgnored(repo: repo) == true {
-            throw InitError.lockfileGitIgnored
+            throw InitError.lockfileGitIgnored(path: lockfilePath)
         }
 
         // `isTracked` returns nil when this is not a git repository at all.
@@ -863,7 +1125,7 @@ public enum InitRunner {
             // resolve rewrote a lockfile that was already committed: the
             // manifest and the pins disagree. That is a dependency change, and
             // init does not make one silently.
-            throw InitError.lockfileOutOfDate
+            throw InitError.lockfileOutOfDate(path: lockfilePath)
         }
         return .required
     }

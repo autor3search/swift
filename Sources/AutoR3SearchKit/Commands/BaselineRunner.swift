@@ -76,7 +76,12 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
     /// `manifest_change_rejected` (if the agent commits it) or
     /// `dirty_working_tree` (if it does not), with no way out, since
     /// `frozenCommit` never advances.
-    case unpinnedDependencies(identities: [String])
+    ///
+    /// `packagePath` names the package the refusal is about: `nil` for the
+    /// repository root, the `benchmark_package_path` directory for a nested
+    /// benchmark package. Both are refused, because both are compiled into
+    /// the measured binary.
+    case unpinnedDependencies(identities: [String], packagePath: String?)
 
     /// A `Package.resolved` is on disk but git is not tracking it -- almost
     /// always because it is named in `.gitignore`, which is what `doctor`
@@ -84,7 +89,7 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
     /// anything: it is absent from `frozenCommit`, so every later worktree
     /// checkout resolves its own, and the hash recorded here describes a file
     /// no subsequent run is guaranteed to see.
-    case lockfileNotTracked
+    case lockfileNotTracked(packagePath: String?)
 
     /// Whether this package needs a lockfile could not be established --
     /// `swift package resolve` failed to run or exited non-zero (no network,
@@ -92,7 +97,7 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
     /// closed, because the alternative is to record "no dependencies to pin"
     /// on the strength of a check that never ran, which is the exact class of
     /// silent-success failure this project has been bitten by repeatedly.
-    case dependencyPinUndetermined(String)
+    case dependencyPinUndetermined(String, packagePath: String?)
 
     /// The manifest inventory could not be built. Fatal for the same reason
     /// `packageDescribeFailed` is: a baseline that records an EMPTY inventory
@@ -116,6 +121,24 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
     /// same reason the others are, and with a sharper edge: the tree it covers
     /// contains build-tool plugins, which SwiftPM EXECUTES during the build.
     case checkoutInventoryFailed(String)
+
+    /// How the three lockfile refusals name the package they are about, so one
+    /// message serves the repository root and a nested benchmark package
+    /// without two copies of the same paragraph drifting apart.
+    ///
+    /// `lockfile` is the path a human would type (`Package.resolved`, or
+    /// `Benchmarks/Package.resolved`), built through `BenchmarkPackage
+    /// .repoRelative` so it is joined in the one place that joins such paths.
+    /// `resolveIn` is the directory `swift package resolve` has to run in for
+    /// the fix to apply to the right package.
+    static func lockfileNaming(_ packagePath: String?)
+        -> (subject: String, lockfile: String, resolveIn: String) {
+        let lockfile = BenchmarkPackage.repoRelative(Lockfile.name, under: packagePath)
+        guard let packagePath, !packagePath.isEmpty else {
+            return ("this package", lockfile, ".")
+        }
+        return ("the nested benchmark package at \(packagePath)/", lockfile, packagePath)
+    }
 
     public var description: String {
         switch self {
@@ -164,13 +187,14 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
             hash. Recording the hash of zero bytes here would look exactly like a real pin while \
             pinning nothing -- "missing" and "empty" must not be the same 64 hex characters.
             """
-        case .unpinnedDependencies(let identities):
+        case .unpinnedDependencies(let identities, let packagePath):
+            let (subject, lockfile, resolveIn) = BaselineError.lockfileNaming(packagePath)
             let named = identities.isEmpty
                 ? ""
                 : " (declared dependencies: \(identities.joined(separator: ", ")))"
             return """
-            refusing to establish a baseline: this package resolves external dependencies\(named) \
-            but has no \(Lockfile.name). baseline pins that file's hash so the dependency set \
+            refusing to establish a baseline: \(subject) resolves external dependencies\(named) \
+            but has no \(lockfile). baseline pins that file's hash so the dependency set \
             cannot move mid-run -- gate 2 exists precisely so the agent cannot win by changing a \
             dependency -- and with no lockfile there is nothing to pin.
 
@@ -183,26 +207,32 @@ public enum BaselineError: Error, CustomStringConvertible, Equatable {
             Fix: run `autor3search-swift init` (which now runs `swift package resolve` and \
             commits the result), or by hand:
 
-              swift package resolve && git add \(Lockfile.name) && git commit -m "pin dependencies"
+              (cd \(resolveIn) && swift package resolve) && git add \(lockfile) && \
+            git commit -m "pin dependencies"
 
             Do NOT add \(Lockfile.name) to .gitignore. That silences the symptom and leaves every \
-            dependency unpinned forever.
+            dependency unpinned forever -- and a bare `\(Lockfile.name)` line with no leading \
+            slash matches at ANY depth, so it covers a nested package's lockfile as well as the \
+            root's.
             """
-        case .lockfileNotTracked:
+        case .lockfileNotTracked(let packagePath):
+            let (_, lockfile, _) = BaselineError.lockfileNaming(packagePath)
             return """
-            refusing to establish a baseline: \(Lockfile.name) exists on disk but git is not \
+            refusing to establish a baseline: \(lockfile) exists on disk but git is not \
             tracking it -- check whether .gitignore names it. An ignored lockfile is pinned by \
             nothing: it is absent from frozenCommit, so every later worktree checkout resolves \
             its own, and the hash recorded here would describe a file no subsequent run is \
             guaranteed to see.
 
-            Fix: remove \(Lockfile.name) from .gitignore, then \
-            `git add \(Lockfile.name) && git commit -m "pin dependencies"`.
+            Fix: remove \(Lockfile.name) from .gitignore (or add a negation for this one file, \
+            `!\(lockfile)`, if the rest of the rule is wanted), then \
+            `git add \(lockfile) && git commit -m "pin dependencies"`.
             """
-        case .dependencyPinUndetermined(let why):
+        case .dependencyPinUndetermined(let why, let packagePath):
+            let (subject, lockfile, _) = BaselineError.lockfileNaming(packagePath)
             return """
-            refusing to establish a baseline: could not determine whether this package needs a \
-            \(Lockfile.name), because `swift package resolve` did not succeed (\(why)).
+            refusing to establish a baseline: could not determine whether \(subject) needs a \
+            \(lockfile), because `swift package resolve` did not succeed (\(why)).
 
             Treating that as "no dependencies to pin" would record a baseline on the strength of \
             a check that never ran. Fix whatever stopped the resolve -- network, credentials for \
@@ -380,10 +410,33 @@ public enum BaselineRunner {
     ///
     /// A trailing slash is tolerated because `git status --ignored` collapses a
     /// wholly-ignored directory into a single `dir/` record.
+    ///
+    /// `.build` AND `.git` ARE MATCHED AT ANY DEPTH, and that is a correction
+    /// rather than a widening. `neverWalkedDirectories` has always been
+    /// applied by NAME to every directory the disk walks hit -- see
+    /// `treeInventory`, which tests `neverWalkedDirectories.contains(name)`
+    /// against `lastPathComponent`, and `manifestInventory`, which tests
+    /// `name == ".git" || name == ".build"` the same way. So gates 2a and 2c
+    /// already stepped over a nested package's `Benchmarks/.build` at any
+    /// depth, while THIS predicate -- which decides what gate 2b's ignored
+    /// inventory records -- matched only at the repository root. A nested
+    /// benchmark package's `.build` was therefore about to be hashed in full
+    /// by `ignoredInventory` (hundreds of megabytes) and then reported as
+    /// changed on the very next eval, because a build directory changes every
+    /// time anything is built. Making the two agree is what gives the nested
+    /// `.build` the same treatment the root's has always had; it opens no
+    /// door, because the tree it now exempts here is one the other two
+    /// inventories were already not looking at.
+    ///
+    /// `results.tsv`, `run.log` and `.autor3search/profiles/` stay ROOT-
+    /// relative, deliberately: those are paths this tool writes, at exactly
+    /// one place each, and a `Benchmarks/results.tsv` is not one of them.
     static func isHarnessOutput(_ relative: String) -> Bool {
         var path = relative
         while path.hasSuffix("/") { path.removeLast() }
         if harnessOutputFiles.contains(path) { return true }
+        let components = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        if components.contains(where: { neverWalkedDirectories.contains($0) }) { return true }
         return harnessOutputDirectories.contains { path == $0 || path.hasPrefix($0 + "/") }
     }
 
@@ -550,8 +603,19 @@ public enum BaselineRunner {
     /// gate 2a, and git's content addressing means a checkout that IS at the
     /// pinned revision has the real bytes. So a checkout that is missing
     /// entirely is safe to allow -- SwiftPM re-clones it from that pin.
-    static func checkoutInventory(in directory: URL) throws -> [String: String] {
-        let root = directory.appendingPathComponent(checkoutsSubpath).standardizedFileURL
+    ///
+    /// `packagePath` selects WHICH package's checkouts. A nested benchmark
+    /// package has its own `.build/checkouts`, holding its own copy of
+    /// `ordo-one/package-benchmark` -- including `BenchmarkPlugin`, the
+    /// build-tool plugin that is EXECUTED when the benchmark is built. That
+    /// tree is compiled into the measured binary just as surely as the root
+    /// package's is, so it gets its own inventory rather than being folded in
+    /// with the root's: `checkoutDependency(of:)` groups by the first path
+    /// component, and prefixing nested entries to share one map would make
+    /// `Benchmarks` look like a dependency name.
+    static func checkoutInventory(in directory: URL, packagePath: String? = nil) throws -> [String: String] {
+        let packageRoot = BenchmarkPackage.directory(in: directory, path: packagePath)
+        let root = packageRoot.appendingPathComponent(checkoutsSubpath).standardizedFileURL
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory),
               isDirectory.boolValue else { return [:] }
@@ -704,21 +768,46 @@ public enum BaselineRunner {
     /// `Package.resolved` and `.build/`, and `repo`'s cleanliness is what
     /// every later gate depends on. The worktree is disposable and is reset
     /// to `frozenCommit` at the end of `run` anyway.
-    private static func resolveLockfilePin(repo: URL, worktree: URL) throws -> String {
-        if Lockfile.exists(in: repo) {
-            guard Lockfile.isTracked(repo: repo) != false else {
-                throw BaselineError.lockfileNotTracked
+    ///
+    /// EVERY PACKAGE THIS TOOL BUILDS IN, not just the root. `packagePath` nil
+    /// is the repository itself; a non-nil value is the nested benchmark
+    /// package, which has its own manifest, its own dependency set (it is the
+    /// package that declares `ordo-one/package-benchmark`) and its own
+    /// `Package.resolved`. Applying this to the root alone left a real,
+    /// reachable brick: a nested package with source-control dependencies and
+    /// no tracked lockfile PASSED `baseline`, and then the first `eval`'s own
+    /// `swift build --product BenchmarkTool` created
+    /// `<benchmark_package_path>/Package.resolved`, which gate 2a's manifest
+    /// inventory reports as a manifest appearing where baseline recorded none
+    /// -- `manifest_change_rejected`, permanently, because `frozenCommit`
+    /// never advances. That is precisely the defect this function was written
+    /// to prevent, reached one directory down.
+    ///
+    /// `Lockfile.exists`, `isTracked` and `probe` all take a DIRECTORY, and
+    /// every git command this project runs carries an explicit `cwd`, so the
+    /// nested package is asked the same three questions by pointing the same
+    /// three functions one level down -- no second implementation, and no way
+    /// for the two to answer differently.
+    static func resolveLockfilePin(
+        repo: URL, worktree: URL, packagePath: String? = nil
+    ) throws -> String {
+        let package = BenchmarkPackage.directory(in: repo, path: packagePath)
+        let packageInWorktree = BenchmarkPackage.directory(in: worktree, path: packagePath)
+        if Lockfile.exists(in: package) {
+            guard Lockfile.isTracked(repo: package) != false else {
+                throw BaselineError.lockfileNotTracked(packagePath: packagePath)
             }
-            return try sha256File(Lockfile.url(in: repo))
+            return try sha256File(Lockfile.url(in: package))
         }
-        switch Lockfile.probe(in: worktree) {
+        switch Lockfile.probe(in: packageInWorktree) {
         case .notProduced:
             return Lockfile.absentPin
         case .required:
             throw BaselineError.unpinnedDependencies(
-                identities: (try? Lockfile.externalDependencyIdentities(repo: repo)) ?? [])
+                identities: (try? Lockfile.externalDependencyIdentities(repo: package)) ?? [],
+                packagePath: packagePath)
         case .undetermined(let why):
-            throw BaselineError.dependencyPinUndetermined(why)
+            throw BaselineError.dependencyPinUndetermined(why, packagePath: packagePath)
         }
     }
 
@@ -846,8 +935,32 @@ public enum BaselineRunner {
         // It also closes a TOCTOU window. Recording a hash taken at the end
         // would pin whatever the file became during the warm build; these are
         // the bytes as they were when the tree was verified clean.
-        let configSHA256 = try sha256File(repo.appendingPathComponent(".autor3search/config.yaml"))
+        let configURL = repo.appendingPathComponent(".autor3search/config.yaml")
+        let configSHA256 = try sha256File(configURL)
         let packageSwiftSHA256 = try sha256File(repo.appendingPathComponent("Package.swift"))
+        // Loaded ONCE, here, and reused for `scope`, for the benchmark
+        // package's location and for the warm build. It used to be re-read
+        // twice with `try?` at two different points in `run`, which was
+        // harmless while the only thing read was `scope` and is not once the
+        // geometry of what gets built depends on it: two reads are two chances
+        // to disagree about which package the benchmark target lives in.
+        //
+        // Still `try?`. A config that cannot be parsed yields an empty scope
+        // (the fail-closed direction: the whole tree is inventoried) and a nil
+        // benchmark package path (the root, which is where `describe` would
+        // look anyway). `eval` rejects an unparseable config outright with
+        // `config_unreadable`, so the run cannot proceed on one either way,
+        // and turning a config typo into a `baseline` crash about inventories
+        // would be the less useful diagnosis.
+        let liveConfig = try? Config.load(configURL)
+        // The nested benchmark package's location is validated BEFORE the
+        // first side effect, alongside the hashes: a `benchmark_package_path`
+        // that escapes the repository, or that names a directory holding no
+        // Package.swift, is knowable from the start, and every refusal above
+        // this line leaves nothing behind to clean up.
+        try liveConfig?.validateBenchmarkPackage(in: repo)
+        let benchmarkPackagePath = liveConfig?.benchmarkPackagePath
+        let benchmarkPackageURL = BenchmarkPackage.directory(in: repo, path: benchmarkPackagePath)
         // The manifest inventory belongs here for the same two reasons: a
         // failure leaves nothing behind, and the hashes are the bytes from the
         // moment the tree was verified clean rather than whatever the warm
@@ -868,7 +981,7 @@ public enum BaselineRunner {
         // config outright (`config_unreadable`), so the run cannot proceed on
         // one either way, and turning a config typo into a `baseline` crash
         // with a message about inventories would be the less useful diagnosis.
-        let scope = (try? Config.load(repo.appendingPathComponent(".autor3search/config.yaml")))?.scope ?? []
+        let scope = liveConfig?.scope ?? []
         let treeSHA256 = try treeInventory(repo: repo, scope: scope)
         // ...and the files an ignore rule hides from git entirely. RECORDED,
         // not refused: see `ignoredInventory`. Taken here, with the other two,
@@ -900,13 +1013,49 @@ public enum BaselineRunner {
         // warning -- see `BaselineError.packageDescribeFailed`. The empty-
         // manifest check below is unconditional for the same reason: there
         // is no path left where an empty freeze set is tolerated silently.
+        //
+        // TWO DESCRIBES, TWO DIFFERENT QUESTIONS, and they must not be
+        // conflated. The ROOT package's describe answers "which TEST targets
+        // are the correctness contract, and which source targets exist" --
+        // gate 6 runs `swift test` at the repository root and nowhere else,
+        // because the library's tests live there. The BENCHMARK PACKAGE's
+        // describe answers "which BENCHMARK targets are measured", and in the
+        // nested layout that is a different package with a different manifest.
+        // In the root-package layout the two are the same directory and the
+        // second describe is skipped entirely, so nothing changes.
         let description: PackageDescription
         do {
             description = try PackageDescribe.describe(repo: repo)
         } catch {
             throw BaselineError.packageDescribeFailed("\(error)")
         }
-        let dirs = description.frozenDirectories
+        // THE FREEZE SET IS THE UNION. An agent that can rewrite the benchmark
+        // can make it measure less work, which is the whole reason benchmark
+        // sources are frozen alongside the tests -- and a benchmark target
+        // living in a nested package is no less rewritable for being nested.
+        // Its paths come back relative to ITS package (`Benchmarks/<Target>`
+        // for a describe run in `Benchmarks/`), so they are re-rooted exactly
+        // once, here, through `BenchmarkPackage.repoRelative`; everything
+        // downstream -- `FrozenSnapshot.directories`, gate 3's restore, gate
+        // 4's new-file scan -- is repo-relative and stays that way.
+        var dirs = description.frozenDirectories
+        if let benchmarkPackagePath, !benchmarkPackagePath.isEmpty {
+            let benchmarkDescription: PackageDescription
+            do {
+                benchmarkDescription = try PackageDescribe.describe(repo: benchmarkPackageURL)
+            } catch {
+                throw BaselineError.packageDescribeFailed(
+                    "in the nested benchmark package at \(benchmarkPackagePath)/: \(error)")
+            }
+            // Its TEST targets are frozen too. A nested benchmark package
+            // rarely has any, but if it does they are as much a thing an agent
+            // could weaken as the root package's, and `frozenDirectories` is
+            // already defined as "tests AND benchmarks".
+            dirs += benchmarkDescription.frozenDirectories.map {
+                BenchmarkPackage.repoRelative($0, under: benchmarkPackagePath)
+            }
+            dirs = Array(Set(dirs)).sorted()
+        }
         for dir in dirs {
             var isDirectory: ObjCBool = false
             let exists = FileManager.default.fileExists(
@@ -938,12 +1087,36 @@ public enum BaselineRunner {
         // refusal after the two pre-side-effect guards.
         let packageResolvedPin = try resolveLockfilePin(repo: repo, worktree: worktreeURL)
 
+        // THE SAME THREE QUESTIONS, ASKED OF THE NESTED BENCHMARK PACKAGE.
+        // Its answer is not recorded in `packageResolvedSHA256` -- that field
+        // is the ROOT package's pin, and gate 2a's manifest inventory already
+        // carries `<benchmark_package_path>/Package.resolved`'s hash by name
+        // (measured on `apple/swift-asn1`: `Benchmarks/Package.resolved`
+        // c787f2c3...). What is wanted here is the REFUSAL, up front, instead
+        // of a baseline that succeeds and an eval that bricks. Discarded
+        // deliberately, and named so, rather than left looking like a value
+        // someone forgot to use.
+        if let benchmarkPackagePath, !benchmarkPackagePath.isEmpty {
+            _ = try resolveLockfilePin(
+                repo: repo, worktree: worktreeURL, packagePath: benchmarkPackagePath)
+        }
+
         // Warm the release build so every eval after this one reuses it
         // instead of paying a cold Swift build. Best-effort: see
         // `warmBuild`'s doc comment for why a repository that cannot
         // currently build does not block baseline from completing.
-        let config = try? Config.load(repo.appendingPathComponent(".autor3search/config.yaml"))
-        for message in warmBuild(worktree: worktreeURL, benchmarkTarget: config?.benchmarkTarget) {
+        //
+        // Warmed in the WORKTREE's copy of the benchmark package, not the
+        // worktree root: `swift build --product BenchmarkTool` has to run
+        // against the package that declares the dependency providing it, and
+        // in the nested layout that is `<worktree>/<benchmark_package_path>`.
+        // A warm build aimed at the root package would exit non-zero on every
+        // nested-layout repository ("no product named BenchmarkTool") and
+        // every eval would then pay a cold build it was told it would not.
+        for message in warmBuild(
+            worktree: BenchmarkPackage.directory(in: worktreeURL, path: benchmarkPackagePath),
+            benchmarkTarget: liveConfig?.benchmarkTarget
+        ) {
             warn(message)
         }
 
@@ -1009,6 +1182,37 @@ public enum BaselineRunner {
             checkoutSHA256[path] = digest
         }
 
+        // THE NESTED BENCHMARK PACKAGE'S OWN CHECKOUTS, on both sides, by the
+        // identical argument one paragraph up. It resolves its own
+        // `Package.resolved` into its own `.build/checkouts`, that tree is
+        // what the benchmark binary is compiled from, and `BenchmarkPlugin`
+        // -- executed during that build -- lives in it. `.build` is exempt
+        // from every other inventory at any depth, so without this the nested
+        // dependency source would be the one part of the measured binary
+        // nothing had hashed.
+        //
+        // `nil`, not `[:]`, when there is no nested package: the empty map has
+        // to keep meaning "there is a nested package and it has no checkouts",
+        // which is a state gate 2d treats differently from "there is no nested
+        // package at all".
+        var benchmarkCheckoutSHA256: [String: String]?
+        if let benchmarkPackagePath, !benchmarkPackagePath.isEmpty {
+            var merged = try checkoutInventory(in: repo, packagePath: benchmarkPackagePath)
+            for (path, digest) in try checkoutInventory(
+                in: worktreeURL, packagePath: benchmarkPackagePath) {
+                if let existing = merged[path], existing != digest {
+                    throw BaselineError.checkoutInventoryFailed("""
+                        \(benchmarkPackagePath)/\(checkoutsSubpath)/\(path) differs between the \
+                        repository and the pinned worktree, though both resolve the same \
+                        \(benchmarkPackagePath)/\(Lockfile.name). One of the two is not the \
+                        revision that file's dependency is pinned to
+                        """)
+                }
+                merged[path] = digest
+            }
+            benchmarkCheckoutSHA256 = merged
+        }
+
         let record = BaselineRecord(
             tag: tag,
             frozenCommit: commit,
@@ -1020,7 +1224,8 @@ public enum BaselineRunner {
             manifestSHA256: manifestSHA256,
             treeSHA256: treeSHA256,
             ignoredSHA256: ignoredSHA256,
-            checkoutSHA256: checkoutSHA256)
+            checkoutSHA256: checkoutSHA256,
+            benchmarkCheckoutSHA256: benchmarkCheckoutSHA256)
         try record.save(to: recordURL)
         return record
     }

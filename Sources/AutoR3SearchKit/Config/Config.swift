@@ -42,12 +42,51 @@ public struct Config: Codable, Equatable, Sendable {
     /// the baseline pinned.
     public var purgeBuildOutput: Bool
 
-    /// The memberwise initialiser. `purgeBuildOutput` is the one parameter
-    /// with a default, deliberately: the file's own header says later code
-    /// constructs this with these exact labels in this exact order, and
-    /// giving the new field a default keeps every one of those call sites --
-    /// and every test fixture -- compiling unchanged. A new REQUIRED
-    /// parameter would have been a churn of a dozen files to express "off".
+    /// The directory of the SwiftPM package that declares `benchmarkTarget`,
+    /// relative to the repository root. `nil` means the repository root
+    /// itself, which is exactly what every configuration written before this
+    /// field existed meant and still means.
+    ///
+    /// WHY IT EXISTS. `init` used to discover benchmark targets by scanning
+    /// the ROOT `Package.swift` for a target carrying the `Benchmark` product
+    /// dependency. Essentially no real adopter of `ordo-one/package-benchmark`
+    /// lays a repository out that way. The convention the ecosystem actually
+    /// uses is a NESTED package: `Benchmarks/Package.swift`, declaring
+    /// `.package(path: "../")` plus the benchmark dependency, with the
+    /// benchmark target's sources under `Benchmarks/Benchmarks/<Target>/`.
+    /// `apple/swift-asn1`, `apple/swift-log`, `GraphQLSwift/GraphQL` and
+    /// `CoreOffice/XMLCoder` all do this, and NONE of them has a benchmark
+    /// target in its root package -- so `init` answered "No benchmarks found"
+    /// on every one of them while seven real benchmarks sat in the tree.
+    ///
+    /// WHAT IT CHANGES. Everything that addresses the benchmark package --
+    /// `swift package describe` for target discovery, the release build of
+    /// the benchmark target and `BenchmarkTool`, the `.build/release/`
+    /// directory gate 8 launches out of, the `.build/checkouts` gate 2d
+    /// verifies, the `.build/plugins` gate 4b purges -- is rooted at
+    /// `<repo>/<benchmarkPackagePath>` instead of `<repo>`. `swift test` is
+    /// NOT: the library's tests are the correctness contract and they live in
+    /// the ROOT package, so gate 6 still runs there.
+    ///
+    /// VALIDATED, not merely stored. It must be relative, must not escape the
+    /// repository (no `..`, no absolute path), and must name a directory that
+    /// actually contains a `Package.swift`. See
+    /// `ConfigError.badBenchmarkPackagePath` and `BenchmarkPackage.validate`.
+    ///
+    /// OPTIONAL ON DECODE, ALWAYS -- the same rule, for the same reason, as
+    /// `purgeBuildOutput`: `baseline` records a SHA-256 of `config.yaml`'s
+    /// bytes and gate 2 refuses a mismatch, so a REQUIRED key here would not
+    /// merely fail to parse, it would brick every in-flight run, because the
+    /// fix (adding the key) changes the hash the baseline pinned.
+    public var benchmarkPackagePath: String?
+
+    /// The memberwise initialiser. `purgeBuildOutput` and
+    /// `benchmarkPackagePath` are the two parameters with defaults,
+    /// deliberately: the file's own header says later code constructs this
+    /// with these exact labels in this exact order, and giving the new fields
+    /// defaults keeps every one of those call sites -- and every test fixture
+    /// -- compiling unchanged. A new REQUIRED parameter would have been a
+    /// churn of a dozen files to express "the repository root".
     public init(
         version: Int,
         scope: [String],
@@ -58,8 +97,10 @@ public struct Config: Codable, Equatable, Sendable {
         minEffectPct: Double,
         maxRegressPct: Double,
         timeoutSeconds: Int,
-        purgeBuildOutput: Bool = false
+        purgeBuildOutput: Bool = false,
+        benchmarkPackagePath: String? = nil
     ) {
+        self.benchmarkPackagePath = benchmarkPackagePath
         self.version = version
         self.scope = scope
         self.benchmarkTarget = benchmarkTarget
@@ -79,9 +120,11 @@ public struct Config: Codable, Equatable, Sendable {
         case maxRegressPct = "max_regress_pct"
         case timeoutSeconds = "timeout_seconds"
         case purgeBuildOutput = "purge_build_output"
+        case benchmarkPackagePath = "benchmark_package_path"
     }
 
-    /// Hand-written ONLY to make `purge_build_output` optional-with-a-default.
+    /// Hand-written ONLY to make `purge_build_output` and
+    /// `benchmark_package_path` optional-with-a-default.
     ///
     /// Every other key stays REQUIRED, and that asymmetry is the point rather
     /// than an oversight. A config missing `benchmarks` or `alpha` is a config
@@ -105,6 +148,13 @@ public struct Config: Codable, Equatable, Sendable {
         maxRegressPct = try c.decode(Double.self, forKey: .maxRegressPct)
         timeoutSeconds = try c.decode(Int.self, forKey: .timeoutSeconds)
         purgeBuildOutput = try c.decodeIfPresent(Bool.self, forKey: .purgeBuildOutput) ?? false
+        // Written out in full for exactly the reason above it: `nil` here
+        // means "the repository root", which is what every config written
+        // before this key existed has always meant, while
+        // `benchmark_package_path: [1, 2]` is a config the operator got wrong
+        // and must be told about. `try?` would collapse those two into one.
+        benchmarkPackagePath =
+            try c.decodeIfPresent(String.self, forKey: .benchmarkPackagePath) ?? nil
     }
 
     /// Loads and decodes `autor3search.yaml` from `url`. Does not validate;

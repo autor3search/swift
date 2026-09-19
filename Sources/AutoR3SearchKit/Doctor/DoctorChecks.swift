@@ -539,6 +539,55 @@ public enum DoctorChecks {
     /// problem to warn about. `all(repo:)` uses this to decide whether the
     /// build and run-length checks (which both need `Config`) are meaningful
     /// to attempt.
+    /// Where the benchmark package is, and whether the configured location is
+    /// one `eval` will accept.
+    ///
+    /// This is a `doctor` check rather than only an `eval` gate because the
+    /// failure it catches is a CONFIGURATION failure, and `eval` would report
+    /// it as `invalid_config` at 3am after the agent had been working all
+    /// night. The three ways to get `benchmark_package_path` wrong -- a path
+    /// that escapes the repository, one naming a directory with no
+    /// `Package.swift`, one whose directory simply is not there any more
+    /// (renamed, or checked out on a branch that predates it) -- are all
+    /// knowable the moment someone runs `doctor`, which is what `doctor` is
+    /// for.
+    ///
+    /// `ok` and SILENT-ish for the root layout: saying "the benchmark package
+    /// is the repository root" on the overwhelming majority of repositories
+    /// that have always been that way is a line of noise, but it is one line
+    /// and it makes the nested case legible by contrast, which is worth more
+    /// than the line costs.
+    public static func benchmarkPackage(config: Config, repo: URL) -> Finding {
+        guard let path = config.benchmarkPackagePath else {
+            return Finding(
+                level: .ok, title: "Benchmark package",
+                detail: """
+                    The repository root. benchmark_package_path is not set, which is what every \
+                    configuration written before that key existed means.
+                    """)
+        }
+        do {
+            try config.validateBenchmarkPackage(in: repo)
+        } catch {
+            return Finding(
+                level: .warn, title: "Benchmark package",
+                detail: """
+                    benchmark_package_path is "\(path)", and eval will refuse this configuration \
+                    with invalid_config: \(error)
+                    """)
+        }
+        return Finding(
+            level: .ok, title: "Benchmark package",
+            detail: """
+                \(path)/ -- a nested SwiftPM package. \(config.benchmarkTarget) and BenchmarkTool \
+                are built from it and measured out of \(path)/.build/release/. That package's \
+                own Package.swift, Package.resolved, .build/checkouts and .build/plugins are \
+                covered by the same gates as the root package's: hashed by gate 2a, verified by \
+                gate 2d on both sides and again at 6b, and purged by gate 4b before every build. \
+                `swift test` still runs at the repository root.
+                """)
+    }
+
     public static func packageConfiguration(configured: Bool) -> Finding {
         guard configured else {
             return Finding(
@@ -868,6 +917,7 @@ public enum DoctorChecks {
             return findings
         }
         findings.append(packageConfiguration(configured: true))
+        findings.append(benchmarkPackage(config: config, repo: repo))
         findings.append(expectedRunLength(config: config, secondsPerRound: 1.0))
 
         if skipBuild {
@@ -1318,12 +1368,20 @@ public enum DoctorChecks {
     /// written synchronously here, before `EvalRunner.buildMeasurementProducts`
     /// is called, so it always appears before the pause, never after it.
     private static func probeMeasurementBuild(repo: URL, config: Config) -> (succeeded: Bool, detail: String) {
-        announceBuildStarting(repo: repo, benchmarkTarget: config.benchmarkTarget)
+        // The BENCHMARK PACKAGE, which is the repository root only in the
+        // root-package layout. `BenchmarkTool` is a product of
+        // `ordo-one/package-benchmark`, declared by whichever manifest depends
+        // on it -- so aiming this at the repository root on a nested-layout
+        // repository would report "Benchmark build: failed" on a repository
+        // whose benchmark build is perfectly fine, which is the worst kind of
+        // doctor finding: a true-looking alarm about nothing.
+        let package = config.benchmarkPackage(in: repo)
+        announceBuildStarting(repo: package, benchmarkTarget: config.benchmarkTarget)
         do {
             let failure = try EvalRunner.buildMeasurementProducts(
-                swift: swiftBinary, in: repo, benchmarkTarget: config.benchmarkTarget,
+                swift: swiftBinary, in: package, benchmarkTarget: config.benchmarkTarget,
                 timeout: TimeInterval(config.timeoutSeconds), reasonPrefix: "doctor_benchmark_build",
-                where: "the repository under test")
+                where: "the benchmark package at \(package.path)")
             guard let failure else { return (true, "") }
             return (false, failure.detail)
         } catch {

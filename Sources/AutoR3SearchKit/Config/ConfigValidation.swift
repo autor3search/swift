@@ -7,6 +7,11 @@ public enum ConfigError: Error, CustomStringConvertible, Equatable {
     case countTooSmall(Int)
     case badAlpha(Double)
 
+    /// `benchmark_package_path` names a location this tool will not address.
+    /// The `why` is `BenchmarkPackage.Invalid`'s own description, which names
+    /// the specific rule that was broken rather than restating a generic one.
+    case badBenchmarkPackagePath(String, String)
+
     public var description: String {
         switch self {
         case .badVersion(let v):
@@ -34,6 +39,8 @@ public enum ConfigError: Error, CustomStringConvertible, Equatable {
             """
         case .badAlpha(let a):
             return "alpha must be between 0 and 1, got \(a)"
+        case .badBenchmarkPackagePath(_, let why):
+            return why
         }
     }
 }
@@ -48,6 +55,33 @@ extension Config {
         guard !benchmarks.isEmpty else { throw ConfigError.emptyBenchmarks }
         guard count >= 4 else { throw ConfigError.countTooSmall(count) }
         guard alpha > 0, alpha < 1 else { throw ConfigError.badAlpha(alpha) }
+        // Structural only -- `validate()` is called from places with no
+        // repository URL to hand. The "and it really contains a Package.swift"
+        // half is `validateBenchmarkPackage(in:)` below, called by every
+        // command that has one.
+        if let path = benchmarkPackagePath {
+            do { try BenchmarkPackage.validateShape(path) }
+            catch { throw ConfigError.badBenchmarkPackagePath(path, "\(error)") }
+        }
+    }
+
+    /// The disk half of `benchmark_package_path`'s validation: the configured
+    /// directory must exist inside `repo` and hold a `Package.swift`.
+    ///
+    /// SEPARATE FROM `validate()` ON PURPOSE. `validate()` is a pure function
+    /// over the config's own values and is called on fabricated configs in
+    /// tests and on a config `init` has only just built in memory; folding a
+    /// filesystem probe into it would make those callers depend on a
+    /// repository they do not have. This is called by `eval` (as part of gate
+    /// 2's config handling), by `baseline`, and by `doctor`, each of which is
+    /// looking at a real repository.
+    ///
+    /// A no-op when the key is absent, which is what keeps the root-package
+    /// layout byte-for-byte unaffected.
+    public func validateBenchmarkPackage(in repo: URL) throws {
+        guard let path = benchmarkPackagePath else { return }
+        do { try BenchmarkPackage.validate(path, in: repo) }
+        catch { throw ConfigError.badBenchmarkPackagePath(path, "\(error)") }
     }
 
     /// `validate()` cannot catch this: it does not know how many benchmarks a run

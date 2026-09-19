@@ -267,7 +267,9 @@ public enum Sampler {
     /// Builds `config.benchmarkTarget` in release WITH `-Xswiftc -g` (debug
     /// info -- see the file-level note in `ProfileCommand` for the MEASURED
     /// fact that `swift build -c release` already passes `-g` by default,
-    /// so this changes nothing about what gets built), spawns it directly
+    /// so this changes nothing about what gets built), IN THE PACKAGE
+    /// `config.benchmarkPackagePath` names (the repository root when the key
+    /// is absent -- see `benchmarkPackageRoot`), spawns it directly
     /// (not through `BenchmarkTool`; the target's own compiled binary
     /// accepts the same `--filter` a driver would pass it), attaches the
     /// platform's sampler for up to `seconds`, persists the raw output
@@ -294,22 +296,9 @@ public enum Sampler {
             throw SamplerError.notPermitted(reason)
         }
 
-        let swift = URL(fileURLWithPath: "/usr/bin/swift")
         let timeout = TimeInterval(config.timeoutSeconds)
-
-        try build(swift: swift, repo: repo, product: config.benchmarkTarget,
-                   extraFlags: ["-Xswiftc", "-g"], timeout: timeout)
-        // `BenchmarkTool` needs no debug info -- only the benchmark
-        // target's own binary is ever attached to -- but it must exist for
-        // the metrics half below, and a bare `swift build` does not
-        // produce a dependency's executable product (see `EvalRunner`).
-        try build(swift: swift, repo: repo, product: "BenchmarkTool", extraFlags: [], timeout: timeout)
-
-        let exe = repo.appendingPathComponent(".build/release/\(config.benchmarkTarget)")
-        guard FileManager.default.isExecutableFile(atPath: exe.path) else {
-            throw SamplerError.buildFailed(
-                "built \(config.benchmarkTarget) in release but \(exe.path) is not present")
-        }
+        let exe = try buildAndLocateBenchmarkExecutable(
+            repo: repo, config: config, timeout: timeout)
 
         let escaped = NSRegularExpression.escapedPattern(for: benchmark)
         let child: SpawnedChild
@@ -428,8 +417,10 @@ public enum Sampler {
     public static func metricHints(
         benchmark: String, repo: URL, config: Config, storage: URL
     ) throws -> [MetricHint] {
-        let tool = repo.appendingPathComponent(".build/release/BenchmarkTool")
-        let exe = repo.appendingPathComponent(".build/release/\(config.benchmarkTarget)")
+        // SAME GEOMETRY AS `eval`. Both executables live under the BENCHMARK
+        // package's `.build/release/`, which is the repository root only when
+        // there is no nested package. See `measuredBinaries`.
+        let (exe, tool) = measuredBinaries(repo: repo, config: config)
         let escaped = NSRegularExpression.escapedPattern(for: benchmark)
 
         let r = try Subprocess.run(tool, [
@@ -613,12 +604,89 @@ public enum Sampler {
     // MARK: - Building, output paths, small helpers
     // =====================================================================
 
+    /// THE ONE PLACE `profile` DECIDES WHICH PACKAGE IT IS TALKING ABOUT.
+    ///
+    /// `Config.benchmarkPackage(in:)` -- i.e. `BenchmarkPackage.directory` --
+    /// is the same call `EvalRunner` makes at gate 5 (`let candidatePackage =
+    /// config.benchmarkPackage(in: repo)`), `BaselineRunner` makes for the
+    /// warm build, and `BenchmarkToolSource.sample` makes for the binaries it
+    /// launches. `profile` did not make it at all: it built with `repo` as the
+    /// package and looked under `repo/.build/release/`, so on every
+    /// nested-layout repository -- which is every real adopter -- it failed
+    /// with
+    ///
+    ///     could not build SwiftASN1Benchmark: error: Could not find target
+    ///     named 'SwiftASN1Benchmark-product'
+    ///
+    /// and then could not find `BenchmarkTool` either. Measured on a local
+    /// clone of `apple/swift-asn1`; see docs/run-log.md, "Run: apple/swift-asn1,
+    /// baseline asn1run".
+    ///
+    /// Reusing that helper rather than re-deriving the path here is the whole
+    /// point: `BenchmarkPackage` is documented as "the one place that knows
+    /// where the benchmark package is", and a gate -- or a command -- that does
+    /// not call it is one that has not been extended.
+    static func benchmarkPackageRoot(repo: URL, config: Config) -> URL {
+        config.benchmarkPackage(in: repo)
+    }
+
+    /// Where `profile` launches the benchmark from, and where `metricHints`
+    /// finds `BenchmarkTool`.
+    ///
+    /// Identical geometry to `EvalRunner.measuredBinaries(in:benchmarkTarget:
+    /// packagePath:)` and to `BenchmarkToolSource.sample`, because it is the
+    /// same two files: with a nested benchmark package both products land under
+    /// `<repo>/<benchmark_package_path>/.build/release/`, since that is the
+    /// package `swift build` was pointed at.
+    static func measuredBinaries(repo: URL, config: Config) -> (target: URL, tool: URL) {
+        let root = benchmarkPackageRoot(repo: repo, config: config)
+        return (root.appendingPathComponent(".build/release/\(config.benchmarkTarget)"),
+                root.appendingPathComponent(".build/release/BenchmarkTool"))
+    }
+
+    /// Builds both products `profile` needs, IN THE BENCHMARK PACKAGE, and
+    /// returns the benchmark target's executable.
+    ///
+    /// Split out of `profile` so the resolution can be exercised without a CPU
+    /// sampler: `profile` refuses up front on a machine where no sampler is
+    /// permitted (Linux under a container, commonly), and a test that could only
+    /// reach this through `profile` would be a test that silently does nothing
+    /// there. Nothing in this project uses `.enabled(if:)` -- `doctor` warns
+    /// about exactly that -- so the seam is here instead.
+    static func buildAndLocateBenchmarkExecutable(
+        repo: URL, config: Config, timeout: TimeInterval
+    ) throws -> URL {
+        let swift = URL(fileURLWithPath: "/usr/bin/swift")
+        let packageRoot = benchmarkPackageRoot(repo: repo, config: config)
+
+        try build(swift: swift, in: packageRoot, product: config.benchmarkTarget,
+                  extraFlags: ["-Xswiftc", "-g"], timeout: timeout)
+        // `BenchmarkTool` needs no debug info -- only the benchmark
+        // target's own binary is ever attached to -- but it must exist for
+        // the metrics half below, and a bare `swift build` does not
+        // produce a dependency's executable product (see `EvalRunner`).
+        // In the nested layout it is not even a product of the root package:
+        // `ordo-one/package-benchmark` is a dependency of
+        // `<benchmark_package_path>/Package.swift`, so a build aimed at the
+        // repository root exits non-zero with "no product named BenchmarkTool".
+        try build(swift: swift, in: packageRoot, product: "BenchmarkTool",
+                  extraFlags: [], timeout: timeout)
+
+        let exe = measuredBinaries(repo: repo, config: config).target
+        guard FileManager.default.isExecutableFile(atPath: exe.path) else {
+            throw SamplerError.buildFailed(
+                "built \(config.benchmarkTarget) in release but \(exe.path) is not present")
+        }
+        return exe
+    }
+
     private static func build(
-        swift: URL, repo: URL, product: String, extraFlags: [String], timeout: TimeInterval
+        swift: URL, in packageRoot: URL, product: String, extraFlags: [String],
+        timeout: TimeInterval
     ) throws {
         let r = try Subprocess.run(
             swift, ["build", "-c", "release", "--product", product] + extraFlags,
-            cwd: repo, timeout: timeout)
+            cwd: packageRoot, timeout: timeout)
         guard !r.timedOut else {
             throw SamplerError.buildFailed(
                 "building \(product) did not finish within timeout_seconds (\(Int(timeout))s)")

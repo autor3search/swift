@@ -20,9 +20,40 @@ not optional**.
 > against a real release binary. Every number in this README and in
 > [SECURITY.md](SECURITY.md) is a real measurement, never an illustration.
 >
-> **It has not yet been run against a third-party repository.** The sibling ports
-> cite measured wins on real libraries; this one cannot yet, and says so rather
-> than implying otherwise.
+> **It has now found a win on a third-party repository — once, on a local clone,
+> and the caveats are the point.** A full loop against `apple/swift-asn1`
+> (benchmarks in the nested package layout the ecosystem actually uses) ran **11
+> experiments: 9 KEEP, 2 DISCARD, cumulative ratio 0.0910 — 10.98× faster** on
+> its PEM parsing, with **all 118 of the library's own tests passing** at the end.
+> Read the rest of this block before quoting that number.
+>
+> - **This was a local clone. Nothing was contributed upstream** — no remote, no
+>   PR, no patch sent. `swift-asn1` is not faster for anyone who uses it.
+> - **10.98× is the product of the per-experiment ratios, and that is the figure
+>   to quote.** Absolute medians drifted by up to **8%** between evals on the same
+>   commit, so each ratio is internally valid — the harness re-measures both sides
+>   inside every eval — but the µs chain behind it is a series of
+>   separately-anchored measurements, not one continuous one.
+> - **The win is raw pointer arithmetic**, flagged by the harness at **13 unsafe
+>   sites** at HEAD, with its own warning that frozen tests verify behaviour but
+>   cannot catch undefined behaviour. It needs a human review of the bounds
+>   reasoning, and ideally a fuzz run over malformed PEM, before anyone would
+>   merge it.
+> - **9 of 11 is not the expected hit rate**, and saying so matters more than the
+>   headline. `PEMDocument.swift` was idiomatic Swift over `Substring.UTF8View` —
+>   correct, readable, and accidentally very slow; the first two experiments
+>   recovered **4.7×** by moving the same algorithm onto raw bytes. That is one
+>   unusually large piece of headroom. Experiments 10 and 11 were two perfectly
+>   reasonable ideas that moved the benchmark by **0.06%** and **0.08%**, and that
+>   is what the effect floor normally does.
+> - **The profile contradicted expectation**, which is the single most interesting
+>   thing in the run: base64 decoding was **6%** of the time, while
+>   `Collection.firstIndex(of:)` over `Substring.UTF8View` was **63%** — its
+>   `Index` is a `String.Index`, so every element access goes through scalar
+>   alignment.
+>
+> The full transcript — every ratio, every p-value, and the run's own list of
+> concerns — is in this project's run log.
 
 ```
 agent commits one change
@@ -211,6 +242,56 @@ purge_build_output: false
 | `max_regress_pct` | `3.0` | A benchmark regressing beyond this, significantly, is an outright refusal. Equal to `min_effect_pct` on purpose. |
 | `timeout_seconds` | `600` | Per build / test / measurement step. |
 | `purge_build_output` | `false` | Delete every compiled artifact under `.build` **before** each side is built. It addresses a *stale* poisoned artifact left by a previous eval; it does **not** address one written *during* one — see [SECURITY.md](SECURITY.md#the-build-cache-is-not-verified). Off because it costs a measured **+33.6 s** per eval. Optional in the file: a config written before this key existed still loads, and still matches the SHA-256 `baseline` pinned. |
+| `benchmark_package_path` | *absent* | The directory of the SwiftPM package that declares `benchmark_target`, relative to the repository root — see [Benchmarks in a nested package](#benchmarks-in-a-nested-package). **Omit it entirely for benchmarks in the root package**; absence is what every config written before this key existed means, and a config without it hashes to exactly what `baseline` pinned. An empty string is *not* a second spelling of absent, and is refused. |
+
+### Benchmarks in a nested package
+
+**The layout every real adopter uses.** `ordo-one/package-benchmark`'s
+convention is a second SwiftPM package at `Benchmarks/Package.swift` declaring
+`.package(path: "../")` plus the benchmark dependency, with the benchmark
+target's sources at `Benchmarks/Benchmarks/<Target>/`. Of the repositories
+surveyed for this feature — `apple/swift-asn1`, `apple/swift-log`,
+`GraphQLSwift/GraphQL`, `CoreOffice/XMLCoder` — **all four are laid out that way
+and none has a benchmark target in its root package.**
+
+`init` auto-detects exactly one location, `Benchmarks/`, and writes the key when
+it finds benchmarks there. It does not go hunting for nested `Package.swift`
+files anywhere else: a repository can contain several (vendored dependencies,
+sample projects, a test fixture), and picking one of them by a heuristic is the
+kind of silent guess `init` refuses to make elsewhere. An unconventional location
+is configured by hand. If **both** packages declare benchmark targets, the root
+wins — that is the no-change branch for every repository configured before this
+key existed — and `init` names the other candidate so you can switch by hand.
+
+What `init` wrote for `apple/swift-asn1`, appended to the config above, verbatim:
+
+```yaml
+# The directory of the SwiftPM package that declares benchmark_target, relative to
+# the repository root. Omit it entirely for benchmarks in the root package -- that
+# is what every config written before this key existed means. The benchmark target
+# and BenchmarkTool are built from this package and measured out of
+# <path>/.build/release/; `swift test` still runs at the repository root, because
+# the library's tests are the correctness contract and they live there.
+benchmark_package_path: Benchmarks
+```
+
+A nested package brings a **second `.build`, a second `Package.resolved`, a
+second `.build/checkouts` and a second `.build/plugins`** into the repository
+under test, and every one of those is compiled into — or executed during — the
+measured build. The gate chain covers all of them; see
+[The gate chain](#the-gate-chain) and
+[SECURITY.md](SECURITY.md#the-nested-benchmark-package-doubles-every-tree-that-matters).
+
+Two things to know before you point it at a nested-layout repository:
+
+- **The clone's directory name is load-bearing.** SwiftPM derives a path
+  dependency's identity from the directory name, so `Benchmarks/Package.swift`'s
+  `package: "swift-asn1"` only resolves if the checkout really is called
+  `swift-asn1`. A clone named anything else fails with `unknown package`.
+- **A bare `Package.resolved` line in `.gitignore` matches at any depth**, so it
+  hides the nested lockfile as well as the root one. `init` refuses that up
+  front and names the remedy (delete the line, or add `!Benchmarks/Package.resolved`).
+  `baseline` refuses it too, for both packages.
 
 ### Why the defaults are stricter than convention
 
@@ -268,14 +349,14 @@ There are three ways to stop a run:
 
 | Command | What it does |
 |---|---|
-| `init` | Discovers benchmark and test targets via `swift package describe --type json`, discovers benchmark names by parsing `Benchmark("Name")` literals, writes `.autor3search/config.yaml` + `program.md` + `.gitignore` entries, and commits the lockfile and `.gitignore`. Refuses a repository with no benchmarks, one with more than one benchmark target, and one whose `Package.resolved` is gitignored. `--force` overwrites an existing config. |
+| `init` | Discovers benchmark and test targets via `swift package describe --type json` — in the root package and in a nested `Benchmarks/` package, writing `benchmark_package_path` when it finds them there — discovers benchmark names by parsing `Benchmark("Name")` literals, writes `.autor3search/config.yaml` + `program.md` + `.gitignore` entries, and commits the lockfile and `.gitignore`. Refuses a repository with no benchmarks, one with more than one benchmark target, and one whose `Package.resolved` is gitignored. `--force` overwrites an existing config. |
 | `doctor` | Checks whether this machine can measure reliably — Low Power Mode, power source, core counts, load average, disk space, XCTest availability, working-tree cleanliness, conditionally-gated tests, redeclared comparison operators, the dependency pin — and builds the measurement products by name. Informational; always exits 0. `--skip-build` skips the build probe. |
 | `baseline --tag <tag>` | Creates the run branch `autor3search-swift/<tag>`, freezes every file in every declared test and benchmark target, records the manifest and out-of-scope inventories, and pins a detached worktree at the baseline commit. Refuses a dirty tree and a reused tag. |
 | `eval` | Runs one experiment through the gate chain, measures, scores, appends a `results.tsv` row, and exits `0`/`1`/`2`/`3` for KEEP/DISCARD/FAIL/CRASH. On KEEP it advances the measurement point to the candidate's commit. `--json` prints one JSON object and nothing else. |
 | `status` | Prints where a run is, read-only. Accepts `--tag <tag>` so it works from any branch. |
 | `stop` | Asks the run to end after the current experiment. `--clear` cancels; `--force` signals a running `eval`. |
 | `report` | Counts by status, cumulative speedup as the product of every kept score, the largest individual wins, and which kept commits introduced unsafe constructs. |
-| `profile` | Hot source lines from `sample` (macOS) or `perf` (Linux, where permitted), plus a per-benchmark instruction and malloc-count table. Refuses loudly where no sampler is permitted rather than reporting nothing. `--benchmark <name>`, `--seconds <n>` (default 5). |
+| `profile` | Hot source lines from `sample` (macOS) or `perf` (Linux, where permitted), plus a per-benchmark instruction and malloc-count table. Builds and measures out of the package `benchmark_package_path` names, exactly as `eval` does. Refuses loudly where no sampler is permitted rather than reporting nothing. `--benchmark <name>`, `--seconds <n>` (default 5). |
 | `version` | The module version for an installed binary, or the commit for one built from a checkout, marked `dirty` when the tree had uncommitted changes. |
 
 Every command accepts `-C <dir>` to run against a repository other than the
@@ -301,9 +382,20 @@ pinned worktree, the run claim — is kept **out of the repository**, under
 baseline.json           the two commits, the config hash, the manifest inventory
 frozen/                 byte-for-byte copies of every frozen test and benchmark file
 frozen-manifest.json    what "frozen" covered
-baseline-worktree/      a detached git worktree pinned at the measurement commit
+baseline-worktree/<repo>  a detached worktree pinned at the measurement commit
 run.claim               an flock'd file: one eval per run at a time
 ```
+
+The pinned tree sits one level down, inside a directory named after the
+repository, and that nesting is load-bearing rather than tidy. SwiftPM derives a
+path dependency's identity from its directory name, so a nested benchmark
+package's `.package(path: "../")` used to resolve to the identity
+`baseline-worktree` and could not satisfy `package: "swift-asn1"`. **The
+baseline side of every nested-layout repository was unbuildable**, and no
+configuration change could have fixed it, because the offending name was the
+harness's own. A run baselined under the older layout is refused with
+`baseline_predates_worktree_layout`, which names the remedy — re-baseline under
+a new tag — rather than failing to restore a tree that is not there.
 
 Set `AUTOR3SEARCH_SWIFT_STATE_HOME` to an absolute path to put it elsewhere. A
 relative value is refused: it would resolve against whatever directory each
@@ -319,14 +411,14 @@ measured — a FAIL from them costs seconds, not minutes.
 |---|---|---|
 | 1 | **Scope.** Every path changed between `frozenCommit` and `HEAD` must match a `scope` glob. Any change to `Package.swift` or `Package.resolved` is rejected outright, regardless of scope. | `out_of_scope`, `manifest_change_rejected` |
 | 2 | **Config integrity.** SHA-256 of `.autor3search/config.yaml` must equal what `baseline` recorded. | `config_hash_mismatch` |
-| 2a | **Manifest integrity, by hash.** Every manifest *as it is on disk*, including nested ones and anything under `.swiftpm/` — and a manifest *appearing* where baseline recorded none is itself a mismatch. | `manifest_change_rejected` |
+| 2a | **Manifest integrity, by hash.** Every manifest *as it is on disk*, including a nested benchmark package's `Package.swift` and `Package.resolved` and anything under `.swiftpm/` — and a manifest *appearing* where baseline recorded none is itself a mismatch. | `manifest_change_rejected` |
 | 2b | **Clean working tree**, read with `git status --porcelain --ignored`. Ignored files are recorded at baseline, not banned: only one that appears, changes or disappears after the freeze is refused. Tracked files are additionally hashed against the commit's blob ids, because a `filter.<name>.clean` driver can make `git status` report a modified file as clean. | `dirty_working_tree` |
 | 2c | **Out-of-scope files, by content.** Hashes every file outside `scope` except `.git/`, `.build/` and the harness's own outputs. Gate 1 asks git what changed; 2c asks the disk. | `out_of_scope` |
-| 2d | **Dependency checkouts.** Every file under `.build/checkouts/`, verified per dependency against the revisions `Package.resolved` pins. | `dependency_checkout_modified` |
-| 3 | **Restore frozen files**, after the whole stored manifest is verified against the recorded hashes. Symlinks are refused at snapshot and at restore time. | `frozen_restore_refused` |
+| 2d | **Dependency checkouts, both sides, both packages.** Every file under `.build/checkouts/`, verified per dependency against the revisions `Package.resolved` pins — in the repository *and* in the pinned worktree, for the root package *and* for the nested benchmark package. The nested one is the tree that supplies `BenchmarkTool` and the build-tool plugin, and on `apple/swift-asn1` it is **805 files against the root package's 0**. | `dependency_checkout_modified` |
+| 3 | **Restore frozen files**, after the whole stored manifest is verified against the recorded hashes. The freeze set is the union over both packages, so a nested benchmark target's sources at `Benchmarks/Benchmarks/<Target>/` are frozen exactly as a root one's are. Symlinks are refused at snapshot and at restore time. | `frozen_restore_refused` |
 | 4 | **Reject new files** appearing in any frozen target directory. | `new_test_or_benchmark_file` |
-| 4b | **Discard caches no inventory can vouch for.** `.build/plugins` is deleted before every build, on both sides, always. | `plugin_cache_not_purged`, `build_output_not_purged` |
-| 5 | **Release build**, then the candidate's measured binaries are hashed. | `build_failed`, `build_timed_out` |
+| 4b | **Discard caches no inventory can vouch for.** `.build/plugins` is deleted before every build, on both sides and in **both** packages, always — with a nested package the copy that actually executes is the nested one, because that is the package the benchmark is built from. | `plugin_cache_not_purged`, `build_output_not_purged` |
+| 5 | **Release build**, then the candidate's measured binaries are hashed. The bare `swift build` stays at the repository root (that library is what `swift test` exercises); the benchmark target and `BenchmarkTool` are built from — and measured out of — `<benchmark_package_path>/.build/release/`. | `build_failed`, `build_timed_out` |
 | 6 | **Tests.** `swift test` — which builds and runs in **debug**, while everything measured is **release**. | `tests_failed`, `tests_timed_out` |
 | 6b | **Re-validate everything gate 6 could have changed**, because `swift test` is the agent's code. Re-runs every read-only check above and re-purges the plugin cache. | `head_moved_during_eval`, and the reasons of every gate it repeats |
 | 7 | **Worktree integrity.** Restores the pinned worktree unconditionally, clearing index flags first, then verifies contents by hashing against the commit's blob ids rather than asking `git status`. | `worktree_integrity` |
@@ -640,9 +732,10 @@ Stated plainly, because performance tools that oversell are worse than useless:
   restore — that no-retry rule caps an attacker at roughly one attempt per run, with
   a logged alarm on every loss.
 - **macOS is the measured platform; Linux is correctness-verified only.** `swift
-  test` is **335 of 335** on macOS. On Linux (`swift:6.1`, aarch64, glibc 2.39) it
+  test` is **361 of 361** on macOS. On Linux (`swift:6.1`, aarch64, glibc 2.39) it
   builds and runs and the harness's own platform behaviour is verified, but the full
-  suite returns **`rc=1`: 328 tests, 8 issues** — 7 are the cross-platform
+  suite — measured when it was 335 tests, and not re-run since — returns
+  **`rc=1`: 328 tests, 8 issues** — 7 are the cross-platform
   `Package.resolved` lockfile refusal (a macOS lockfile cannot be `init`-ed on Linux
   or vice versa) and 1 is a genuine flake from tests sharing a SwiftPM cache under
   `HOME`. **No Linux timing exists**, deliberately: benchmarking in a VM on a Mac
@@ -709,7 +802,7 @@ swift build -c release
 swift test
 ```
 
-The test suite is **335 tests on macOS** and takes several minutes: a good part of
+The test suite is **361 tests on macOS** and takes several minutes: a good part of
 it builds and measures the real fixture package with the real benchmark harness,
 because the things worth testing here are the ones that only fail for real.
 
