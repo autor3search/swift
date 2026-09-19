@@ -122,6 +122,33 @@ public struct BaselineRecord: Codable, Equatable, Sendable {
     /// `--json` contract.
     public var checkoutSHA256: [String: String]?
 
+    /// The same thing as `checkoutSHA256`, for the NESTED benchmark package's
+    /// own `.build/checkouts` -- paths relative to
+    /// `<repo>/<benchmark_package_path>/.build/checkouts`.
+    ///
+    /// A nested benchmark package (`Benchmarks/Package.swift`, the layout
+    /// every real adopter of `ordo-one/package-benchmark` uses) resolves its
+    /// dependencies into its OWN `.build/checkouts`, against its OWN
+    /// `Package.resolved`. Those sources are what the benchmark binary is
+    /// compiled from, and `BenchmarkPlugin` -- a build-tool plugin the build
+    /// EXECUTES -- lives among them. Every word of `checkoutSHA256`'s
+    /// reasoning applies to this tree unchanged; what does not carry over is
+    /// the map itself, because the two trees are at different paths and are
+    /// verified against different lockfiles.
+    ///
+    /// WHY THIS ONE IS NOT REFUSED WHEN IT IS `nil`, unlike its three
+    /// siblings. `nil` there means "a record from before the inventory
+    /// existed", which must never read as "there is nothing to check". Here
+    /// `nil` also -- and much more commonly -- means "this configuration has
+    /// no nested benchmark package", which is the ordinary root-package
+    /// layout and the only thing that existed before this field. So the
+    /// decision is keyed on the CONFIG, whose bytes gate 2 has already pinned
+    /// against `configSHA256`: when `benchmark_package_path` is set and this
+    /// is `nil`, `eval` refuses exactly as it does for the others; when the
+    /// key is absent, there is genuinely no second tree and `nil` is the
+    /// truth. See `EvalRunner.checkoutIntegrityFailure`.
+    public var benchmarkCheckoutSHA256: [String: String]?
+
     public init(
         tag: String,
         frozenCommit: String,
@@ -133,12 +160,14 @@ public struct BaselineRecord: Codable, Equatable, Sendable {
         manifestSHA256: [String: String]? = nil,
         treeSHA256: [String: String]? = nil,
         ignoredSHA256: [String: String]? = nil,
-        checkoutSHA256: [String: String]? = nil
+        checkoutSHA256: [String: String]? = nil,
+        benchmarkCheckoutSHA256: [String: String]? = nil
     ) {
         self.manifestSHA256 = manifestSHA256
         self.treeSHA256 = treeSHA256
         self.ignoredSHA256 = ignoredSHA256
         self.checkoutSHA256 = checkoutSHA256
+        self.benchmarkCheckoutSHA256 = benchmarkCheckoutSHA256
         self.tag = tag
         self.frozenCommit = frozenCommit
         self.measurementCommit = measurementCommit

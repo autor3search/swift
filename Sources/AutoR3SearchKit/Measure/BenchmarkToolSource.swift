@@ -15,9 +15,21 @@ public struct BenchmarkToolSource: MetricSource {
     public let benchmarkTarget: String
     public let storage: URL
 
-    public init(benchmarkTarget: String, storage: URL) {
+    /// The benchmark package's directory relative to the worktree being
+    /// sampled, or `nil` for the root package. Both binaries live under
+    /// `<worktree>/<benchmarkPackagePath>/.build/release/`, because that is
+    /// the package `swift build --package-path` produced them from.
+    ///
+    /// Defaulted, so the root-package layout constructs this exactly as it
+    /// always has -- including in the five `BenchmarkToolSourceTests` call
+    /// sites, which are about parsing `BenchmarkTool`'s output and have
+    /// nothing to say about where it lives.
+    public let benchmarkPackagePath: String?
+
+    public init(benchmarkTarget: String, storage: URL, benchmarkPackagePath: String? = nil) {
         self.benchmarkTarget = benchmarkTarget
         self.storage = storage
+        self.benchmarkPackagePath = benchmarkPackagePath
     }
 
     /// Row 50 of the `--format histogramPercentiles` table. The exported
@@ -66,8 +78,9 @@ public struct BenchmarkToolSource: MetricSource {
     /// significance if fed to a rank test (spec.md 6). The sample for a round
     /// is the p50 of exactly one process invocation.
     public func sample(benchmark: String, in worktree: URL, config: Config) throws -> Double {
-        let tool = worktree.appendingPathComponent(".build/release/BenchmarkTool")
-        let exe = worktree.appendingPathComponent(".build/release/\(benchmarkTarget)")
+        let packageRoot = BenchmarkPackage.directory(in: worktree, path: benchmarkPackagePath)
+        let tool = packageRoot.appendingPathComponent(".build/release/BenchmarkTool")
+        let exe = packageRoot.appendingPathComponent(".build/release/\(benchmarkTarget)")
 
         // `--filter` is a regex matched against benchmark names. Anchoring an
         // escaped copy of the exact name keeps a benchmark name that happens to

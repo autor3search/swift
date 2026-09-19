@@ -553,14 +553,54 @@ public enum EvalRunner {
     /// PURE READ, and placed with the other pure reads so that it runs before
     /// gate 3 writes a byte and, far more importantly, before gate 5 starts a
     /// build that would execute a plugin out of this tree.
+    ///
+    /// BOTH PACKAGES, when there is a nested benchmark package. It resolves
+    /// its own `Package.resolved` into its own `.build/checkouts`, holding its
+    /// own copy of `ordo-one/package-benchmark` -- `BenchmarkPlugin` included,
+    /// which the benchmark build EXECUTES. Every sentence above applies to
+    /// that tree word for word; it is simply at a different path and pinned by
+    /// a different lockfile, so it gets its own recorded map and its own pass
+    /// over both sides. Four inventories in the nested layout (two packages x
+    /// two sides), two in the root layout, and the root layout's messages are
+    /// byte-identical to what they were.
     static func checkoutIntegrityFailure(
-        repo: URL, worktree: URL, record: BaselineRecord
+        repo: URL, worktree: URL, record: BaselineRecord, benchmarkPackagePath: String? = nil
     ) -> GateFailure? {
-        guard let recorded = record.checkoutSHA256 else {
+        if let failure = checkoutIntegrityFailure(
+            repo: repo, worktree: worktree, recorded: record.checkoutSHA256,
+            packagePath: nil, packageDescription: nil) {
+            return failure
+        }
+        guard let benchmarkPackagePath, !benchmarkPackagePath.isEmpty else { return nil }
+        // `nil` here is refused only because the CONFIG says there is a nested
+        // package -- and the config's bytes were pinned against
+        // `configSHA256` by gate 2, which runs before this. A record that
+        // predates the field, or one taken when the key was absent, cannot
+        // vouch for a tree it never looked at.
+        return checkoutIntegrityFailure(
+            repo: repo, worktree: worktree, recorded: record.benchmarkCheckoutSHA256,
+            packagePath: benchmarkPackagePath,
+            packageDescription: "the nested benchmark package at \(benchmarkPackagePath)/")
+    }
+
+    /// One package's checkouts, verified on both sides. `packagePath` nil is
+    /// the root package and produces exactly the wording this gate has always
+    /// produced; a non-nil one names the nested package in every message, so
+    /// an operator can tell the two trees apart without reading the code.
+    private static func checkoutIntegrityFailure(
+        repo: URL, worktree: URL, recorded recordedOrNil: [String: String]?,
+        packagePath: String?, packageDescription: String?
+    ) -> GateFailure? {
+        let subpath = BenchmarkPackage.repoRelative(
+            BaselineRunner.checkoutsSubpath, under: packagePath)
+        let inPackage = packageDescription.map { " of \($0)" } ?? ""
+        guard let recorded = recordedOrNil else {
             return GateFailure(reason: "baseline_predates_tree_inventory", detail: """
-                this baseline record has no inventory of the dependency checkouts under \
-                \(BaselineRunner.checkoutsSubpath), because it was written by a version of \
-                autor3search-swift from before that existed. That tree is exempt from the \
+                this baseline record has no inventory of the dependency checkouts\(inPackage) \
+                under \(subpath), because it was written by a version of \
+                autor3search-swift from before that existed, or -- for a nested benchmark \
+                package -- because `benchmark_package_path` was added to config.yaml after \
+                this baseline was taken. That tree is exempt from the \
                 out-of-scope inventory and from the dirty-tree gate -- .build/ is excluded from \
                 both -- but SwiftPM COMPILES it and does not re-verify it, and a build-tool \
                 plugin living there is EXECUTED during the build. Without the inventory a single \
@@ -576,18 +616,19 @@ public enum EvalRunner {
                                    ("the pinned measurement worktree", worktree)] {
             let live: [String: String]
             do {
-                live = try BaselineRunner.checkoutInventory(in: directory)
+                live = try BaselineRunner.checkoutInventory(
+                    in: directory, packagePath: packagePath)
             } catch {
                 return GateFailure(reason: "dependency_checkout_modified", detail: """
-                    could not inventory the dependency checkouts in \(label) at \
-                    \(directory.path): \(error). Failing closed -- a check that cannot run is not \
-                    a check that passed.
+                    could not inventory the dependency checkouts\(inPackage) in \(label) at \
+                    \(directory.path)/\(subpath): \(error). Failing closed -- a check that \
+                    cannot run is not a check that passed.
                     """)
             }
             guard !live.isEmpty else { continue }
             if recorded.isEmpty {
                 return GateFailure(reason: "dependency_checkout_modified", detail: """
-                    \(label) has dependency checkouts under \(BaselineRunner.checkoutsSubpath), \
+                    \(label) has dependency checkouts\(inPackage) under \(subpath), \
                     but baseline recorded none, so there is nothing to verify them against. \
                     Refusing rather than compiling unverified dependency source: that tree holds \
                     build-tool plugins the build executes. Re-run `baseline` under a new tag.
@@ -615,12 +656,12 @@ public enum EvalRunner {
             }
             guard lines.isEmpty else {
                 return GateFailure(reason: "dependency_checkout_modified", detail: """
-                    the dependency sources in \(label) are no longer the ones \(Lockfile.name) \
-                    pins:
+                    the dependency sources\(inPackage) in \(label) are no longer the ones \
+                    \(BenchmarkPackage.repoRelative(Lockfile.name, under: packagePath)) pins:
 
                     \(String(lines.joined(separator: "\n").prefix(4000)))
 
-                    \(BaselineRunner.checkoutsSubpath) is SOURCE, not build output. It is exempt \
+                    \(subpath) is SOURCE, not build output. It is exempt \
                     from the out-of-scope inventory and from the dirty-tree gate -- .build/ is \
                     excluded from both, and git collapses it to a single ignored record -- but \
                     SwiftPM compiles it, and does not restore or re-verify it once the checkout \
@@ -629,9 +670,11 @@ public enum EvalRunner {
                     during the build, so this is also an arbitrary-code-execution surface.
 
                     Deleting a whole dependency's checkout is fine and is NOT what this is \
-                    reporting: SwiftPM re-clones it at the revision \(Lockfile.name) pins, and \
-                    that file's own bytes are hashed by gate 2. To recover, delete the affected \
-                    checkout (or all of \(BaselineRunner.checkoutsSubpath)) and let SwiftPM \
+                    reporting: SwiftPM re-clones it at the revision \
+                    \(BenchmarkPackage.repoRelative(Lockfile.name, under: packagePath)) pins, and \
+                    that file's own bytes are hashed by gate 2a's manifest inventory, which \
+                    covers a nested Package.resolved exactly as it covers the root one. To \
+                    recover, delete the affected checkout (or all of \(subpath)) and let SwiftPM \
                     restore it from the pin; the next build will do so automatically. If the \
                     change was intended, it belongs in a dependency version bump, which is a \
                     human decision and requires a new baseline.
@@ -893,18 +936,34 @@ public enum EvalRunner {
     /// Per-side, because each side is snapshotted immediately after ITS OWN
     /// build and the two builds are far apart in the gate chain -- gate 5 for
     /// the candidate, gate 7 for the baseline -- with `swift test` in between.
-    static func measuredBinaries(in directory: URL, benchmarkTarget: String) -> [URL] {
-        [benchmarkTarget, "BenchmarkTool"].map {
-            directory.appendingPathComponent(".build/release/\($0)")
+    ///
+    /// `packagePath` is where they LIVE. With a nested benchmark package the
+    /// products land under `<side>/<benchmark_package_path>/.build/release/`,
+    /// because that is the package `swift build --package-path` was pointed
+    /// at. Snapshotting `<side>/.build/release/` there would hash two files
+    /// that do not exist, `digests(of:)` would record nothing (a binary absent
+    /// at snapshot time is deliberately not recorded, so injected-MetricSource
+    /// tests keep working), and the per-sample guard would then vouch for an
+    /// empty set -- a guard that passes because it is guarding nothing. Both
+    /// sides use the same relative geometry, so one function serves both.
+    static func measuredBinaries(
+        in directory: URL, benchmarkTarget: String, packagePath: String? = nil
+    ) -> [URL] {
+        let packageRoot = BenchmarkPackage.directory(in: directory, path: packagePath)
+        return [benchmarkTarget, "BenchmarkTool"].map {
+            packageRoot.appendingPathComponent(".build/release/\($0)")
         }
     }
 
     /// The four executables gate 8 launches, both sides.
     static func measuredBinaries(
-        baselineWorktree: URL, candidateWorktree: URL, benchmarkTarget: String
+        baselineWorktree: URL, candidateWorktree: URL, benchmarkTarget: String,
+        packagePath: String? = nil
     ) -> [URL] {
-        measuredBinaries(in: baselineWorktree, benchmarkTarget: benchmarkTarget)
-            + measuredBinaries(in: candidateWorktree, benchmarkTarget: benchmarkTarget)
+        measuredBinaries(in: baselineWorktree, benchmarkTarget: benchmarkTarget,
+                         packagePath: packagePath)
+            + measuredBinaries(in: candidateWorktree, benchmarkTarget: benchmarkTarget,
+                               packagePath: packagePath)
     }
 
     /// Deletes the measured binaries on both sides, so a poisoned one cannot
@@ -917,11 +976,12 @@ public enum EvalRunner {
     /// the next build to produce them again from sources every gate has
     /// verified.
     static func discardMeasuredBinaries(
-        baselineWorktree: URL, candidateWorktree: URL, benchmarkTarget: String
+        baselineWorktree: URL, candidateWorktree: URL, benchmarkTarget: String,
+        packagePath: String? = nil
     ) {
         for url in measuredBinaries(
             baselineWorktree: baselineWorktree, candidateWorktree: candidateWorktree,
-            benchmarkTarget: benchmarkTarget) {
+            benchmarkTarget: benchmarkTarget, packagePath: packagePath) {
             try? FileManager.default.removeItem(at: url)
         }
     }
@@ -1064,7 +1124,17 @@ public enum EvalRunner {
         }
         // The dependency sources the BASELINE build is about to compile, and
         // the repository's, re-checked because gate 2d ran before the tests.
-        if let failure = checkoutIntegrityFailure(repo: repo, worktree: worktree, record: record) {
+        // BOTH PACKAGES: a nested benchmark package's checkouts are compiled
+        // into the baseline binary at gate 7, after `swift test` has run the
+        // agent's code, which is the same window and the same argument that
+        // put the root package's checkouts in this list. The reason this is a
+        // gap worth naming rather than assuming: the seventeenth vector was
+        // exactly this -- a check before gate 6 vouching for a tree consumed
+        // after it -- found on the ROOT checkouts, and the nested tree is the
+        // one the benchmark is actually built from.
+        if let failure = checkoutIntegrityFailure(
+            repo: repo, worktree: worktree, record: record,
+            benchmarkPackagePath: config.benchmarkPackagePath) {
             return failure
         }
         // Manifests decide how the baseline side is compiled.
@@ -1320,6 +1390,20 @@ public enum EvalRunner {
                 the config recorded at baseline does not validate: \(error)
                 """))
         }
+        // `benchmark_package_path`'s disk half, checked here rather than in
+        // `validate()` because only this call site has the repository. It is
+        // safe to trust the value at this point and would not have been one
+        // line earlier: gate 2 has just proved these are the bytes baseline
+        // pinned, so the directory named here is the directory the baseline
+        // inventories were taken against. A path that escapes the repository
+        // or names no package is refused BEFORE gate 3 writes anything and
+        // long before gate 5 builds out of it.
+        do { try config.validateBenchmarkPackage(in: repo) }
+        catch {
+            return fail(GateFailure(reason: "invalid_config", detail: """
+                the config recorded at baseline does not validate: \(error)
+                """))
+        }
 
         // ---- Gate 2b: the working tree must be clean ----
         //
@@ -1405,9 +1489,43 @@ public enum EvalRunner {
         // plugin -- EXECUTES. See `checkoutIntegrityFailure`.
         //
         // Before gate 3's first write and, critically, before gate 5's build.
+        //
+        // BOTH PACKAGES. A nested benchmark package brings a SECOND
+        // `.build/checkouts` -- its own copy of `ordo-one/package-benchmark`,
+        // `BenchmarkPlugin` and all -- and that is the tree the measured
+        // binary is actually compiled from. Leaving it unverified would have
+        // reopened this exact vector (`rc 0, keep, ratio 0.0099977` from one
+        // `sed` into a dependency's timer) for every repository using the
+        // layout the ecosystem actually uses.
         let pinnedWorktree = try home.worktreeURL(tag: tag)
+        // A run baselined before the pinned worktree was named after the
+        // repository has its checkout one level up. Detected here, once, so
+        // the operator gets the actual diagnosis instead of a gate-7 restore
+        // failing on a directory that is not there. See
+        // `StateHome.worktreeURL` for why the name moved.
+        if !FileManager.default.fileExists(
+            atPath: pinnedWorktree.appendingPathComponent(".git").path),
+           FileManager.default.fileExists(
+            atPath: try home.legacyWorktreeURL(tag: tag).appendingPathComponent(".git").path) {
+            return fail(GateFailure(reason: "baseline_predates_worktree_layout", detail: """
+                this run's pinned measurement worktree is at \
+                \(try home.legacyWorktreeURL(tag: tag).path), the location used before the \
+                worktree was named after the repository under test. It moved because SwiftPM \
+                derives a path dependency's package IDENTITY from its directory name: a nested \
+                benchmark package saying `.package(path: "../")` and `package: "\
+                \(home.repoDirectoryName)"` cannot resolve inside a directory called \
+                "\(StateHome.worktreeContainer)", so the BASELINE side of every such repository \
+                failed to build with "unknown package".
+
+                Nothing is measured from the old location and nothing is deleted from it. Re-run \
+                `autor3search-swift baseline` under a NEW tag, which is the same answer this tool \
+                gives for a record written before an inventory existed; the old run directory can \
+                be removed by hand once you no longer want its history.
+                """))
+        }
         if let failure = checkoutIntegrityFailure(
-            repo: repo, worktree: pinnedWorktree, record: record) {
+            repo: repo, worktree: pinnedWorktree, record: record,
+            benchmarkPackagePath: config.benchmarkPackagePath) {
             return fail(failure)
         }
 
@@ -1474,10 +1592,20 @@ public enum EvalRunner {
         // ~0.81 s per side on the demo package -- about 4% of a ~39 s eval --
         // against a cold build of the whole output tree at ~18 s per side.
         // See `purgePluginCache`.
+        //
+        // EVERY PACKAGE ROOT ON EVERY SIDE. `config.buildRoots` yields the
+        // repository (or worktree) plus the nested benchmark package when
+        // there is one -- and the NESTED `.build/plugins` is the one that
+        // actually executes, because the benchmark is built with
+        // `--package-path <benchmark_package_path>`. Purging only the root's
+        // would have been purging the tree that matters least while leaving
+        // the one that runs.
         let purgeOutput = purgeBuildOutput(config: config, env: env)
-        for (directory, description) in [(repo, "the candidate repository"),
-                                         (try home.worktreeURL(tag: tag),
-                                          "the pinned measurement worktree")] {
+        let purgeTargets =
+            config.buildRoots(in: repo, sideDescription: "the candidate repository")
+            + config.buildRoots(in: try home.worktreeURL(tag: tag),
+                                sideDescription: "the pinned measurement worktree")
+        for (directory, description) in purgeTargets {
             if purgeOutput {
                 // OPT-IN, default off. Deletes every compiled artifact, not
                 // just the plugins, so the measured binaries are built entirely
@@ -1521,10 +1649,22 @@ public enum EvalRunner {
         // `<repo>/.build/release/BenchmarkTool` and gate 8 crashes on the first
         // real repository. Fail-closed (it can never produce a wrong KEEP) but
         // the tool would simply not work, so both products are built by name.
+        //
+        // BUILT AGAINST THE BENCHMARK PACKAGE, which in the nested layout is
+        // NOT the repository root. `BenchmarkTool` is a product of
+        // `ordo-one/package-benchmark`, and that dependency is declared by
+        // `Benchmarks/Package.swift`, not by the root manifest -- so a build
+        // aimed at the root exits non-zero with "no product named
+        // BenchmarkTool" on every nested-layout repository. The bare
+        // `swift build -c release` above stays at the ROOT: it compiles the
+        // library that `swift test` is about to exercise, which is the
+        // correctness contract.
+        let candidatePackage = config.benchmarkPackage(in: repo)
         if let failure = try buildMeasurementProducts(
-            swift: swift, in: repo, benchmarkTarget: config.benchmarkTarget, timeout: timeout,
+            swift: swift, in: candidatePackage, benchmarkTarget: config.benchmarkTarget,
+            timeout: timeout,
             reasonPrefix: "benchmark_build",
-            where: "the candidate repository at \(repo.path)") {
+            where: "the candidate repository at \(candidatePackage.path)") {
             return fail(failure)
         }
 
@@ -1562,8 +1702,19 @@ public enum EvalRunner {
         // exception. Nothing legitimately rewrites these two files between here
         // and gate 8: `swift test` builds DEBUG products, and the only other
         // builds are the baseline side's, in a different directory.
+        //
+        // The paths follow the package: with a nested benchmark package these
+        // are `<repo>/<benchmark_package_path>/.build/release/...`. The
+        // MOMENT is unchanged and must stay unchanged -- immediately after
+        // this side's own build, before `swift test` runs the agent's code.
+        // That placement is the fix for the sixteenth vector (a lazy global
+        // firing during the test phase that copied a pre-staged fast binary
+        // over the candidate's, which a later snapshot then adopted as its own
+        // reference), and moving the directory must not be allowed to quietly
+        // move the timing.
         let candidateDigests = MeasuredBinaryGuard.digests(
-            of: measuredBinaries(in: repo, benchmarkTarget: config.benchmarkTarget))
+            of: measuredBinaries(in: repo, benchmarkTarget: config.benchmarkTarget,
+                                 packagePath: config.benchmarkPackagePath))
 
         let tests = try Subprocess.run(swift, ["test"], cwd: repo,
                                        env: SanitizedEnvironment.forTools(), timeout: timeout)
@@ -1597,8 +1748,10 @@ public enum EvalRunner {
         // purge. A cache the tests re-planted would otherwise be reused by that
         // build -- SwiftPM keys these artifacts on input signatures, so an
         // executable dropped here is not rebuilt away.
-        for (directory, description) in [(repo, "the candidate repository"),
-                                         (pinnedWorktree, "the pinned measurement worktree")] {
+        for (directory, description) in
+            config.buildRoots(in: repo, sideDescription: "the candidate repository")
+            + config.buildRoots(in: pinnedWorktree,
+                                sideDescription: "the pinned measurement worktree") {
             if let failure = purgePluginCache(in: directory, where: description) {
                 return fail(failure)
             }
@@ -1713,6 +1866,7 @@ public enum EvalRunner {
         // It runs AFTER gate 7 on purpose: the integrity check must see the
         // worktree as the previous eval left it, not as this eval's build
         // just rewrote it.
+        let baselinePackage = config.benchmarkPackage(in: worktree)
         let baselineBuild = try Subprocess.run(
             swift, ["build", "-c", "release"], cwd: worktree,
             env: SanitizedEnvironment.forTools(), timeout: timeout)
@@ -1736,9 +1890,10 @@ public enum EvalRunner {
         // worktree, the benchmark target's binary there is the PREVIOUS commit's
         // until it is rebuilt by name.
         if let failure = try buildMeasurementProducts(
-            swift: swift, in: worktree, benchmarkTarget: config.benchmarkTarget, timeout: timeout,
+            swift: swift, in: baselinePackage, benchmarkTarget: config.benchmarkTarget,
+            timeout: timeout,
             reasonPrefix: "baseline_benchmark_build",
-            where: "the pinned measurement worktree at \(worktree.path) (commit \(record.measurementCommit))") {
+            where: "the pinned measurement worktree's benchmark package at \(baselinePackage.path) (commit \(record.measurementCommit))") {
             return fail(failure)
         }
 
@@ -1772,7 +1927,8 @@ public enum EvalRunner {
         // the candidate here instead would re-adopt whatever gate 6 left
         // behind, which is exactly the sixteenth vector.
         let measuredBinaryDigests = candidateDigests + MeasuredBinaryGuard.digests(
-            of: measuredBinaries(in: worktree, benchmarkTarget: config.benchmarkTarget))
+            of: measuredBinaries(in: worktree, benchmarkTarget: config.benchmarkTarget,
+                                 packagePath: config.benchmarkPackagePath))
 
         // SwiftPM can leave files outside `.build` behind (a freshly written
         // `Package.resolved` for a package with a source-control dependency),
@@ -1805,7 +1961,8 @@ public enum EvalRunner {
         } else {
             metric = BenchmarkToolSource(
                 benchmarkTarget: config.benchmarkTarget,
-                storage: try home.benchStorageURL(tag: tag))
+                storage: try home.benchStorageURL(tag: tag),
+                benchmarkPackagePath: config.benchmarkPackagePath)
         }
 
         // WARM-UP, OUTSIDE THE COUNTED SESSION. `MeasureSession` samples
@@ -1854,7 +2011,8 @@ public enum EvalRunner {
         func measuredBinaryTampering(_ offender: String) -> Verdict {
             discardMeasuredBinaries(
                 baselineWorktree: worktree, candidateWorktree: repo,
-                benchmarkTarget: config.benchmarkTarget)
+                benchmarkTarget: config.benchmarkTarget,
+                packagePath: config.benchmarkPackagePath)
             let detail = """
                 a binary being measured changed while it was being measured: \(offender). \
                 Nothing constrains what the candidate's benchmark does once it is launched -- it \

@@ -43,9 +43,22 @@ struct InitCommand: ParsableCommand {
         print("""
         Wrote .autor3search/config.yaml, program.md and .gitignore entries
           benchmark target: \(config.benchmarkTarget)
+          benchmark package: \(config.benchmarkPackagePath.map { "\($0)/" } ?? "the repository root")
           benchmarks: \(config.benchmarks.joined(separator: ", "))
           scope: \(config.scope.joined(separator: ", "))
         """)
+
+        // Which package the benchmarks came from, and -- when both packages
+        // had candidates -- that a choice was made and how to change it. Not
+        // warnings: nothing here means anything went wrong. But a human who
+        // never learns which of two benchmark targets is being measured
+        // cannot tell a right answer from a wrong one, and this tool's whole
+        // posture is that a decision the operator can see beats a decision
+        // made silently on their behalf.
+        for note in outcome.notes {
+            print("")
+            print(note)
+        }
 
         // ANNOUNCE THE COMMIT. init is the one command in this tool that
         // writes to someone else's git history, and it does so because the
