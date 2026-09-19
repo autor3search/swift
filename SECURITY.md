@@ -76,15 +76,15 @@ still move:
 | **1** scope, `frozen..HEAD` | HEAD's commit set | **yes** — `swift test` *and* the gate-8 binaries can commit | yes, by the advance | gate 6b + gate 8b + `headUnderTest` |
 | **2** config hash | `config.yaml` bytes | yes | no — values are held in memory | *incidental* (tracked content at 6b) |
 | **2a** root manifests | `Package.swift`, `Package.resolved`, `.swiftpm` | yes | **yes** — the gate-7 build resolves them | re-checked at 6b |
-| **2a** manifest inventory | every manifest in the tree | yes | yes, same | re-checked at 6b |
+| **2a** manifest inventory | every manifest in the tree, **including `<benchmark_package_path>/Package.swift` and `Package.resolved`** | yes | yes, same | re-checked at 6b |
 | **2b** dirty tree + ignored record | working tree, ignored files | yes | **yes** — the next eval starts here | re-checked at 6b |
 | **2c** out-of-scope inventory | files outside `scope` | yes | repo copy already compiled at gate 5 | re-checked at 6b |
 | **2e** tracked content vs blobs | repo tracked files | yes | as above | re-checked at 6b |
-| **2d** `.build/checkouts`, both sides | dependency sources | **yes** | **yes — the worktree's copy is compiled at gate 7** | re-checked at 6b |
-| **3** frozen restore | frozen files in the repo | yes | already compiled and run by gates 5 and 6 | *repo copy: by 2c/2e at 6b* |
+| **2d** `.build/checkouts`, both sides, **both packages** | dependency sources, root **and** `<benchmark_package_path>/.build/checkouts` | **yes** | **yes — the worktree's copy is compiled at gate 7** | re-checked at 6b |
+| **3** frozen restore | frozen files in the repo, **including a nested benchmark target at `Benchmarks/Benchmarks/<Target>/`** | yes | already compiled and run by gates 5 and 6 | *repo copy: by 2c/2e at 6b* |
 | **4** new files | files the candidate added | yes | as above | as above |
-| **4b** plugin purge, both sides | `.build/plugins` | **yes** | **yes — executed by the gate-7 build** | re-purged at 6b |
-| **5** build + binary snapshot | the four measured binaries | yes | yes | snapshot moved per side + per-sample guard |
+| **4b** plugin purge, both sides, **both packages** | `.build/plugins`, root **and** `<benchmark_package_path>/.build/plugins` | **yes** | **yes — executed by the gate-7 build; with a nested package the nested cache is the one that runs** | re-purged at 6b |
+| **5** build + binary snapshot | the four measured binaries, under `<benchmark_package_path>/.build/release/` | yes | yes | snapshot moved per side + per-sample guard |
 
 **Two rows are deliberately left alone, and the reasons matter more than the
 rows.**
@@ -237,6 +237,122 @@ achieved nothing: the same hook can be delivered entirely through
 `.git/` at all. `/dev/null` rather than an empty directory the harness creates,
 too — an empty directory is same-uid and can simply have hooks written into it,
 whereas `<path>/post-checkout` under `/dev/null` cannot resolve.
+
+## The nested benchmark package doubles every tree that matters
+
+Almost every repository that actually uses `ordo-one/package-benchmark` declares
+its benchmarks in a **second SwiftPM package** — `Benchmarks/Package.swift`,
+`.package(path: "../")`, sources at `Benchmarks/Benchmarks/<Target>/`. Of the
+repositories surveyed for this feature (`apple/swift-asn1`, `apple/swift-log`,
+`GraphQLSwift/GraphQL`, `CoreOffice/XMLCoder`) **all four are laid out that way
+and none declares a benchmark target in its root package.**
+
+That second package is not a detail of discovery. It is a second copy of every
+tree this document argues about, and the measured binary comes out of the second
+copy, not the first.
+
+| Tree | Root package | Nested benchmark package | Why it matters |
+|---|---|---|---|
+| `.build/` | `<repo>/.build` | `<repo>/<path>/.build` | Exempt from every inventory at any depth. On `apple/swift-asn1` the nested one is **253 MB**; an inventory that walked it would refuse on the next eval, because a build directory changes whenever anything is built |
+| `Package.resolved` | `<repo>/Package.resolved` | `<repo>/<path>/Package.resolved` | The nested one pins `ordo-one/package-benchmark`; the root manifest does not declare it at all |
+| `.build/checkouts/` | `<repo>/.build/checkouts` | `<repo>/<path>/.build/checkouts` | **Dependency source that is compiled into the measured binary** |
+| `.build/plugins/` | `<repo>/.build/plugins` | `<repo>/<path>/.build/plugins` | SwiftPM's cache of the **compiled `BenchmarkPlugin`** — a Mach-O executable run during the build. With a nested package, the nested copy is the one that executes |
+| `.build/release/` | `<repo>/.build/release` | `<repo>/<path>/.build/release` | Where the benchmark target and `BenchmarkTool` actually land, and therefore what gate 5 snapshots and gate 8 launches |
+
+Every one of those is covered on **both sides** — the repository under test and
+the pinned measurement worktree — through one function
+(`Config.buildRoots`/`BenchmarkPackage.directory`), so a future gate gets both
+roots by calling it rather than by remembering to.
+
+### The evidence, measured on `apple/swift-asn1`
+
+- **`benchmarkCheckoutSHA256` = 805 files; `checkoutSHA256` = 0.** The root
+  package of `swift-asn1` has no dependencies at all. Before this change, **805
+  dependency source files were compiled into the measured binary and nothing
+  hashed a single one of them.** That one line is the whole parity argument.
+- **Gate 2d, before and after.** One `sed` into the candidate's nested copy of
+  the benchmark dependency's timer
+  (`Benchmarks/.build/checkouts/package-benchmark/Sources/Benchmark/BenchmarkExecutor.swift`,
+  `add(Int(nanoSeconds))` → `add(Int(nanoSeconds) / 100)`; sha256 `8b32cd5f…` →
+  `b5cd0431…`). Against a binary whose nested checkout pass short-circuited to
+  `nil` — the call shape the code had before this work, everything else identical
+  — a **comment-only commit was KEPT at 100×**: `rc 0, verdict keep, ratio
+  0.00999, p 1.08e-05, warnings []`, on a real Apple repository, with a
+  byte-clean working tree and every other gate passing. Against the shipped
+  binary, same tamper, same state: `rc 2, dependency_checkout_modified`, naming
+  the file and both hashes. The checkout file was `0444` and its directory
+  `0755`, so one `chmod` sufficed — exactly what this document already says
+  about file mode not being a defence.
+- **Gate 2a, the nested manifest.** `git update-index --assume-unchanged
+  Benchmarks/Package.resolved`, then an edit: `git status --porcelain` empty,
+  `eval` `rc 2, manifest_change_rejected`, naming
+  `Benchmarks/Package.resolved` and both hashes. Before this change the file did
+  not exist at baseline time at all, so there was no hash to mismatch.
+- **Gate 4b / 6b, the plugin caches.** A sentinel was planted in each of the
+  three plugin caches that existed on that repository (the candidate's nested
+  one, the worktree's nested one, and the candidate's root one) and one
+  experiment run. **All three were purged.** Afterwards the candidate's nested
+  `plugins/` does not exist and the worktree's holds `cache/` and `outputs/`;
+  that asymmetry is correct, because gate 6b re-purges both after `swift test`
+  and only the worktree is rebuilt afterwards, at gate 7.
+- **Gate 2b, the nested `.build`.** `isHarnessOutput` matched `.build` only at
+  the repository root, while the tree and manifest walks have always skipped it
+  by *name* at any depth — so the ignored-file inventory was about to hash all
+  253 MB of `Benchmarks/.build` and refuse on the very next eval. It now agrees
+  with the walks: `ignoredSHA256` has **0** entries on `swift-asn1`, and
+  `treeSHA256`'s 193 entries contain no `.build/` path.
+- **The baseline side was unbuildable, and the harness's own name was the
+  cause.** The pinned worktree used to be a directory literally called
+  `baseline-worktree`, so a nested `.package(path: "../")` resolved to the
+  identity `baseline-worktree` and could not satisfy `package: "swift-asn1"`. No
+  configuration could have fixed it. `StateHome.worktreeURL(tag:)` is now
+  `<run>/baseline-worktree/<repository directory name>`, unconditionally — one
+  geometry rather than one plus an exception — and a run baselined under the old
+  layout is refused with **`baseline_predates_worktree_layout`**, naming the
+  remedy (re-baseline under a new tag) rather than failing to restore a tree
+  that is not there. The candidate side was unaffected, because its directory
+  *is* the repository: another instance of the rule two sections up, that
+  anything with two sides is somewhere a correct principle can be half-applied
+  and look finished.
+
+### Two gaps found by reviewing that change, both now closed
+
+Neither is counted among the nineteen bypasses, and the reason is worth stating
+rather than assuming: **neither is reachable by the agent.** They are listed
+because a reader deciding what to trust should see the whole review, not only
+the parts that scored.
+
+- **`BenchmarkPackage.validate` used `fileExists`, which follows symlinks.** A
+  `Benchmarks` symlink pointing outside the repository satisfied it, and the
+  gates then disagree about what they can see: `FileManager.enumerator` does not
+  descend a symlinked directory, so gates 2a and 2c would never look inside the
+  nested package at all, while gate 2d addresses `<path>/.build/checkouts` by
+  path and *would* follow it — a package compiled into the measured binary out
+  of a tree no inventory covers. Planting it needs operator setup that pre-dates
+  the baseline (gate 2b reports a link appearing afterwards), so the fix is a
+  containment check rather than a new gate: `resolvingSymlinksInPath()` on both
+  the repository and the package, and a refusal when the resolved package is not
+  inside the resolved repository. Both sides must be resolved — on macOS the
+  repository itself is routinely reached through a symlink (`/var` →
+  `/private/var`), and resolving only the child would refuse every ordinary
+  repository under `TMPDIR`. Bound by a test that runs the real gate-2a walk
+  against the symlinked tree and shows the nested manifest genuinely missing
+  from the inventory.
+- **`BaselineRunner.resolveLockfilePin` asked its three questions of the root
+  package only.** A nested package with source-control dependencies and no
+  tracked `Package.resolved` therefore *passed* `baseline`, and the first
+  `eval`'s own `swift build --product BenchmarkTool` then created
+  `<path>/Package.resolved` — which gate 2a reads as a manifest appearing where
+  baseline recorded none. Every experiment after that is
+  `manifest_change_rejected`, permanently, because `frozenCommit` never
+  advances. That is precisely the defect this check exists to prevent, reached
+  one directory down. `baseline` now refuses **up front**, for the nested
+  package exactly as for the root one, naming the lockfile by its repo-relative
+  path. Worth knowing why it bites in practice: a bare `Package.resolved` line
+  in `.gitignore` has no leading slash, so it matches at **any** depth and hides
+  a nested lockfile as well as the root one — which is how `swift-asn1`
+  presented, and what `init` refuses up front with a message naming the
+  `!Benchmarks/Package.resolved` negation as one remedy.
 
 ## The environment is filtered, by allowlist
 
@@ -650,6 +766,17 @@ surprising in practice.
 the legitimate change.** The inventory is recorded at `frozenCommit` and
 deliberately never advances — that is what makes it a fixed reference — so a
 genuine change to anything it covers requires a new reference.
+
+**A fourth surprise has a different remedy, and it will hit many real
+repositories.** A bare `Package.resolved` line in `.gitignore` carries no
+leading slash, so git matches it at **any** depth — it hides a nested benchmark
+package's lockfile as well as the root one. `init` refuses that up front, and so
+does `baseline`, for either package: an ignored lockfile is pinned by nothing,
+since it is absent from `frozenCommit` and every later worktree checkout
+resolves its own. The remedy here is to fix the ignore rule — delete the line,
+or add a negation for the one file (`!Benchmarks/Package.resolved`) if the rest
+of the rule is wanted — and then re-run `init`. `apple/swift-asn1` presented
+exactly this way.
 
 **None of this affects the normal single-package flow**, which is what `init`
 generates and what the fixture exercises: a comment-only commit still discards
