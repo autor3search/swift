@@ -439,7 +439,17 @@ private func makeCheckout(_ side: URL, packagePath: String?, body: String) throw
 /// with no network at all -- the same constraint `makeGitFixture` is built
 /// under. What `init` keys on is the product NAME (`productDependencies`
 /// containing "Benchmark"), which is identical either way.
-private func makeNestedBenchmarkFixture(rootAlsoHasBenchmarks: Bool = false) throws -> URL {
+///
+/// `nestedSourceControlDependency` adds a REAL `sourceControl` dependency to
+/// the NESTED package only -- a second, local git repository consumed by
+/// `file://` URL, the same offline device `makeDependentGitFixture` uses -- so
+/// `Benchmarks/Package.resolved` becomes a file SwiftPM insists on producing.
+/// That is the shape every real adopter has, because
+/// `ordo-one/package-benchmark` is declared by the nested manifest and by
+/// nothing else.
+private func makeNestedBenchmarkFixture(
+    rootAlsoHasBenchmarks: Bool = false, nestedSourceControlDependency: Bool = false
+) throws -> URL {
     // The repository directory is named `repo`, not a UUID, and that is
     // load-bearing rather than cosmetic: SwiftPM derives a path dependency's
     // package IDENTITY from its directory name, so `.package(path: "../")`
@@ -462,6 +472,37 @@ private func makeNestedBenchmarkFixture(rootAlsoHasBenchmarks: Bool = false) thr
     try mk("Tests/LibTests")
     try mk("BenchDep/Sources/Benchmark")
     try mk("Benchmarks/Benchmarks/LibBenchmark")
+
+    // The `sourceControl` dependency, when asked for: a sibling git repository
+    // of the fixture (NOT inside it), so nothing about it is inventoried by the
+    // repository's own gates, reached by `file://` so no network is involved.
+    var nestedDependencyDeclaration = ""
+    var nestedDependencyProduct = ""
+    if nestedSourceControlDependency {
+        let dep = dir.deletingLastPathComponent().appendingPathComponent("dep")
+        try FileManager.default.createDirectory(
+            at: dep.appendingPathComponent("Sources/DepLib"), withIntermediateDirectories: true)
+        try """
+            // swift-tools-version: 6.0
+            import PackageDescription
+            let package = Package(
+                name: "DepLib",
+                products: [.library(name: "DepLib", targets: ["DepLib"])],
+                targets: [.target(name: "DepLib")]
+            )
+            """.write(to: dep.appendingPathComponent("Package.swift"),
+                      atomically: true, encoding: .utf8)
+        try "public func depThing() -> Int { 7 }\n".write(
+            to: dep.appendingPathComponent("Sources/DepLib/DepLib.swift"),
+            atomically: true, encoding: .utf8)
+        let depSetup = try Subprocess.run(URL(fileURLWithPath: "/bin/sh"), ["-c", """
+            git init -q -b main . && git config user.name Test && git config user.email t@example.com \
+            && git add -A && git commit -q -m dep && git tag 1.0.0
+            """], cwd: dep, env: nil, timeout: 120)
+        #expect(depSetup.exitCode == 0, "dependency repo setup failed: \(depSetup.stderr)")
+        nestedDependencyDeclaration = "        .package(url: \"file://\(dep.path)\", from: \"1.0.0\"),\n"
+        nestedDependencyProduct = "                .product(name: \"DepLib\", package: \"dep\"),\n"
+    }
 
     try write("Sources/Lib/Lib.swift", "public func f() -> Int { 1 }\n")
     try write("Tests/LibTests/LibTests.swift", """
@@ -530,14 +571,14 @@ private func makeNestedBenchmarkFixture(rootAlsoHasBenchmarks: Bool = false) thr
             dependencies: [
                 .package(path: "../"),
                 .package(path: "../BenchDep"),
-            ],
+        \(nestedDependencyDeclaration)    ],
             targets: [
                 .executableTarget(
                     name: "LibBenchmark",
                     dependencies: [
                         .product(name: "Benchmark", package: "BenchDep"),
                         .product(name: "Lib", package: "repo"),
-                    ],
+        \(nestedDependencyProduct)            ],
                     path: "Benchmarks/LibBenchmark")
             ]
         )
@@ -651,6 +692,301 @@ private func makeNestedBenchmarkFixture(rootAlsoHasBenchmarks: Bool = false) thr
     // And no inventory walked either `.build`.
     #expect(record.treeSHA256?.keys.allSatisfy { !$0.contains(".build/") } == true)
     #expect(record.manifestSHA256?.keys.allSatisfy { !$0.contains(".build/") } == true)
+}
+
+// =========================================================================
+// MARK: - `profile` -- the command that ignored the key entirely
+// =========================================================================
+
+/// A minimal nested-layout repository whose benchmark package declares BOTH
+/// executables `profile` builds by name, and whose ROOT package declares
+/// NEITHER.
+///
+/// That asymmetry is the test. `Sampler.profile` used to build with the
+/// repository root as the package and look for the products under
+/// `<repo>/.build/release/`, so against a real nested-layout repository it
+/// died before it profiled anything:
+///
+///     could not build SwiftASN1Benchmark: error: Could not find target named
+///     'SwiftASN1Benchmark-product'
+///
+/// -- measured on a local clone of `apple/swift-asn1`; see docs/run-log.md,
+/// "Run: apple/swift-asn1, baseline asn1run", §"What `profile` said". Nothing
+/// here needs git, a CPU sampler, or the network: the point is purely which
+/// package gets built and where the result is looked for.
+///
+/// The directory is called `repo` for the same reason
+/// `makeNestedBenchmarkFixture`'s is -- SwiftPM derives a path dependency's
+/// identity from the directory name, so `package: "repo"` only resolves if the
+/// directory really is called that.
+private func makeNestedProfileFixture() throws -> URL {
+    let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent(UUID().uuidString)
+        .appendingPathComponent("repo")
+    func mk(_ p: String) throws {
+        try FileManager.default.createDirectory(
+            at: dir.appendingPathComponent(p), withIntermediateDirectories: true)
+    }
+    func write(_ p: String, _ body: String) throws {
+        try body.write(to: dir.appendingPathComponent(p), atomically: true, encoding: .utf8)
+    }
+    try mk("Sources/Lib")
+    try mk("Benchmarks/Sources/NestedBench")
+    try mk("Benchmarks/Sources/BenchmarkTool")
+
+    try write("Sources/Lib/Lib.swift", "public func f() -> Int { 1 }\n")
+    try write("Package.swift", """
+        // swift-tools-version: 6.0
+        import PackageDescription
+        let package = Package(
+            name: "repo",
+            products: [.library(name: "Lib", targets: ["Lib"])],
+            targets: [.target(name: "Lib")]
+        )
+        """)
+    try write("Benchmarks/Package.swift", """
+        // swift-tools-version: 6.0
+        import PackageDescription
+        let package = Package(
+            name: "benchmarks",
+            products: [
+                .executable(name: "NestedBench", targets: ["NestedBench"]),
+                .executable(name: "BenchmarkTool", targets: ["BenchmarkTool"]),
+            ],
+            dependencies: [.package(path: "../")],
+            targets: [
+                .executableTarget(
+                    name: "NestedBench",
+                    dependencies: [.product(name: "Lib", package: "repo")]),
+                .executableTarget(name: "BenchmarkTool"),
+            ]
+        )
+        """)
+    try write("Benchmarks/Sources/NestedBench/main.swift", "import Lib\nprint(f())\n")
+    try write("Benchmarks/Sources/BenchmarkTool/main.swift", "print(\"tool\")\n")
+    return dir
+}
+
+/// THE BUG, BOUND. `profile` must resolve the benchmark package exactly the way
+/// `eval` does -- through `Config.benchmarkPackage(in:)`, i.e.
+/// `BenchmarkPackage.directory`, the one place that knows where the benchmark
+/// package is -- and find both products under `<benchPath>/.build/release/`.
+///
+/// The first assertion is the pre-condition that makes this a real regression
+/// test rather than a restatement: a build aimed at the repository ROOT cannot
+/// produce these products at all, which is exactly what the shipped `profile`
+/// was doing. It is measured here rather than asserted from memory.
+///
+/// Split out of `profile` itself because `profile` refuses up front on a
+/// machine with no permitted CPU sampler, and a test reachable only through it
+/// would silently do nothing on Linux. `doctor` warns about conditionally-gated
+/// tests, so the seam is in the code rather than an `.enabled(if:)` here.
+@Test func profileBuildsAndLocatesTheBenchmarkBinariesInTheNestedPackage() throws {
+    let repo = try makeNestedProfileFixture()
+    defer { try? FileManager.default.removeItem(at: repo.deletingLastPathComponent()) }
+
+    var config = InitRunner.defaultConfig(
+        scope: ["Sources/Lib/**"], benchmarkTarget: "NestedBench", benchmarks: ["A"],
+        benchmarkPackagePath: "Benchmarks")
+
+    // Pre-condition: the ROOT package has no such product, so the old geometry
+    // could not have worked here -- or on any repository laid out this way.
+    let atRoot = try Subprocess.run(
+        URL(fileURLWithPath: "/usr/bin/swift"),
+        ["build", "-c", "release", "--product", "NestedBench"],
+        cwd: repo, env: nil, timeout: 600)
+    #expect(atRoot.exitCode != 0,
+            "the fixture is wrong: the root package must NOT be able to build NestedBench")
+
+    let exe = try Sampler.buildAndLocateBenchmarkExecutable(
+        repo: repo, config: config, timeout: 600)
+    let expected = repo.appendingPathComponent("Benchmarks/.build/release/NestedBench")
+    #expect(exe.standardizedFileURL.path == expected.standardizedFileURL.path,
+            "profile located \(exe.path)")
+    #expect(FileManager.default.isExecutableFile(atPath: exe.path))
+
+    // BenchmarkTool too: it is a product of the package that declares the
+    // benchmark dependency, which in this layout is not the root one.
+    let both = Sampler.measuredBinaries(repo: repo, config: config)
+    #expect(both.target.standardizedFileURL.path == exe.standardizedFileURL.path)
+    #expect(FileManager.default.isExecutableFile(atPath: both.tool.path),
+            "BenchmarkTool was expected at \(both.tool.path)")
+
+    // Nothing landed at the repository root, which is where the old code looked.
+    #expect(!FileManager.default.fileExists(
+        atPath: repo.appendingPathComponent(".build/release/NestedBench").path))
+
+    // AND THE ROOT LAYOUT IS UNCHANGED. Every config written before this key
+    // existed omits it, and for those `profile` must address the repository
+    // itself, exactly as it always did.
+    config.benchmarkPackagePath = nil
+    #expect(Sampler.benchmarkPackageRoot(repo: repo, config: config).path == repo.path)
+    #expect(Sampler.measuredBinaries(repo: repo, config: config).target.path
+        == repo.appendingPathComponent(".build/release/NestedBench").path)
+}
+
+// =========================================================================
+// MARK: - The two gaps a reviewer named
+// =========================================================================
+
+/// GAP 1. `BenchmarkPackage.validate` decided "this is a real package
+/// directory" with `fileExists`, WHICH FOLLOWS SYMLINKS. A `Benchmarks`
+/// symlink pointing outside the repository therefore satisfied it, and the
+/// gates then disagree about what they can see: `FileManager.enumerator` does
+/// not descend a symlinked directory, so gates 2a and 2c never look inside it,
+/// while gate 2d addresses `<path>/.build/checkouts` by path and does follow
+/// it. The result is a package compiled into the measured binary out of a tree
+/// no inventory covers.
+///
+/// Not reachable by the agent -- planting it needs operator setup that
+/// pre-dates the baseline, and gate 2b reports a link that appears afterwards
+/// -- which is why it is a containment check rather than a new gate.
+///
+/// The `manifestInventory` assertion is the live half: it is the real gate 2a
+/// walk, run against this exact tree, showing the nested manifest genuinely
+/// missing rather than asserted to be.
+@Test func aBenchmarkPackageReachedThroughASymlinkOutOfTheRepositoryIsRefused() throws {
+    let parent = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent(UUID().uuidString)
+    let repo = parent.appendingPathComponent("repo")
+    let outside = parent.appendingPathComponent("outside")
+    let fm = FileManager.default
+    try fm.createDirectory(at: repo, withIntermediateDirectories: true)
+    try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: parent) }
+
+    try "// swift-tools-version: 6.0\n".write(
+        to: repo.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+    try "// swift-tools-version: 6.0\n".write(
+        to: outside.appendingPathComponent("Package.swift"), atomically: true, encoding: .utf8)
+    try fm.createSymbolicLink(at: repo.appendingPathComponent("Benchmarks"),
+                              withDestinationURL: outside)
+
+    // The shape rule sees nothing wrong -- there is no ".." to find -- and
+    // `fileExists` follows the link, so the pre-fix check was satisfied.
+    try BenchmarkPackage.validateShape("Benchmarks")
+    #expect(fm.fileExists(atPath: repo.appendingPathComponent("Benchmarks/Package.swift").path),
+            "the premise of this test is that fileExists follows the link")
+
+    // Gate 2a's own walk, run for real: the nested manifest is invisible.
+    let inventory = try BaselineRunner.manifestInventory(repo: repo)
+    #expect(inventory["Package.swift"] != nil)
+    #expect(inventory["Benchmarks/Package.swift"] == nil,
+            "manifest inventory saw \(inventory.keys.sorted())")
+
+    #expect(throws: BenchmarkPackage.Invalid.self) {
+        try BenchmarkPackage.validate("Benchmarks", in: repo)
+    }
+    var config = InitRunner.defaultConfig(
+        scope: ["Sources/**"], benchmarkTarget: "B", benchmarks: ["A"],
+        benchmarkPackagePath: "Benchmarks")
+    #expect(throws: (any Error).self) { try config.validateBenchmarkPackage(in: repo) }
+
+    // A REAL directory in the same place is still accepted -- the check is
+    // containment, not a ban on the name.
+    try fm.removeItem(at: repo.appendingPathComponent("Benchmarks"))
+    try fm.createDirectory(at: repo.appendingPathComponent("Benchmarks"),
+                           withIntermediateDirectories: true)
+    try "// swift-tools-version: 6.0\n".write(
+        to: repo.appendingPathComponent("Benchmarks/Package.swift"),
+        atomically: true, encoding: .utf8)
+    try BenchmarkPackage.validate("Benchmarks", in: repo)
+    try config.validateBenchmarkPackage(in: repo)
+    #expect(try BaselineRunner.manifestInventory(repo: repo)["Benchmarks/Package.swift"] != nil)
+}
+
+/// GAP 1, THE OTHER HALF: a repository whose own path runs through a symlink
+/// must NOT be refused. On macOS that is the ordinary case, not an exotic one
+/// -- `NSTemporaryDirectory()` hands back `/var/folders/...`, and `/var` is a
+/// symlink to `/private/var` -- so a containment check that resolved only the
+/// child would refuse every fixture in this file.
+@Test func aRepositoryReachedThroughASymlinkIsNotItselfAnEscape() throws {
+    let parent = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent(UUID().uuidString)
+    let real = parent.appendingPathComponent("real")
+    let fm = FileManager.default
+    try fm.createDirectory(at: real.appendingPathComponent("Benchmarks"),
+                           withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: parent) }
+    try "// swift-tools-version: 6.0\n".write(
+        to: real.appendingPathComponent("Benchmarks/Package.swift"),
+        atomically: true, encoding: .utf8)
+
+    let link = parent.appendingPathComponent("link")
+    try fm.createSymbolicLink(at: link, withDestinationURL: real)
+    try BenchmarkPackage.validate("Benchmarks", in: link)
+}
+
+/// GAP 2. `resolveLockfilePin` asked its three questions of the ROOT package
+/// only. A nested benchmark package has its own manifest and its own
+/// dependency set -- it is the package that declares
+/// `ordo-one/package-benchmark` -- so a nested package with source-control
+/// dependencies and no tracked `Package.resolved` PASSED `baseline`, and then
+/// the first `eval`'s own `swift build --product BenchmarkTool` created
+/// `Benchmarks/Package.resolved`. Gate 2a treats a manifest appearing where
+/// baseline recorded none as a mismatch, so every experiment after that is
+/// `manifest_change_rejected`, permanently, because `frozenCommit` never
+/// advances. That is the exact defect `resolveLockfilePin` exists to prevent,
+/// reached one directory down.
+///
+/// Refused UP FRONT now, the same as for the root package. The lockfile is
+/// removed from git after `init` has committed it, because `init` is what
+/// normally prevents this state -- the repository this has to protect is one
+/// configured by hand, by an older `init`, or with the lockfile re-ignored
+/// afterwards (a bare `Package.resolved` line in `.gitignore` matches at any
+/// depth, which is how `apple/swift-asn1` presented).
+@Test func baselineRefusesANestedPackageWithUnpinnedDependencies() throws {
+    let repo = try makeNestedBenchmarkFixture(nestedSourceControlDependency: true)
+    let env = isolatedStateEnv()
+    defer {
+        cleanUpFixture(repo: repo.deletingLastPathComponent(), env: env)
+    }
+
+    try InitRunner.run(repo: repo, force: false)
+    let sh = URL(fileURLWithPath: "/bin/sh")
+    let setup = try Subprocess.run(sh, ["-c", """
+        git add -A && git commit -q -m config \
+        && git rm -q --cached Benchmarks/Package.resolved \
+        && rm -f Benchmarks/Package.resolved \
+        && printf 'Package.resolved\\n' >> .gitignore \
+        && git add -A && git commit -q -m unpin
+        """], cwd: repo, env: nil, timeout: 120)
+    #expect(setup.exitCode == 0, "\(setup.stderr)")
+    #expect(!FileManager.default.fileExists(
+        atPath: repo.appendingPathComponent("Benchmarks/Package.resolved").path),
+            "the state being refused is: no nested lockfile, and git is not tracking one")
+
+    do {
+        _ = try BaselineRunner.run(repo: repo, tag: "nestedlock", env: env)
+        Issue.record("baseline accepted a nested benchmark package with no tracked lockfile")
+    } catch let error as BaselineError {
+        let text = "\(error)"
+        #expect(text.contains("Benchmarks/Package.resolved"),
+                "the refusal must name the nested lockfile by its repo-relative path: \(text)")
+        #expect(text.contains("Benchmarks/"),
+                "the refusal must say WHICH package it is about: \(text)")
+    }
+}
+
+/// And the root package's own behaviour is untouched by that change: a package
+/// with no external dependencies anywhere in its graph still records "absent",
+/// and a nested package that genuinely has no source-control dependencies --
+/// the fixture's default, whose nested manifest declares only path
+/// dependencies -- still baselines cleanly.
+@Test func aNestedPackageWithOnlyPathDependenciesStillBaselines() throws {
+    let repo = try makeNestedBenchmarkFixture()
+    let env = isolatedStateEnv()
+    defer { cleanUpFixture(repo: repo.deletingLastPathComponent(), env: env) }
+
+    try InitRunner.run(repo: repo, force: false)
+    let r = try Subprocess.run(URL(fileURLWithPath: "/bin/sh"),
+                               ["-c", "git add -A && git commit -q -m config"],
+                               cwd: repo, env: nil, timeout: 60)
+    #expect(r.exitCode == 0)
+
+    let record = try BaselineRunner.run(repo: repo, tag: "pathonly", env: env)
+    #expect(record.packageResolvedSHA256 == Lockfile.absentPin,
+            "got \(record.packageResolvedSHA256)")
 }
 
 // =========================================================================

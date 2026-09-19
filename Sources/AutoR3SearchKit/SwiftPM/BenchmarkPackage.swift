@@ -45,6 +45,7 @@ public enum BenchmarkPackage {
         case unsafeComponent(path: String, component: String)
         case reservedComponent(path: String, component: String)
         case noManifest(path: String, expected: String)
+        case escapesViaSymlink(path: String, resolved: String, repo: String)
 
         public var description: String {
             switch self {
@@ -100,6 +101,25 @@ public enum BenchmarkPackage {
                     measured binaries under <path>/.build/release/ are all addressed against. \
                     If the benchmarks live in the root package, omit the key.
                     """
+            case .escapesViaSymlink(let path, let resolved, let repo):
+                return """
+                    benchmark_package_path "\(path)" is inside the repository only as a path: it \
+                    resolves through a symbolic link to \(resolved), which is outside \(repo). \
+                    The shape check above rejects a ".." component; this rejects the same escape \
+                    spelled as a link.
+
+                    It has to be refused rather than followed, because the gates disagree about \
+                    symlinks and the disagreement is the bypass. Gates 2a and 2c walk the \
+                    repository with FileManager.enumerator, which does NOT descend a symlinked \
+                    directory -- so the whole nested package, its manifests and its sources, \
+                    would be invisible to every inventory. Gate 2d addresses \
+                    <path>/.build/checkouts by path, so it WOULD follow the link. The result is \
+                    a benchmark package that is compiled into the measured binary out of a tree \
+                    no inventory covers.
+
+                    Move the benchmark package inside the repository, or point \
+                    benchmark_package_path at a real directory rather than a link.
+                    """
             }
         }
     }
@@ -133,17 +153,43 @@ public enum BenchmarkPackage {
         }
     }
 
-    /// `validateShape`, plus the one thing only the disk can answer: the
-    /// directory has to actually be a SwiftPM package.
+    /// `validateShape`, plus the two things only the disk can answer: the
+    /// directory has to really be inside the repository, and it has to
+    /// actually be a SwiftPM package.
     ///
     /// Separate from `validateShape` so `Config.validate()` -- which is called
     /// in places that have no repository URL to hand, including on a config
     /// constructed in a test -- can check everything that is checkable without
     /// I/O, and the callers that DO have a repository can additionally insist
     /// the manifest is there.
+    ///
+    /// CONTAINMENT IS CHECKED THROUGH THE LINKS, NOT THROUGH THE SPELLING.
+    /// `validateShape` refuses a `..` component, which is the whole escape
+    /// available to a string; `fileExists` then FOLLOWS SYMLINKS, so a
+    /// `Benchmarks` symlink pointing at a tree outside the repository passed
+    /// both checks. Nothing about that is reachable by the agent -- it needs
+    /// operator setup that pre-dates the baseline, and gate 2b would report a
+    /// link that appeared afterwards -- but the gates disagree about symlinks
+    /// in a way that makes it worth refusing rather than reasoning about:
+    /// `FileManager.enumerator` does not descend a symlinked directory, so
+    /// gates 2a and 2c would never see the nested package at all, while gate
+    /// 2d addresses `<path>/.build/checkouts` by path and would follow it.
+    /// `resolvingSymlinksInPath()` on BOTH sides is required, not just on the
+    /// package: on macOS the repository itself is routinely reached through
+    /// one (`/tmp` -> `/private/tmp`, `/var` -> `/private/var`), and comparing
+    /// a resolved child against an unresolved parent would refuse every
+    /// perfectly ordinary repository under those.
     public static func validate(_ path: String, in repo: URL) throws {
         try validateShape(path)
-        let manifest = repo.appendingPathComponent(path).appendingPathComponent("Package.swift")
+
+        let directory = repo.appendingPathComponent(path)
+        let resolvedRepo = repo.resolvingSymlinksInPath().standardizedFileURL.path
+        let resolved = directory.resolvingSymlinksInPath().standardizedFileURL.path
+        guard resolved == resolvedRepo || resolved.hasPrefix(resolvedRepo + "/") else {
+            throw Invalid.escapesViaSymlink(path: path, resolved: resolved, repo: resolvedRepo)
+        }
+
+        let manifest = directory.appendingPathComponent("Package.swift")
         guard FileManager.default.fileExists(atPath: manifest.path) else {
             throw Invalid.noManifest(path: path, expected: manifest.path)
         }
