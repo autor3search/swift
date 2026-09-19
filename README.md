@@ -1,6 +1,6 @@
 # autor3search-swift
 
-[autoresearch for your codebase](https://autor3search.dev/) — the same loop in seven languages, with every agent prompt in one place.
+[autoresearch for your codebase](https://autor3search.dev/) — the same loop in eight languages, with every agent prompt in one place.
 
 **Autonomous AI-driven performance optimization for any Swift package.**
 
@@ -20,10 +20,12 @@ not optional**.
 > against a real release binary. Every number in this README and in
 > [SECURITY.md](SECURITY.md) is a real measurement, never an illustration.
 >
-> **It has not yet been run against a third-party repository.** The sibling ports
-> cite measured wins on real libraries; this one cannot yet, and says so rather
-> than implying otherwise. There is no tagged release, so `version` reports a
-> commit rather than a version number.
+> **It has not yet found a win on a third-party repository.** It now *runs* on
+> one — `apple/swift-asn1`, whose benchmarks live in the nested package layout
+> the ecosystem actually uses — through `init`, `doctor`, `baseline` and `eval`,
+> correctly discarding a comment-only commit. But no optimization loop has been
+> run there yet, so unlike the sibling ports this README cites no measured win on
+> someone else's library.
 
 ```
 agent commits one change
@@ -48,7 +50,8 @@ paste this:
 You are optimizing this Swift repository for performance.
 
 Setup (once):
-1. Build and install autor3search-swift (see its README — there is no release yet).
+1. brew install autor3search/tap/autor3search-swift
+   (or build from source — see its README.)
 2. autor3search-swift init
    Show me the benchmarks it discovered. If it reports none, STOP and tell me:
    this tool can only optimize what it can measure.
