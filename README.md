@@ -126,6 +126,18 @@ Two things worth knowing before you start:
 - **Numbers are only as good as the machine.** Run `doctor` and read it. A
   thermally throttled laptop on battery produces noise dressed as data.
 
+### Or install it as a skill
+
+The same prompt ships as an agent skill, in
+[`skills/autor3search-swift`](skills/autor3search-swift/SKILL.md). Install it once and ask your
+agent to make the repository faster; it loads the prompt itself.
+
+```sh
+mkdir -p ~/.claude/skills/autor3search-swift
+curl -fsSL https://raw.githubusercontent.com/autor3search/swift/main/skills/autor3search-swift/SKILL.md \
+  -o ~/.claude/skills/autor3search-swift/SKILL.md
+```
+
 ## Install
 
 ```sh
