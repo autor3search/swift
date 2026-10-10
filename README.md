@@ -78,6 +78,8 @@ paste this:
 You are optimizing this Swift repository for performance.
 
 Setup (once):
+0. Run git status. If the working tree has changes, STOP and ask me to
+   commit or stash them first.
 1. brew install autor3search/tap/autor3search-swift
    (or build from source — see its README.)
 2. autor3search-swift init
